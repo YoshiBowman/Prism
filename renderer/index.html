@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DMX-HUE</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- Title bar -->
+<div id="titlebar">
+  <h1>DMX-HUE</h1>
+  <span class="subtitle">Philips Hue Art-Net Bridge</span>
+  <div id="artnet-badge" class="artnet-badge">
+    <div class="dot"></div>
+    <span id="artnet-label">Art-Net: Stopped</span>
+  </div>
+</div>
+
+<!-- Listener control bar (always visible) -->
+<div id="listener-bar">
+  <div class="lb-field">
+    <label>Protocol</label>
+    <select id="lb-protocol" class="select select-sm">
+      <option value="artnet">Art-Net</option>
+      <option value="sacn">sACN (E1.31)</option>
+      <option value="both">Both</option>
+    </select>
+  </div>
+  <div class="lb-field" id="lb-artnet-field">
+    <label>Art-Net Univ.</label>
+    <input id="lb-artnet-universe" class="input input-sm" type="number" min="0" max="32767" placeholder="0">
+  </div>
+  <div class="lb-field" id="lb-sacn-field" style="display:none">
+    <label>sACN Univ.</label>
+    <input id="lb-sacn-universe" class="input input-sm" type="number" min="1" max="63999" placeholder="1">
+  </div>
+  <button id="lb-start" class="btn btn-primary btn-sm">▶ Start</button>
+  <button id="lb-stop"  class="btn btn-secondary btn-sm" disabled>■ Stop</button>
+  <div id="lb-status">
+    <div class="dot"></div>
+    <span id="lb-label">Stopped</span>
+  </div>
+</div>
+
+<!-- Tabs -->
+<div id="tabs">
+  <div class="tab active" data-tab="bridge">Bridge</div>
+  <div class="tab" data-tab="lights">Lights</div>
+  <div class="tab" data-tab="monitor">Monitor</div>
+  <div class="tab" data-tab="settings">Settings</div>
+</div>
+
+<!-- Content -->
+<div id="content">
+
+  <!-- Bridge panel -->
+  <div id="panel-bridge" class="panel active">
+    <div class="bridge-layout">
+
+      <!-- Connection status -->
+      <div class="card">
+        <h2>Connection</h2>
+        <div class="status-row">
+          <div id="bridge-status-dot" class="status-dot"></div>
+          <span id="bridge-status-text">Not connected</span>
+        </div>
+        <button id="btn-disconnect" class="btn btn-danger btn-sm" style="display:none">Disconnect</button>
+      </div>
+
+      <!-- Discovery -->
+      <div class="card">
+        <h2>Discover Bridges</h2>
+
+        <div class="field" style="margin-bottom:10px">
+          <label>Search via Interface</label>
+          <div class="nic-row">
+            <select id="discover-nic" class="select" style="flex:1">
+              <option value="0.0.0.0">All Interfaces (0.0.0.0)</option>
+            </select>
+            <button id="btn-refresh-nics-discover" class="btn btn-secondary btn-sm" title="Refresh interfaces">↻</button>
+          </div>
+        </div>
+
+        <div class="tip-banner" style="margin-bottom:10px">
+          🔘 When connecting you'll need to <strong>press the round button on top of your Hue Bridge</strong> to authorize. Have it nearby before clicking Connect.
+        </div>
+
+        <div class="field" style="margin-bottom:10px">
+          <label>Additional Subnet <span style="color:var(--text3)">(optional, e.g. 10.0.5)</span></label>
+          <div class="nic-row">
+            <input id="extra-subnet" class="input" placeholder="e.g. 10.0.5  or  192.168.0" style="flex:1">
+            <button id="btn-show-subnets" class="btn btn-secondary btn-sm" title="Show subnets that will be scanned">?</button>
+          </div>
+          <div id="subnet-preview" class="hint" style="margin-top:4px;display:none"></div>
+        </div>
+
+        <button id="btn-scan" class="btn btn-primary btn-sm">Scan Network</button>
+
+        <div id="scan-progress-wrap" style="display:none;margin-top:10px">
+          <div class="scan-progress-bar-bg">
+            <div id="scan-progress-bar" class="scan-progress-bar-fill"></div>
+          </div>
+          <div id="scan-progress-label" class="hint" style="margin-top:4px">Scanning…</div>
+        </div>
+
+        <div id="bridge-list" style="margin-top:12px">
+          <div class="empty-state"><small>Click "Scan Network" to find bridges on your LAN</small></div>
+        </div>
+
+        <div class="manual-ip-row">
+          <input id="manual-ip" class="input" placeholder="Manual IP e.g. 192.168.1.100" style="flex:1">
+          <button id="btn-manual-connect" class="btn btn-secondary btn-sm">Connect</button>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Pairing dialog -->
+    <div id="pair-dialog" class="card">
+      <h2>Bridge Pairing</h2>
+
+      <div id="pair-step-verify" class="pair-step">
+        <div style="display:flex;align-items:center;gap:10px">
+          <div class="spinner"></div>
+          <span id="pair-verify-label">Checking bridge at <span id="pair-ip"></span>…</span>
+        </div>
+      </div>
+
+      <div id="pair-step-link" class="pair-step" style="display:none">
+        <div class="pair-found-banner">
+          ✓ Bridge found — <span id="pair-bridge-name"></span>
+        </div>
+        <div class="pair-link-instruction">
+          <div class="pair-link-icon">🔘</div>
+          <div>
+            <strong>Press the round link button on top of your Hue Bridge</strong>
+            <p>The button is on the physical hardware. You have <span id="pair-countdown">30</span> seconds.</p>
+          </div>
+        </div>
+        <div class="scan-progress-bar-bg" style="margin-top:12px">
+          <div id="pair-timer-bar" class="scan-progress-bar-fill" style="background:var(--green);width:100%;transition:width 1s linear"></div>
+        </div>
+        <div id="pair-message" style="font-size:12px;color:var(--text3);margin-top:6px">Waiting…</div>
+      </div>
+
+      <button id="btn-cancel-pair" class="btn btn-secondary btn-sm" style="margin-top:14px">Cancel</button>
+    </div>
+  </div>
+
+  <!-- Lights panel -->
+  <div id="panel-lights" class="panel">
+    <div id="lights-toolbar">
+      <button id="btn-refresh-lights" class="btn btn-secondary btn-sm">↻ Refresh</button>
+      <span class="hint">Drag rows to reorder DMX channel assignment · Toggle to enable/disable a light</span>
+    </div>
+    <div id="lights-list">
+      <div class="empty-state">
+        <div class="icon">💡</div>
+        <p>Connect to a bridge first</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Monitor panel -->
+  <div id="panel-monitor" class="panel">
+    <div id="monitor-signal-bar">
+      <div id="monitor-signal-dot" class="signal-dot"></div>
+      <span id="monitor-signal-label">No signal</span>
+      <span id="monitor-signal-age" class="hint"></span>
+      <span id="monitor-universe-label" class="hint" style="margin-left:auto"></span>
+    </div>
+    <div id="sacn-diag-bar" style="display:none">
+      <span id="sacn-diag-icon">📡</span>
+      <span id="sacn-diag-text"></span>
+    </div>
+    <div id="monitor-grid">
+      <div class="empty-state">
+        <div class="icon">📡</div>
+        <p>Connect to a bridge and start the listener to monitor channels</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Settings panel -->
+  <div id="panel-settings" class="panel">
+    <div class="settings-layout">
+
+      <!-- DMX / Art-Net settings -->
+      <div class="card">
+        <h2>Art-Net / DMX</h2>
+
+        <div class="field">
+          <label>Bind Interface</label>
+          <div class="nic-row">
+            <select id="s-nic" class="select" style="flex:1">
+              <option value="0.0.0.0">All Interfaces (0.0.0.0)</option>
+            </select>
+            <button id="btn-refresh-nics-settings" class="btn btn-secondary btn-sm" title="Refresh interfaces">↻</button>
+          </div>
+          <div class="hint">Interface the listener binds to. Restart after changing.</div>
+        </div>
+
+        <div class="field">
+          <label>Art-Net Universe <span style="color:var(--text3)">(0 – 32767)</span></label>
+          <input id="s-universe" class="input" type="number" min="0" max="32767" placeholder="0">
+        </div>
+
+        <div id="sacn-fields">
+          <div class="field">
+            <label>sACN Universe <span style="color:var(--text3)">(1 – 63999)</span></label>
+            <input id="s-sacn-universe" class="input" type="number" min="1" max="63999" placeholder="1">
+            <div class="hint">Multicast group: <span id="sacn-multicast-group">239.255.0.1</span></div>
+          </div>
+          <div class="checkbox-row" style="border:none;padding:0;margin-bottom:16px">
+            <div>
+              <label for="s-sacn-multicast">sACN Multicast</label>
+              <div class="description">Join the universe multicast group. Disable for unicast.</div>
+            </div>
+            <label class="toggle">
+              <input id="s-sacn-multicast" type="checkbox" checked>
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+        </div>
+
+        <div class="field">
+          <label>DMX Start Address <span style="color:var(--text3)">(1 – 511)</span></label>
+          <input id="s-address" class="input" type="number" min="1" max="511" placeholder="1">
+        </div>
+
+        <div class="field">
+          <label>Transition Time <span style="color:var(--text3)">(ms or "channel")</span></label>
+          <input id="s-transition" class="input" placeholder="100">
+          <div class="hint">Use "channel" to control transition via first DMX channel</div>
+        </div>
+      </div>
+
+      <!-- Feature flags -->
+      <div class="card">
+        <h2>Features</h2>
+
+        <div class="checkbox-row">
+          <div>
+            <label for="s-white">White / Color Temperature Mode</label>
+            <div class="description">Adds 2 extra channels per light: CT (ch+3) and Brightness (ch+4)</div>
+          </div>
+          <label class="toggle">
+            <input id="s-white" type="checkbox">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <div class="checkbox-row">
+          <div>
+            <label for="s-colorloop">Color Loop</label>
+            <div class="description">When RGB = 1,1,1 the light runs a color cycle effect</div>
+          </div>
+          <label class="toggle">
+            <input id="s-colorloop" type="checkbox">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <div class="checkbox-row">
+          <div>
+            <label for="s-nolimit">Disable Rate Limiting</label>
+            <div class="description">Remove the 100 ms cooldown between API calls (not recommended)</div>
+          </div>
+          <label class="toggle">
+            <input id="s-nolimit" type="checkbox">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+      </div>
+
+    </div>
+
+    <div class="settings-footer">
+      <button id="btn-save-settings" class="btn btn-primary">Save Settings</button>
+    </div>
+  </div>
+
+</div>
+
+<!-- DMX channel bar (bottom) -->
+<div id="dmx-bar-wrap"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

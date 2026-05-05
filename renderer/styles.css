@@ -629,6 +629,7 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 14px 16px;
+  overflow: hidden;
   transition: border-color .2s, opacity .3s;
 }
 .control-card.dmx-active { opacity: 0.45; pointer-events: none; }
@@ -678,6 +679,7 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
 .bri-slider {
   -webkit-appearance: none;
   flex: 1;
+  min-width: 0;
   height: 4px;
   border-radius: 2px;
   background: var(--glass3);
@@ -697,10 +699,8 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
   font-family: monospace;
   color: var(--text3);
   width: 38px;
-  min-width: 38px;
   text-align: right;
   flex-shrink: 0;
-  overflow: hidden;
 }
 
 /* Group select button (dot in card header) */

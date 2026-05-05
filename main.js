@@ -119,10 +119,9 @@ let artnetSocket = null;
 let artnetRunning = false;
 let dmxBuffer = Buffer.alloc(512, 0);
 
-// Per-light update queue for rate limiting
-let updateQueue = [];
-let updateTimer = null;
-let lastUpdateTime = 0;
+// Per-light independent rate-limiting timers (parallel, not serial)
+const lightTimers   = {};   // lightId → pending setTimeout handle
+const lightLastSent = {};   // lightId → timestamp of last sent call
 
 function rgbToHsb(r, g, b) {
   r /= 255; g /= 255; b /= 255;
@@ -174,31 +173,14 @@ function buildLightState(r, g, b, extraChannels, opts) {
 }
 
 function scheduleUpdate(lightId, state) {
-  // Remove any pending update for this light
-  updateQueue = updateQueue.filter(item => item.lightId !== lightId);
-  updateQueue.push({ lightId, state });
-  if (!updateTimer) drainQueue();
-}
-
-function drainQueue() {
-  updateTimer = null;
-  if (!hueApi || updateQueue.length === 0) return;
-
-  const rateMs = config.noLimit ? 0 : 100;
-  const now = Date.now();
-  const wait = Math.max(0, rateMs - (now - lastUpdateTime));
-
-  updateTimer = setTimeout(async () => {
-    updateTimer = null;
-    if (!updateQueue.length) return;
-
-    const { lightId, state } = updateQueue.shift();
-    lastUpdateTime = Date.now();
-    try {
-      await hueApi.lights.setLightState(lightId, state);
-    } catch { /* light may be unreachable */ }
-
-    if (updateQueue.length > 0) drainQueue();
+  // Cancel any pending call for this light and re-schedule
+  if (lightTimers[lightId]) clearTimeout(lightTimers[lightId]);
+  const rateMs = config.noLimit ? 0 : 85;
+  const wait   = Math.max(0, rateMs - (Date.now() - (lightLastSent[lightId] || 0)));
+  lightTimers[lightId] = setTimeout(async () => {
+    delete lightTimers[lightId];
+    lightLastSent[lightId] = Date.now();
+    try { await hueApi.lights.setLightState(lightId, state); } catch {}
   }, wait);
 }
 
@@ -1053,9 +1035,12 @@ function createWindow() {
   mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
 }
 
-app.whenReady().then(async () => {
+app.whenReady().then(() => {
   loadConfig();
   createWindow();
+
+  // Start bridge connection immediately (parallel with window load)
+  const connectedPromise = connectToSavedBridge();
 
   // ── Auto-updater (production only) ────────────────────────────────────────
   if (app.isPackaged) {
@@ -1079,20 +1064,18 @@ app.whenReady().then(async () => {
     ipcMain.handle('update:download', () => autoUpdater.downloadUpdate());
     ipcMain.handle('update:install',  () => { autoUpdater.quitAndInstall(); });
 
-    setTimeout(() => autoUpdater.checkForUpdates().catch(() => {}), 3000);
+    setTimeout(() => autoUpdater.checkForUpdates().catch(() => {}), 5000);
   }
 
-  // Try auto-connect on startup
-  const connected = await connectToSavedBridge();
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.once('did-finish-load', () => {
-      // Inject platform so CSS can adjust titlebar padding
-      mainWindow.webContents.executeJavaScript(
-        `document.body.dataset.platform = '${process.platform}'`
-      );
+  // Send auto-connect result once the page is ready (whichever finishes last)
+  mainWindow.webContents.once('did-finish-load', async () => {
+    mainWindow.webContents.executeJavaScript(
+      `document.body.dataset.platform = '${process.platform}'`
+    );
+    const connected = await connectedPromise;
+    if (mainWindow && !mainWindow.isDestroyed())
       mainWindow.webContents.send('bridge:auto-connect', { connected, bridge: config.bridge });
-    });
-  }
+  });
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();

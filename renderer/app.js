@@ -524,12 +524,12 @@ function updateGroupBar() {
         controlState[id] = { ...controlState[id], rgb, bri, on: true };
         sendLightState(id, controlState[id]);
         // sync individual card UI
-        const card = controlGrid.querySelector(`[data-light-id="${id}"]`);
-        if (card) {
-          card.querySelector('.ctrl-color').value = rgb;
-          card.querySelector('.ctrl-bri').value   = bri;
-          card.querySelector('.bri-val').textContent = `${bri}%`;
-          card.querySelector('.ctrl-onoff').checked = true;
+        const tile = controlGrid.querySelector(`[data-light-id="${id}"]`);
+        if (tile) {
+          controlState[id] = { ...controlState[id], rgb, bri, on: true };
+          applyTileVisual(tile, controlState[id]);
+          tile.querySelector('.ctrl-bri').value      = bri;
+          tile.querySelector('.bri-val').textContent = `${bri}%`;
         }
       }
     }, 80);
@@ -541,7 +541,7 @@ function updateGroupBar() {
     });
     bar.querySelector('#group-clear').addEventListener('click', () => {
       selectedLights.clear();
-      controlGrid.querySelectorAll('.control-card.selected')
+      controlGrid.querySelectorAll('.ctrl-tile.selected')
         .forEach(c => c.classList.remove('selected'));
       updateGroupBar();
     });
@@ -571,61 +571,85 @@ function debounce(fn, ms) {
 // Per-light state stored in renderer for scene saving
 const controlState = {}; // { lightId: { on, rgb, bri } }
 
+// Apply color + on/off visuals to a tile element
+function applyTileVisual(tile, s) {
+  tile.style.setProperty('--tile-color', s.rgb);
+  tile.classList.toggle('active', !!s.on);
+  const swatch = tile.querySelector('.ctrl-color-swatch');
+  if (swatch) swatch.style.background = s.on ? s.rgb : '';
+  const colorInput = tile.querySelector('.ctrl-color-input');
+  if (colorInput) colorInput.value = s.rgb;
+}
+
 function buildControlCards(lights) {
   selectedLights.clear();
   updateGroupBar();
   if (!lights || lights.length === 0) {
-    controlGrid.innerHTML = '<div class="empty-state"><div class="icon">🎛️</div><p>Connect to a bridge and load lights first</p></div>';
+    controlGrid.innerHTML = '<div class="empty-state"><div class="icon">💡</div><p>Connect to a bridge and load lights first</p></div>';
     return;
   }
   controlGrid.innerHTML = '';
 
   for (const light of lights) {
     if (!controlState[light.id]) {
-      controlState[light.id] = { on: light.state?.on ?? true, rgb: '#ffffff', bri: Math.round(((light.state?.bri ?? 254) / 254) * 100) };
+      controlState[light.id] = {
+        on:  light.state?.on ?? true,
+        rgb: '#ffcc66',
+        bri: Math.round(((light.state?.bri ?? 254) / 254) * 100),
+      };
     }
     const s = controlState[light.id];
 
-    const card = document.createElement('div');
-    card.className   = 'control-card';
-    card.dataset.lightId = light.id;
-    card.innerHTML = `
-      <div class="control-card-header">
-        <button class="ctrl-select-btn" title="Select for group control"></button>
-        <span class="control-card-name">${light.name}</span>
-        <label class="toggle" title="On / Off">
-          <input type="checkbox" class="ctrl-onoff" ${s.on ? 'checked' : ''}>
-          <span class="toggle-slider"></span>
-        </label>
+    const tile = document.createElement('div');
+    tile.className      = 'ctrl-tile' + (s.on ? ' active' : '');
+    tile.dataset.lightId = light.id;
+    tile.style.setProperty('--tile-color', s.rgb);
+    tile.innerHTML = `
+      <div class="ctrl-tile-glow"></div>
+      <div class="ctrl-tile-top">
+        <button class="ctrl-sel-dot" title="Select for group control"></button>
+        <button class="ctrl-power-btn" title="Toggle on/off">⏻</button>
       </div>
-      <div class="control-row">
-        <span class="control-row-label">Color</span>
-        <input type="color" class="color-input ctrl-color" value="${s.rgb}">
+      <div class="ctrl-tile-mid">
+        <div class="ctrl-color-wrap" title="Change color">
+          <div class="ctrl-color-swatch" style="background:${s.on ? s.rgb : ''}"></div>
+          <input type="color" class="ctrl-color-input" value="${s.rgb}">
+        </div>
       </div>
-      <div class="control-row">
-        <span class="control-row-label">Brightness</span>
-        <input type="range" min="1" max="100" value="${s.bri}" class="bri-slider ctrl-bri">
-        <span class="bri-val">${s.bri}%</span>
+      <div class="ctrl-tile-bot">
+        <span class="ctrl-tile-name">${light.name}</span>
+        <div class="ctrl-bri-row">
+          <input type="range" min="1" max="100" value="${s.bri}" class="bri-slider ctrl-bri">
+          <span class="bri-val">${s.bri}%</span>
+        </div>
       </div>`;
 
-    card.querySelector('.ctrl-select-btn').addEventListener('click', () => toggleCardSelect(light.id, card));
+    tile.querySelector('.ctrl-sel-dot').addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleCardSelect(light.id, tile);
+    });
 
-    card.querySelector('.ctrl-onoff').addEventListener('change', (e) => {
-      s.on = e.target.checked;
+    tile.querySelector('.ctrl-power-btn').addEventListener('click', () => {
+      s.on = !s.on;
+      applyTileVisual(tile, s);
       sendLightState(light.id, s);
     });
 
-    const sendColor = debounce((rgb) => { s.rgb = rgb; sendLightState(light.id, s); }, 80);
-    card.querySelector('.ctrl-color').addEventListener('input', (e) => sendColor(e.target.value));
+    const sendColor = debounce((rgb) => {
+      s.rgb = rgb;
+      applyTileVisual(tile, s);
+      sendLightState(light.id, s);
+    }, 80);
+    tile.querySelector('.ctrl-color-input').addEventListener('input', (e) => sendColor(e.target.value));
 
     const sendBri = debounce((bri) => { s.bri = bri; sendLightState(light.id, s); }, 80);
-    card.querySelector('.ctrl-bri').addEventListener('input', (e) => {
+    tile.querySelector('.ctrl-bri').addEventListener('input', (e) => {
       const bri = parseInt(e.target.value);
-      e.target.closest('.control-row').querySelector('.bri-val').textContent = `${bri}%`;
+      tile.querySelector('.bri-val').textContent = `${bri}%`;
       sendBri(bri);
     });
 
-    controlGrid.appendChild(card);
+    controlGrid.appendChild(tile);
   }
 }
 
@@ -637,10 +661,10 @@ async function sendLightState(lightId, s) {
   await window.hue.setLightState(lightId, { on: true, rgb: s.rgb, bri: s.bri });
 }
 
-// DMX takeover — dim control cards while DMX is active
+// DMX takeover — dim tiles while DMX is active
 window.hue.on('dmx:takeover-change', ({ active }) => {
   dmxOverrideBanner.style.display = active ? 'flex' : 'none';
-  controlGrid.querySelectorAll('.control-card').forEach(c => c.classList.toggle('dmx-active', active));
+  controlGrid.querySelectorAll('.ctrl-tile').forEach(c => c.classList.toggle('dmx-active', active));
   const threshold = parseInt(dmxThresholdInput.value) || 100;
   dmxOverrideInfo.textContent = active ? `(priority ≥ ${threshold})` : '';
 });

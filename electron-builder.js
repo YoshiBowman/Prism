@@ -22,6 +22,10 @@ module.exports = {
     entitlements:        'build/entitlements.mac.plist',
     entitlementsInherit: 'build/entitlements.mac.plist',
     icon:                'build/icon.icns',
+    extendInfo: {
+      NSLocalNetworkUsageDescription: 'DMX-HUE needs local network access to discover and control Philips Hue bridges and receive Art-Net / sACN DMX data.',
+      NSBonjourServices: ['_hue._tcp', '_ssdp._udp'],
+    },
     notarize: process.env.APPLE_TEAM_ID
       ? { teamId: process.env.APPLE_TEAM_ID }
       : false,

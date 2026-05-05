@@ -124,6 +124,57 @@ let dmxBuffer = Buffer.alloc(512, 0);
 // Per-light independent rate-limiting timers (parallel, not serial)
 const lightTimers   = {};   // lightId → pending setTimeout handle
 const lightLastSent = {};   // lightId → timestamp of last sent call
+const lightLastKey  = {};   // lightId → last serialized state key (dedup)
+
+// Keep-alive HTTP agent — reuses TCP connections to the bridge, eliminates
+// the ~20-50 ms TCP handshake that node-hue-api pays on every call
+const keepAliveAgent = new http.Agent({ keepAlive: true, maxSockets: Infinity });
+
+// Fast direct PUT to the Hue local REST API bypassing node-hue-api overhead
+function sendDirectState(lightId, payload) {
+  if (!config.bridge || !config.user) return;
+  const body = Buffer.from(JSON.stringify(payload));
+  const req  = http.request({
+    hostname: config.bridge,
+    port:     80,
+    path:     `/api/${config.user}/lights/${lightId}/state`,
+    method:   'PUT',
+    headers:  { 'Content-Type': 'application/json', 'Content-Length': body.length },
+    agent:    keepAliveAgent,
+  }, res => res.resume()); // drain response without parsing
+  req.on('error', () => {});
+  req.write(body);
+  req.end();
+}
+
+// Build a plain-object payload (Hue API units) instead of a LightState object
+function buildDirectPayload(r, g, b, extraChannels, opts) {
+  const tt = Math.round((opts.transition ?? 100) / 100); // deciseconds
+
+  if (r === 0 && g === 0 && b === 0) {
+    if (!opts.white || (extraChannels && extraChannels[1] === 0))
+      return { on: false, transitiontime: tt };
+  }
+
+  if (opts.colorloop && r === 1 && g === 1 && b === 1)
+    return { on: true, effect: 'colorloop', transitiontime: tt };
+
+  if (opts.white && r === 0 && g === 0 && b === 0 && extraChannels) {
+    const ct  = Math.round(153 + (extraChannels[0] / 255) * (500 - 153));
+    const bri = Math.max(1, Math.round((extraChannels[1] / 255) * 254));
+    return { on: true, ct, bri, effect: 'none', transitiontime: tt };
+  }
+
+  const [h, s, v] = rgbToHsb(r, g, b);
+  return {
+    on:             true,
+    hue:            Math.round(h * 65535),
+    sat:            Math.round(s * 254),
+    bri:            Math.max(1, Math.round(v * 254)),
+    effect:         'none',
+    transitiontime: tt,
+  };
+}
 
 function rgbToHsb(r, g, b) {
   r /= 255; g /= 255; b /= 255;
@@ -174,15 +225,15 @@ function buildLightState(r, g, b, extraChannels, opts) {
   return state;
 }
 
-function scheduleUpdate(lightId, state) {
+function scheduleUpdate(lightId, payload) {
   // Cancel any pending call for this light and re-schedule
   if (lightTimers[lightId]) clearTimeout(lightTimers[lightId]);
-  const rateMs = config.noLimit ? 0 : 85;
+  const rateMs = config.noLimit ? 0 : 60;
   const wait   = Math.max(0, rateMs - (Date.now() - (lightLastSent[lightId] || 0)));
-  lightTimers[lightId] = setTimeout(async () => {
+  lightTimers[lightId] = setTimeout(() => {
     delete lightTimers[lightId];
     lightLastSent[lightId] = Date.now();
-    try { await hueApi.lights.setLightState(lightId, state); } catch {}
+    sendDirectState(lightId, payload);
   }, wait);
 }
 
@@ -212,8 +263,13 @@ function processArtnet(data) {
     const b = data[offset + 2];
     const extra = config.white ? [data[offset + 3] || 0, data[offset + 4] || 0] : null;
 
-    const state = buildLightState(r, g, b, extra, opts);
-    scheduleUpdate(light.id, state);
+    // Skip if nothing changed — avoids redundant bridge calls on static scenes
+    const key = extra ? `${r},${g},${b},${extra[0]},${extra[1]}` : `${r},${g},${b}`;
+    if (lightLastKey[light.id] === key) continue;
+    lightLastKey[light.id] = key;
+
+    const payload = buildDirectPayload(r, g, b, extra, opts);
+    scheduleUpdate(light.id, payload);
   }
 
   // Forward DMX buffer snapshot to renderer for live display
@@ -880,11 +936,9 @@ ipcMain.handle('artnet:start', () => {
 ipcMain.handle('artnet:stop', () => {
   stopArtnet();
   stopSACN();
-  // Clear any pending per-light update timers
-  for (const id of Object.keys(lightTimers)) {
-    clearTimeout(lightTimers[id]);
-    delete lightTimers[id];
-  }
+  // Clear per-light timers and dedup cache
+  for (const id of Object.keys(lightTimers))  { clearTimeout(lightTimers[id]); delete lightTimers[id]; }
+  for (const id of Object.keys(lightLastKey))  { delete lightLastKey[id]; }
   return { success: true };
 });
 

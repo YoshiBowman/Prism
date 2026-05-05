@@ -31,6 +31,8 @@ const DEFAULT_CONFIG = {
   lightsOrder: [],
   dmxPriorityThreshold: 100, // sACN priority >= this takes over native control
   scenes: {},                 // { sceneName: [ { id, on, rgb, bri } ] }
+  lightStates: {},            // { lightId: { on, rgb, bri } } — persisted control-tab state
+  lastTab: 'bridge',          // last active tab, restored on launch
 };
 
 let config = { ...DEFAULT_CONFIG };
@@ -856,7 +858,7 @@ ipcMain.handle('settings:save', (event, updates) => {
   const safeKeys = [
     'dmxAddress', 'universe', 'sacnUniverse', 'sacnMulticast',
     'protocol', 'host', 'transition', 'colorloop', 'white', 'noLimit',
-    'dmxPriorityThreshold',
+    'dmxPriorityThreshold', 'lightStates', 'lastTab',
   ];
   for (const key of safeKeys) {
     if (updates[key] !== undefined) config[key] = updates[key];
@@ -878,8 +880,11 @@ ipcMain.handle('artnet:start', () => {
 ipcMain.handle('artnet:stop', () => {
   stopArtnet();
   stopSACN();
-  updateQueue = [];
-  if (updateTimer) { clearTimeout(updateTimer); updateTimer = null; }
+  // Clear any pending per-light update timers
+  for (const id of Object.keys(lightTimers)) {
+    clearTimeout(lightTimers[id]);
+    delete lightTimers[id];
+  }
   return { success: true };
 });
 

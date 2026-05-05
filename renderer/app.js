@@ -25,7 +25,10 @@ function showTab(name) {
   if (name === 'control') { buildControlCards(state.lights); loadScenes(); }
 }
 
-tabs.forEach(t => t.addEventListener('click', () => showTab(t.dataset.tab)));
+tabs.forEach(t => t.addEventListener('click', () => {
+  showTab(t.dataset.tab);
+  window.hue.saveSettings({ lastTab: t.dataset.tab });
+}));
 
 // ── Toast ─────────────────────────────────────────────────────────────────────
 
@@ -295,11 +298,16 @@ document.getElementById('btn-disconnect').addEventListener('click', async () => 
   toast('Disconnected from bridge', 'info');
 });
 
-window.hue.on('bridge:auto-connect', ({ connected, bridge }) => {
+window.hue.on('bridge:auto-connect', async ({ connected, bridge }) => {
+  // Always restore settings so listener bar/controls reflect saved config
+  await refreshSettings();
+
   setBridgeStatus(connected, bridge, false);
   if (connected) {
     toast(`Connected to ${bridge}`, 'success');
-    showTab('lights');
+    // Restore last active tab (default to lights when connected)
+    const saved = state.settings.lastTab;
+    showTab(saved && saved !== 'bridge' ? saved : 'lights');
   }
 });
 
@@ -568,8 +576,13 @@ function debounce(fn, ms) {
   return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
 }
 
-// Per-light state stored in renderer for scene saving
+// Per-light state stored in renderer (and persisted to config)
 const controlState = {}; // { lightId: { on, rgb, bri } }
+
+// Debounced persist — writes controlState to config ~1.5 s after last change
+const persistControlState = debounce(() => {
+  window.hue.saveSettings({ lightStates: { ...controlState } });
+}, 1500);
 
 // Apply color + on/off visuals to a tile element
 function applyTileVisual(tile, s) {
@@ -590,9 +603,12 @@ function buildControlCards(lights) {
   }
   controlGrid.innerHTML = '';
 
+  // Seed from persisted config if available
+  const saved = (state.settings && state.settings.lightStates) || {};
+
   for (const light of lights) {
     if (!controlState[light.id]) {
-      controlState[light.id] = {
+      controlState[light.id] = saved[light.id] || {
         on:  light.state?.on ?? true,
         rgb: '#ffcc66',
         bri: Math.round(((light.state?.bri ?? 254) / 254) * 100),
@@ -654,6 +670,7 @@ function buildControlCards(lights) {
 }
 
 async function sendLightState(lightId, s) {
+  persistControlState();
   if (!s.on) {
     await window.hue.setLightState(lightId, { on: false });
     return;

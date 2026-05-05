@@ -486,6 +486,80 @@ const dmxOverrideInfo   = document.getElementById('dmx-override-info');
 const dmxThresholdInput = document.getElementById('dmx-threshold-input');
 const sceneSelect       = document.getElementById('scene-select');
 const sceneNameRow      = document.getElementById('scene-name-row');
+
+// Group selection
+const selectedLights = new Set();
+
+function getGroupBar() { return document.getElementById('group-bar'); }
+
+function updateGroupBar() {
+  let bar = getGroupBar();
+  if (selectedLights.size < 1) {
+    if (bar) bar.remove();
+    return;
+  }
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.id = 'group-bar';
+    bar.innerHTML = `
+      <span id="group-bar-label"></span>
+      <div class="control-row" style="flex:1;margin:0;gap:10px">
+        <span class="control-row-label" style="width:auto">Color</span>
+        <input type="color" class="color-input" id="group-color" value="#ffffff">
+        <span class="control-row-label" style="width:auto;margin-left:10px">Brightness</span>
+        <input type="range" min="1" max="100" value="100" class="bri-slider" id="group-bri" style="max-width:120px">
+        <span id="group-bri-val" class="bri-val">100%</span>
+      </div>
+      <button class="btn btn-secondary btn-sm" id="group-clear">✕ Clear</button>`;
+    controlGrid.parentElement.insertBefore(bar, controlGrid);
+
+    const groupColor = bar.querySelector('#group-color');
+    const groupBri   = bar.querySelector('#group-bri');
+    const groupBriVal = bar.querySelector('#group-bri-val');
+
+    const sendGroup = debounce(() => {
+      const rgb = groupColor.value;
+      const bri = parseInt(groupBri.value);
+      for (const id of selectedLights) {
+        controlState[id] = { ...controlState[id], rgb, bri, on: true };
+        sendLightState(id, controlState[id]);
+        // sync individual card UI
+        const card = controlGrid.querySelector(`[data-light-id="${id}"]`);
+        if (card) {
+          card.querySelector('.ctrl-color').value = rgb;
+          card.querySelector('.ctrl-bri').value   = bri;
+          card.querySelector('.bri-val').textContent = `${bri}%`;
+          card.querySelector('.ctrl-onoff').checked = true;
+        }
+      }
+    }, 80);
+
+    groupColor.addEventListener('input', sendGroup);
+    groupBri.addEventListener('input', (e) => {
+      groupBriVal.textContent = `${e.target.value}%`;
+      sendGroup();
+    });
+    bar.querySelector('#group-clear').addEventListener('click', () => {
+      selectedLights.clear();
+      controlGrid.querySelectorAll('.control-card.selected')
+        .forEach(c => c.classList.remove('selected'));
+      updateGroupBar();
+    });
+  }
+  bar.querySelector('#group-bar-label').textContent =
+    `${selectedLights.size} light${selectedLights.size > 1 ? 's' : ''} selected`;
+}
+
+function toggleCardSelect(lightId, card) {
+  if (selectedLights.has(lightId)) {
+    selectedLights.delete(lightId);
+    card.classList.remove('selected');
+  } else {
+    selectedLights.add(lightId);
+    card.classList.add('selected');
+  }
+  updateGroupBar();
+}
 const sceneNameInput    = document.getElementById('scene-name-input');
 
 // Debounce helper
@@ -498,6 +572,8 @@ function debounce(fn, ms) {
 const controlState = {}; // { lightId: { on, rgb, bri } }
 
 function buildControlCards(lights) {
+  selectedLights.clear();
+  updateGroupBar();
   if (!lights || lights.length === 0) {
     controlGrid.innerHTML = '<div class="empty-state"><div class="icon">🎛️</div><p>Connect to a bridge and load lights first</p></div>';
     return;
@@ -515,6 +591,7 @@ function buildControlCards(lights) {
     card.dataset.lightId = light.id;
     card.innerHTML = `
       <div class="control-card-header">
+        <button class="ctrl-select-btn" title="Select for group control"></button>
         <span class="control-card-name">${light.name}</span>
         <label class="toggle" title="On / Off">
           <input type="checkbox" class="ctrl-onoff" ${s.on ? 'checked' : ''}>
@@ -531,24 +608,17 @@ function buildControlCards(lights) {
         <span class="bri-val">${s.bri}%</span>
       </div>`;
 
-    // On/Off toggle
+    card.querySelector('.ctrl-select-btn').addEventListener('click', () => toggleCardSelect(light.id, card));
+
     card.querySelector('.ctrl-onoff').addEventListener('change', (e) => {
       s.on = e.target.checked;
       sendLightState(light.id, s);
     });
 
-    // Color picker — debounced
-    const sendColor = debounce((rgb) => {
-      s.rgb = rgb;
-      sendLightState(light.id, s);
-    }, 80);
+    const sendColor = debounce((rgb) => { s.rgb = rgb; sendLightState(light.id, s); }, 80);
     card.querySelector('.ctrl-color').addEventListener('input', (e) => sendColor(e.target.value));
 
-    // Brightness slider — debounced
-    const sendBri = debounce((bri) => {
-      s.bri = bri;
-      sendLightState(light.id, s);
-    }, 80);
+    const sendBri = debounce((bri) => { s.bri = bri; sendLightState(light.id, s); }, 80);
     card.querySelector('.ctrl-bri').addEventListener('input', (e) => {
       const bri = parseInt(e.target.value);
       e.target.closest('.control-row').querySelector('.bri-val').textContent = `${bri}%`;

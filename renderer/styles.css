@@ -696,9 +696,53 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
   font-size: 11px;
   font-family: monospace;
   color: var(--text3);
-  width: 32px;
+  width: 38px;
+  min-width: 38px;
   text-align: right;
   flex-shrink: 0;
+  overflow: hidden;
+}
+
+/* Group select button (dot in card header) */
+.ctrl-select-btn {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid var(--border2);
+  background: transparent;
+  cursor: pointer;
+  flex-shrink: 0;
+  padding: 0;
+  transition: background .15s, border-color .15s;
+}
+.ctrl-select-btn:hover { border-color: var(--accent2); }
+.control-card.selected .ctrl-select-btn {
+  background: var(--accent2);
+  border-color: var(--accent2);
+}
+.control-card.selected {
+  border-color: var(--accent2);
+  box-shadow: 0 0 0 1px rgba(167,139,250,0.3);
+}
+
+/* Group control bar */
+#group-bar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  background: rgba(167,139,250,0.08);
+  border: 1px solid rgba(167,139,250,0.3);
+  border-radius: var(--radius-sm);
+  padding: 10px 14px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+#group-bar-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--accent2);
+  white-space: nowrap;
+  min-width: 90px;
 }
 
 /* ── Monitor panel ──────────────────────────────────────────────────────────── */

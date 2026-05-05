@@ -73,9 +73,15 @@
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "YoshiBowman",
+      "repo": "DMX-Hue"
     }
   },
   "dependencies": {
+    "electron-updater": "^6.8.3",
     "node-hue-api": "^4.0.11"
   },
   "devDependencies": {

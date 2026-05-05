@@ -21,7 +21,7 @@ const DEFAULT_CONFIG = {
   universe: 0,
   sacnUniverse: 1,
   sacnMulticast: true,
-  protocol: 'artnet',   // 'artnet' | 'sacn' | 'both'
+  protocol: 'artnet',
   host: '0.0.0.0',
   transition: 100,
   colorloop: false,
@@ -29,6 +29,8 @@ const DEFAULT_CONFIG = {
   noLimit: false,
   disabledLights: {},
   lightsOrder: [],
+  dmxPriorityThreshold: 100, // sACN priority >= this takes over native control
+  scenes: {},                 // { sceneName: [ { id, on, rgb, bri } ] }
 };
 
 let config = { ...DEFAULT_CONFIG };
@@ -50,6 +52,30 @@ function saveConfig() {
 
 let hueApi = null;
 let mainWindow = null;
+
+// ── DMX priority takeover tracking ────────────────────────────────────────────
+
+let lastDmxTakeoverMs  = 0;
+let dmxTakeoverActive  = false;
+
+function markDmxActive() {
+  lastDmxTakeoverMs = Date.now();
+}
+
+function isDmxActive() {
+  return Date.now() - lastDmxTakeoverMs < 2000;
+}
+
+// Broadcast takeover state changes to renderer every 500 ms
+setInterval(() => {
+  const nowActive = isDmxActive();
+  if (nowActive !== dmxTakeoverActive) {
+    dmxTakeoverActive = nowActive;
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('dmx:takeover-change', { active: nowActive });
+    }
+  }
+}, 500);
 
 async function connectToSavedBridge() {
   if (!config.bridge || !config.user) return false;
@@ -231,6 +257,7 @@ function startArtnet() {
     const length = msg.readUInt16BE(16);
     const dmxData = msg.slice(18, 18 + length);
     dmxBuffer = Buffer.from(dmxData);
+    markDmxActive(); // Art-Net always takes over
     processArtnet(dmxData);
   });
 
@@ -296,12 +323,12 @@ function parseSACN(msg) {
   // Root vector 0x00000004, framing vector 0x00000002
   if (msg.readUInt32BE(18) !== 0x00000004) return null;
   if (msg.readUInt32BE(40) !== 0x00000002) return null;
-  const universe = msg.readUInt16BE(113);
+  const priority = msg[108];          // E1.31 priority byte (0–200, default 100)
+  const universe  = msg.readUInt16BE(113);
   const propCount = msg.readUInt16BE(123);
   if (msg.length < 125 + propCount) return null;
-  // Start code at 125, DMX data at 126
   const dmxData = msg.slice(126, 125 + propCount);
-  return { universe, dmxData };
+  return { universe, priority, dmxData };
 }
 
 function startSACN() {
@@ -321,12 +348,19 @@ function startSACN() {
     if (!result) { emitSacnDiag(); return; }
 
     sacnDiag.lastUniverse = result.universe;
+    sacnDiag.lastPriority = result.priority;
     emitSacnDiag();
 
     if (result.universe !== config.sacnUniverse) {
       sacnDiag.wrongUniverse++;
       return;
     }
+
+    // Only take over if priority meets or exceeds configured threshold
+    const threshold = config.dmxPriorityThreshold ?? 100;
+    if (result.priority < threshold) return;
+
+    markDmxActive();
     dmxBuffer = Buffer.from(result.dmxData);
     processArtnet(result.dmxData);
   });
@@ -840,6 +874,7 @@ ipcMain.handle('settings:save', (event, updates) => {
   const safeKeys = [
     'dmxAddress', 'universe', 'sacnUniverse', 'sacnMulticast',
     'protocol', 'host', 'transition', 'colorloop', 'white', 'noLimit',
+    'dmxPriorityThreshold',
   ];
   for (const key of safeKeys) {
     if (updates[key] !== undefined) config[key] = updates[key];
@@ -867,6 +902,96 @@ ipcMain.handle('artnet:stop', () => {
 });
 
 ipcMain.handle('artnet:status', () => buildStatusPayload());
+
+// ── Native light control ─────────────────────────────────────────────────────
+
+function hexToRgb(hex) {
+  const n = parseInt(hex.replace('#', ''), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+ipcMain.handle('lights:set-state', async (event, lightId, { on, rgb, bri, ct, mode }) => {
+  if (!hueApi) return { success: false, error: 'Not connected' };
+  const { LightState } = v3.lightStates;
+  const state = new LightState();
+  state.transitiontime(Math.round((config.transition || 100) / 100));
+
+  if (!on) {
+    state.off();
+  } else {
+    state.on(true);
+    if (mode === 'ct' && ct != null) {
+      state.ct(ct);
+      state.brightness(Math.max(1, bri ?? 100));
+    } else if (rgb) {
+      const [r, g, b] = hexToRgb(rgb);
+      const [h, s] = rgbToHsb(r, g, b);
+      state.hue(Math.round(h * 65535));
+      state.saturation(Math.round(s * 100));
+      state.brightness(Math.max(1, bri ?? 100));
+    } else {
+      state.brightness(Math.max(1, bri ?? 100));
+    }
+  }
+
+  try {
+    await hueApi.lights.setLightState(lightId, state);
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('dmx:is-active', () => isDmxActive());
+
+// ── Scene management ──────────────────────────────────────────────────────────
+
+ipcMain.handle('scenes:get', () => config.scenes || {});
+
+ipcMain.handle('scenes:save', (event, name, lights) => {
+  if (!config.scenes) config.scenes = {};
+  config.scenes[name] = lights;
+  saveConfig();
+  return { success: true };
+});
+
+ipcMain.handle('scenes:apply', async (event, name) => {
+  if (!hueApi) return { success: false, error: 'Not connected' };
+  const scene = (config.scenes || {})[name];
+  if (!scene) return { success: false, error: 'Scene not found' };
+  const errors = [];
+  for (const entry of scene) {
+    try {
+      const { LightState } = v3.lightStates;
+      const state = new LightState();
+      state.transitiontime(Math.round((config.transition || 100) / 100));
+      if (!entry.on) {
+        state.off();
+      } else {
+        state.on(true);
+        if (entry.rgb) {
+          const [r, g, b] = hexToRgb(entry.rgb);
+          const [h, s] = rgbToHsb(r, g, b);
+          state.hue(Math.round(h * 65535));
+          state.saturation(Math.round(s * 100));
+          state.brightness(Math.max(1, entry.bri ?? 100));
+        } else {
+          state.brightness(Math.max(1, entry.bri ?? 100));
+        }
+      }
+      await hueApi.lights.setLightState(entry.id, state);
+    } catch (err) {
+      errors.push(`Light ${entry.id}: ${err.message}`);
+    }
+  }
+  return { success: errors.length === 0, errors };
+});
+
+ipcMain.handle('scenes:delete', (event, name) => {
+  if (config.scenes) delete config.scenes[name];
+  saveConfig();
+  return { success: true };
+});
 
 // ── Bridge pairing ───────────────────────────────────────────────────────────
 
@@ -931,6 +1056,31 @@ function createWindow() {
 app.whenReady().then(async () => {
   loadConfig();
   createWindow();
+
+  // ── Auto-updater (production only) ────────────────────────────────────────
+  if (app.isPackaged) {
+    const { autoUpdater } = require('electron-updater');
+    autoUpdater.autoDownload = false;
+
+    autoUpdater.on('update-available', (info) => {
+      if (mainWindow && !mainWindow.isDestroyed())
+        mainWindow.webContents.send('update:available', { version: info.version });
+    });
+    autoUpdater.on('download-progress', (p) => {
+      if (mainWindow && !mainWindow.isDestroyed())
+        mainWindow.webContents.send('update:progress', { percent: Math.round(p.percent) });
+    });
+    autoUpdater.on('update-downloaded', () => {
+      if (mainWindow && !mainWindow.isDestroyed())
+        mainWindow.webContents.send('update:downloaded');
+    });
+    autoUpdater.on('error', () => {});
+
+    ipcMain.handle('update:download', () => autoUpdater.downloadUpdate());
+    ipcMain.handle('update:install',  () => { autoUpdater.quitAndInstall(); });
+
+    setTimeout(() => autoUpdater.checkForUpdates().catch(() => {}), 3000);
+  }
 
   // Try auto-connect on startup
   const connected = await connectToSavedBridge();

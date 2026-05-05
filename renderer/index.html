@@ -44,10 +44,24 @@
   </div>
 </div>
 
+<!-- Update banner (shown app-wide) -->
+<div id="update-banner" style="display:none">
+  <span id="update-banner-text">⬆ Update available</span>
+  <div id="update-progress-wrap" style="display:none;flex:1;max-width:160px">
+    <div class="scan-progress-bar-bg">
+      <div id="update-progress-bar" class="scan-progress-bar-fill"></div>
+    </div>
+  </div>
+  <button id="btn-update-download" class="btn btn-primary btn-sm">Download</button>
+  <button id="btn-update-install"  class="btn btn-primary btn-sm" style="display:none">Restart &amp; Install</button>
+  <button id="btn-update-dismiss"  class="btn btn-secondary btn-sm">✕</button>
+</div>
+
 <!-- Tabs -->
 <div id="tabs">
   <div class="tab active" data-tab="bridge">Bridge</div>
   <div class="tab" data-tab="lights">Lights</div>
+  <div class="tab" data-tab="control">Control</div>
   <div class="tab" data-tab="monitor">Monitor</div>
   <div class="tab" data-tab="settings">Settings</div>
 </div>
@@ -161,6 +175,48 @@
         <p>Connect to a bridge first</p>
       </div>
     </div>
+  </div>
+
+  <!-- Control panel -->
+  <div id="panel-control" class="panel">
+
+    <!-- DMX override banner -->
+    <div id="dmx-override-banner" style="display:none">
+      <span>⚡ DMX Override Active</span>
+      <span id="dmx-override-info" class="hint"></span>
+      <span class="hint" style="margin-left:auto">Native control resumes 2 s after last DMX packet</span>
+    </div>
+
+    <!-- Toolbar: priority threshold + scenes -->
+    <div id="control-toolbar">
+      <div class="lb-field">
+        <label>DMX Override Priority</label>
+        <input id="dmx-threshold-input" class="input input-sm" type="number" min="1" max="200" value="100">
+      </div>
+      <span class="hint">sACN priority ≥ this value takes over. Art-Net always overrides.</span>
+      <div class="control-scenes-row">
+        <select id="scene-select" class="select select-sm"><option value="">— No scene —</option></select>
+        <button id="btn-apply-scene"  class="btn btn-primary btn-sm"   disabled>Apply</button>
+        <button id="btn-save-scene"   class="btn btn-secondary btn-sm">Save Scene</button>
+        <button id="btn-delete-scene" class="btn btn-secondary btn-sm" disabled>Delete</button>
+      </div>
+    </div>
+
+    <!-- Save scene name input (hidden until Save clicked) -->
+    <div id="scene-name-row" style="display:none">
+      <input id="scene-name-input" class="input" placeholder="Scene name…" style="max-width:240px">
+      <button id="btn-scene-name-confirm" class="btn btn-primary btn-sm">Save</button>
+      <button id="btn-scene-name-cancel"  class="btn btn-secondary btn-sm">Cancel</button>
+    </div>
+
+    <!-- Per-light control grid -->
+    <div id="control-grid">
+      <div class="empty-state">
+        <div class="icon">🎛️</div>
+        <p>Connect to a bridge and load lights first</p>
+      </div>
+    </div>
+
   </div>
 
   <!-- Monitor panel -->

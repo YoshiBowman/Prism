@@ -22,6 +22,7 @@ function showTab(name) {
   if (name === 'lights'   && state.connected) refreshLights();
   if (name === 'settings') refreshSettings();
   if (name === 'monitor'  && state.lights.length > 0) buildMonitorCards(state.lights);
+  if (name === 'control') { buildControlCards(state.lights); loadScenes(); }
 }
 
 tabs.forEach(t => t.addEventListener('click', () => showTab(t.dataset.tab)));
@@ -328,6 +329,7 @@ function renderLights() {
   }
   for (const light of state.lights) lightsList.appendChild(buildLightRow(light));
   buildMonitorCards(state.lights);
+  buildControlCards(state.lights);
 }
 
 function buildLightRow(light) {
@@ -441,6 +443,205 @@ function updateDmxBars(dmx) {
     bar.style.height = `${Math.round(((dmx[i] || 0) / 255) * 24)}px`;
   });
 }
+
+// ── OTA Updates ───────────────────────────────────────────────────────────────
+
+const updateBanner       = document.getElementById('update-banner');
+const updateBannerText   = document.getElementById('update-banner-text');
+const updateProgressWrap = document.getElementById('update-progress-wrap');
+const updateProgressBar  = document.getElementById('update-progress-bar');
+const btnUpdateDownload  = document.getElementById('btn-update-download');
+const btnUpdateInstall   = document.getElementById('btn-update-install');
+
+window.hue.on('update:available', ({ version }) => {
+  updateBannerText.textContent = `⬆ Update available: v${version}`;
+  updateBanner.style.display = 'flex';
+});
+
+window.hue.on('update:progress', ({ percent }) => {
+  updateProgressWrap.style.display = 'flex';
+  updateProgressBar.style.width    = `${percent}%`;
+  updateBannerText.textContent     = `Downloading update… ${percent}%`;
+  btnUpdateDownload.style.display  = 'none';
+});
+
+window.hue.on('update:downloaded', () => {
+  updateBannerText.textContent    = '✓ Update downloaded — restart to install';
+  updateProgressWrap.style.display = 'none';
+  btnUpdateInstall.style.display  = '';
+  btnUpdateDownload.style.display = 'none';
+});
+
+btnUpdateDownload.addEventListener('click', () => window.hue.downloadUpdate());
+btnUpdateInstall.addEventListener('click',  () => window.hue.installUpdate());
+document.getElementById('btn-update-dismiss').addEventListener('click', () => {
+  updateBanner.style.display = 'none';
+});
+
+// ── Control panel ─────────────────────────────────────────────────────────────
+
+const controlGrid       = document.getElementById('control-grid');
+const dmxOverrideBanner = document.getElementById('dmx-override-banner');
+const dmxOverrideInfo   = document.getElementById('dmx-override-info');
+const dmxThresholdInput = document.getElementById('dmx-threshold-input');
+const sceneSelect       = document.getElementById('scene-select');
+const sceneNameRow      = document.getElementById('scene-name-row');
+const sceneNameInput    = document.getElementById('scene-name-input');
+
+// Debounce helper
+function debounce(fn, ms) {
+  let t;
+  return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
+}
+
+// Per-light state stored in renderer for scene saving
+const controlState = {}; // { lightId: { on, rgb, bri } }
+
+function buildControlCards(lights) {
+  if (!lights || lights.length === 0) {
+    controlGrid.innerHTML = '<div class="empty-state"><div class="icon">🎛️</div><p>Connect to a bridge and load lights first</p></div>';
+    return;
+  }
+  controlGrid.innerHTML = '';
+
+  for (const light of lights) {
+    if (!controlState[light.id]) {
+      controlState[light.id] = { on: light.state?.on ?? true, rgb: '#ffffff', bri: Math.round(((light.state?.bri ?? 254) / 254) * 100) };
+    }
+    const s = controlState[light.id];
+
+    const card = document.createElement('div');
+    card.className   = 'control-card';
+    card.dataset.lightId = light.id;
+    card.innerHTML = `
+      <div class="control-card-header">
+        <span class="control-card-name">${light.name}</span>
+        <label class="toggle" title="On / Off">
+          <input type="checkbox" class="ctrl-onoff" ${s.on ? 'checked' : ''}>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <div class="control-row">
+        <span class="control-row-label">Color</span>
+        <input type="color" class="color-input ctrl-color" value="${s.rgb}">
+      </div>
+      <div class="control-row">
+        <span class="control-row-label">Brightness</span>
+        <input type="range" min="1" max="100" value="${s.bri}" class="bri-slider ctrl-bri">
+        <span class="bri-val">${s.bri}%</span>
+      </div>`;
+
+    // On/Off toggle
+    card.querySelector('.ctrl-onoff').addEventListener('change', (e) => {
+      s.on = e.target.checked;
+      sendLightState(light.id, s);
+    });
+
+    // Color picker — debounced
+    const sendColor = debounce((rgb) => {
+      s.rgb = rgb;
+      sendLightState(light.id, s);
+    }, 80);
+    card.querySelector('.ctrl-color').addEventListener('input', (e) => sendColor(e.target.value));
+
+    // Brightness slider — debounced
+    const sendBri = debounce((bri) => {
+      s.bri = bri;
+      sendLightState(light.id, s);
+    }, 80);
+    card.querySelector('.ctrl-bri').addEventListener('input', (e) => {
+      const bri = parseInt(e.target.value);
+      e.target.closest('.control-row').querySelector('.bri-val').textContent = `${bri}%`;
+      sendBri(bri);
+    });
+
+    controlGrid.appendChild(card);
+  }
+}
+
+async function sendLightState(lightId, s) {
+  if (!s.on) {
+    await window.hue.setLightState(lightId, { on: false });
+    return;
+  }
+  await window.hue.setLightState(lightId, { on: true, rgb: s.rgb, bri: s.bri });
+}
+
+// DMX takeover — dim control cards while DMX is active
+window.hue.on('dmx:takeover-change', ({ active }) => {
+  dmxOverrideBanner.style.display = active ? 'flex' : 'none';
+  controlGrid.querySelectorAll('.control-card').forEach(c => c.classList.toggle('dmx-active', active));
+  const threshold = parseInt(dmxThresholdInput.value) || 100;
+  dmxOverrideInfo.textContent = active ? `(priority ≥ ${threshold})` : '';
+});
+
+// Save priority threshold on change
+dmxThresholdInput.addEventListener('change', () => {
+  window.hue.saveSettings({ dmxPriorityThreshold: parseInt(dmxThresholdInput.value) || 100 });
+});
+
+// ── Scenes ────────────────────────────────────────────────────────────────────
+
+async function loadScenes() {
+  const scenes = await window.hue.getScenes();
+  sceneSelect.innerHTML = '<option value="">— No scene —</option>';
+  for (const name of Object.keys(scenes)) {
+    const opt = document.createElement('option');
+    opt.value = opt.textContent = name;
+    sceneSelect.appendChild(opt);
+  }
+  const hasSel = sceneSelect.value !== '';
+  document.getElementById('btn-apply-scene').disabled  = !hasSel;
+  document.getElementById('btn-delete-scene').disabled = !hasSel;
+}
+
+sceneSelect.addEventListener('change', () => {
+  const hasSel = sceneSelect.value !== '';
+  document.getElementById('btn-apply-scene').disabled  = !hasSel;
+  document.getElementById('btn-delete-scene').disabled = !hasSel;
+});
+
+document.getElementById('btn-apply-scene').addEventListener('click', async () => {
+  const name = sceneSelect.value;
+  if (!name) return;
+  const res = await window.hue.applyScene(name);
+  toast(res.success ? `Scene "${name}" applied` : `Failed: ${(res.errors || []).join(', ')}`,
+        res.success ? 'success' : 'error');
+});
+
+document.getElementById('btn-save-scene').addEventListener('click', () => {
+  sceneNameRow.style.display = 'flex';
+  sceneNameInput.value = '';
+  sceneNameInput.focus();
+});
+
+document.getElementById('btn-scene-name-confirm').addEventListener('click', saveCurrentScene);
+sceneNameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') saveCurrentScene(); });
+
+async function saveCurrentScene() {
+  const name = sceneNameInput.value.trim();
+  if (!name) return;
+  sceneNameRow.style.display = 'none';
+
+  const snapshot = Object.entries(controlState).map(([id, s]) => ({ id, ...s }));
+  await window.hue.saveScene(name, snapshot);
+  await loadScenes();
+  sceneSelect.value = name;
+  sceneSelect.dispatchEvent(new Event('change'));
+  toast(`Scene "${name}" saved`, 'success');
+}
+
+document.getElementById('btn-scene-name-cancel').addEventListener('click', () => {
+  sceneNameRow.style.display = 'none';
+});
+
+document.getElementById('btn-delete-scene').addEventListener('click', async () => {
+  const name = sceneSelect.value;
+  if (!name) return;
+  await window.hue.deleteScene(name);
+  await loadScenes();
+  toast(`Scene "${name}" deleted`, 'info');
+});
 
 // ── Monitor panel ─────────────────────────────────────────────────────────────
 
@@ -627,6 +828,8 @@ async function refreshSettings() {
   document.getElementById('s-colorloop').checked    = !!cfg.colorloop;
   document.getElementById('s-white').checked        = !!cfg.white;
   document.getElementById('s-nolimit').checked      = !!cfg.noLimit;
+
+  if (dmxThresholdInput) dmxThresholdInput.value = cfg.dmxPriorityThreshold ?? 100;
 
   updateProtocolVisibility(cfg.protocol ?? 'artnet');
   updateMulticastHint();

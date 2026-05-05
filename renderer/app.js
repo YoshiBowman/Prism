@@ -914,9 +914,10 @@ document.getElementById('btn-refresh-nics-settings').addEventListener('click', (
 
 // ── Settings panel ────────────────────────────────────────────────────────────
 
-function updateProtocolVisibility(protocol) {
-  const sacnFields  = document.getElementById('sacn-fields');
-  sacnFields.style.display = (protocol === 'artnet') ? 'none' : '';
+function updateProtocolVisibility(_protocol) {
+  // sACN fields are always visible in Settings so they can always be configured.
+  // Protocol-based field hiding only applies to the listener bar (handled separately).
+  document.getElementById('sacn-fields').style.display = '';
 }
 
 function updateMulticastHint() {

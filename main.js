@@ -121,10 +121,60 @@ let artnetSocket = null;
 let artnetRunning = false;
 let dmxBuffer = Buffer.alloc(512, 0);
 
-// Per-light independent rate-limiting timers (parallel, not serial)
-const lightTimers   = {};   // lightId → pending setTimeout handle
-const lightLastSent = {};   // lightId → timestamp of last sent call
-const lightLastKey  = {};   // lightId → last serialized state key (dedup)
+// ── Throttled intermediary ────────────────────────────────────────────────────
+// DMX frames arrive up to 44 fps — far more than the Hue bridge can absorb.
+// The Hue v1 local API reliably handles ~10 commands/sec per light.
+//
+// Strategy:
+//   • Each incoming DMX frame just updates an in-memory "current value" table.
+//     No bridge calls happen here at all.
+//   • A 100 ms setInterval tick reads each light's latest value and sends it
+//     with transitiontime=1 (100 ms).  The bridge glides smoothly to that value
+//     and arrives just as the next tick fires.
+//
+// Result: the light tracks the console with at most ~100 ms of lag — completely
+// invisible on any fade.  Velocity prediction was tried but EMA convergence
+// introduced its own lag at the start of every fade; raw current value is simpler
+// and more accurate.
+
+const TICKER_MS = 100;
+
+// { lightId: { r, g, b, extra } }  — latest DMX values, updated every frame
+const lightCurrent = {};
+
+// Last key sent to bridge per light — skip call on unchanged values
+const lightLastKey = {};
+
+let bridgeTicker = null;
+
+function updateCurrent(lightId, r, g, b, extra) {
+  lightCurrent[lightId] = { r, g, b, extra };
+}
+
+function tickBridge() {
+  if (!hueApi || !config.bridge || !config.user) return;
+  const opts = { colorloop: config.colorloop, white: config.white };
+  for (const [lightId, cur] of Object.entries(lightCurrent)) {
+    if (config.disabledLights[lightId]) continue;
+    const { r, g, b, extra } = cur;
+    const key = extra ? `${r},${g},${b},${extra[0]},${extra[1]}` : `${r},${g},${b}`;
+    if (lightLastKey[lightId] === key) continue; // nothing changed — skip
+    lightLastKey[lightId] = key;
+    // tt=1 → 100 ms transition; bridge arrives at this value as the next tick fires
+    const payload = buildDirectPayload(r, g, b, extra, { ...opts, tt: 1 });
+    sendDirectState(lightId, payload);
+  }
+}
+
+function startBridgeTicker() {
+  if (!bridgeTicker) bridgeTicker = setInterval(tickBridge, TICKER_MS);
+}
+
+function stopBridgeTicker() {
+  if (bridgeTicker) { clearInterval(bridgeTicker); bridgeTicker = null; }
+  for (const k of Object.keys(lightCurrent)) delete lightCurrent[k];
+  for (const k of Object.keys(lightLastKey))  delete lightLastKey[k];
+}
 
 // Keep-alive HTTP agent — reuses TCP connections to the bridge, eliminates
 // the ~20-50 ms TCP handshake that node-hue-api pays on every call
@@ -149,7 +199,10 @@ function sendDirectState(lightId, payload) {
 
 // Build a plain-object payload (Hue API units) instead of a LightState object
 function buildDirectPayload(r, g, b, extraChannels, opts) {
-  const tt = Math.round((opts.transition ?? 100) / 100); // deciseconds
+  // tt is supplied by the caller:
+  //   • ticker path  → tt=1 (100 ms) so the bridge glides to the projected value
+  //   • direct path  → tt=0 (instant snap)
+  const tt = opts.tt !== undefined ? opts.tt : 0;
 
   if (r === 0 && g === 0 && b === 0) {
     if (!opts.white || (extraChannels && extraChannels[1] === 0))
@@ -225,26 +278,8 @@ function buildLightState(r, g, b, extraChannels, opts) {
   return state;
 }
 
-function scheduleUpdate(lightId, payload) {
-  // Cancel any pending call for this light and re-schedule
-  if (lightTimers[lightId]) clearTimeout(lightTimers[lightId]);
-  const rateMs = config.noLimit ? 0 : 60;
-  const wait   = Math.max(0, rateMs - (Date.now() - (lightLastSent[lightId] || 0)));
-  lightTimers[lightId] = setTimeout(() => {
-    delete lightTimers[lightId];
-    lightLastSent[lightId] = Date.now();
-    sendDirectState(lightId, payload);
-  }, wait);
-}
-
 function processArtnet(data) {
   if (!hueApi) return;
-
-  const opts = {
-    transition: config.transition === 'channel' ? (data[0] * 100) : config.transition,
-    colorloop: config.colorloop,
-    white: config.white,
-  };
 
   const channelsPerLight = config.white ? 5 : 3;
   const baseOffset = (config.dmxAddress - 1) + (config.transition === 'channel' ? 1 : 0);
@@ -258,19 +293,17 @@ function processArtnet(data) {
     const offset = baseOffset + i * channelsPerLight;
     if (offset + 2 >= data.length) break;
 
-    const r = data[offset];
-    const g = data[offset + 1];
-    const b = data[offset + 2];
+    const r     = data[offset];
+    const g     = data[offset + 1];
+    const b     = data[offset + 2];
     const extra = config.white ? [data[offset + 3] || 0, data[offset + 4] || 0] : null;
 
-    // Skip if nothing changed — avoids redundant bridge calls on static scenes
-    const key = extra ? `${r},${g},${b},${extra[0]},${extra[1]}` : `${r},${g},${b}`;
-    if (lightLastKey[light.id] === key) continue;
-    lightLastKey[light.id] = key;
-
-    const payload = buildDirectPayload(r, g, b, extra, opts);
-    scheduleUpdate(light.id, payload);
+    // Cache latest value — no bridge call here
+    updateCurrent(light.id, r, g, b, extra);
   }
+
+  // Ensure the 100 ms bridge ticker is running
+  startBridgeTicker();
 
   // Forward DMX buffer snapshot to renderer for live display
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -325,8 +358,8 @@ function stopArtnet() {
     artnetSocket = null;
   }
   artnetRunning = false;
-  updateQueue = [];
-  if (updateTimer) { clearTimeout(updateTimer); updateTimer = null; }
+  // Stop the predictive ticker when no protocol is running
+  if (!sacnRunning) stopBridgeTicker();
   return { success: true };
 }
 
@@ -446,6 +479,8 @@ function stopSACN() {
     sacnSocket = null;
   }
   sacnRunning = false;
+  // Stop the predictive ticker when no protocol is running
+  if (!artnetRunning) stopBridgeTicker();
   return { success: true };
 }
 
@@ -936,9 +971,9 @@ ipcMain.handle('artnet:start', () => {
 ipcMain.handle('artnet:stop', () => {
   stopArtnet();
   stopSACN();
-  // Clear per-light timers and dedup cache
-  for (const id of Object.keys(lightTimers))  { clearTimeout(lightTimers[id]); delete lightTimers[id]; }
-  for (const id of Object.keys(lightLastKey))  { delete lightLastKey[id]; }
+  // stopBridgeTicker() is called inside stopArtnet/stopSACN; calling it here
+  // as a safety net in case both were already stopped individually
+  stopBridgeTicker();
   return { success: true };
 });
 

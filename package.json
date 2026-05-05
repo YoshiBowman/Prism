@@ -21,6 +21,7 @@
     "directories": {
       "output": "dist"
     },
+    "afterSign": "build/notarize.js",
     "files": [
       "main.js",
       "preload.js",
@@ -34,7 +35,6 @@
       "gatekeeperAssess": false,
       "entitlements": "build/entitlements.mac.plist",
       "entitlementsInherit": "build/entitlements.mac.plist",
-      "afterSign": "build/notarize.js",
       "target": [
         {
           "target": "dmg",

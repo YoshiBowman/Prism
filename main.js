@@ -121,28 +121,31 @@ let artnetSocket = null;
 let artnetRunning = false;
 let dmxBuffer = Buffer.alloc(512, 0);
 
-// ── Throttled intermediary ────────────────────────────────────────────────────
-// DMX frames arrive up to 44 fps — far more than the Hue bridge can absorb.
-// The Hue v1 local API reliably handles ~10 commands/sec per light.
+// ── Smart intermediary ────────────────────────────────────────────────────────
+// The Hue bridge processes ~10 commands/sec total across all lights.  Sending
+// current-value-every-tick at 10 Hz × 4 lights = 40 commands/sec overflows its
+// internal queue, which then drains slowly — producing the "10-second fade"
+// the user sees even though the console is done in 3 seconds.
 //
-// Strategy:
-//   • Each incoming DMX frame just updates an in-memory "current value" table.
-//     No bridge calls happen here at all.
-//   • A 100 ms setInterval tick reads each light's latest value and sends it
-//     with transitiontime=1 (100 ms).  The bridge glides smoothly to that value
-//     and arrives just as the next tick fires.
-//
-// Result: the light tracks the console with at most ~100 ms of lag — completely
-// invisible on any fade.  Velocity prediction was tried but EMA convergence
-// introduced its own lag at the start of every fade; raw current value is simpler
-// and more accurate.
+// Strategy (true intermediary):
+//   • Each DMX frame updates a per-light "current value" table — no API calls.
+//   • A 250 ms tick compares current values to the previous tick to detect velocity.
+//   • If STATIC  → send current value with tt=0  (instant correction; dedup = 0 calls
+//                  on unchanging scenes).
+//   • If FADING  → extrapolate to the natural endpoint (the channel wall at 0 or 255)
+//                  and send ONE command with the matching transitiontime.
+//                  For a linear 3-second fade this means 1-2 total commands rather than
+//                  30, so the bridge queue never grows.  The bridge runs its own native
+//                  smooth transition and tracks the console perfectly.
+//   • End-of-fade → velocity drops to ~0, a single snap correction confirms final state.
 
-const TICKER_MS = 100;
+const TICKER_MS = 250;
 
-// { lightId: { r, g, b, extra } }  — latest DMX values, updated every frame
+// { lightId: { r, g, b, extra } }  — latest value from DMX frames
 const lightCurrent = {};
-
-// Last key sent to bridge per light — skip call on unchanged values
+// { lightId: { r, g, b } }         — values from the previous tick
+const lightPrev    = {};
+// { lightId: string }              — last sent endpoint key (dedup)
 const lightLastKey = {};
 
 let bridgeTicker = null;
@@ -151,18 +154,77 @@ function updateCurrent(lightId, r, g, b, extra) {
   lightCurrent[lightId] = { r, g, b, extra };
 }
 
+function clampByte(v) { return v < 0 ? 0 : v > 255 ? 255 : Math.round(v); }
+
 function tickBridge() {
   if (!hueApi || !config.bridge || !config.user) return;
   const opts = { colorloop: config.colorloop, white: config.white };
+
   for (const [lightId, cur] of Object.entries(lightCurrent)) {
     if (config.disabledLights[lightId]) continue;
-    const { r, g, b, extra } = cur;
-    const key = extra ? `${r},${g},${b},${extra[0]},${extra[1]}` : `${r},${g},${b}`;
-    if (lightLastKey[lightId] === key) continue; // nothing changed — skip
+
+    const prev = lightPrev[lightId];
+    lightPrev[lightId] = { r: cur.r, g: cur.g, b: cur.b };
+
+    if (!prev) {
+      // First tick — no history yet, just send current
+      const key = `s:${cur.r},${cur.g},${cur.b}`;
+      if (lightLastKey[lightId] === key) continue;
+      lightLastKey[lightId] = key;
+      sendDirectState(lightId, buildDirectPayload(cur.r, cur.g, cur.b, cur.extra, { ...opts, tt: 0 }));
+      continue;
+    }
+
+    const dr = cur.r - prev.r;
+    const dg = cur.g - prev.g;
+    const db = cur.b - prev.b;
+    const maxDelta = Math.max(Math.abs(dr), Math.abs(dg), Math.abs(db));
+
+    if (maxDelta < 2) {
+      // Static — instant correction, dedup prevents redundant calls
+      const key = `s:${cur.r},${cur.g},${cur.b}`;
+      if (lightLastKey[lightId] === key) continue;
+      lightLastKey[lightId] = key;
+      sendDirectState(lightId, buildDirectPayload(cur.r, cur.g, cur.b, cur.extra, { ...opts, tt: 0 }));
+      continue;
+    }
+
+    // ── Fading: extrapolate to natural endpoint ────────────────────────────
+    // velocity in units/ms over the last tick window
+    const vr = dr / TICKER_MS;
+    const vg = dg / TICKER_MS;
+    const vb = db / TICKER_MS;
+
+    // Time (ms) until the first channel hits its wall (0 or 255)
+    let timeToEnd = Infinity;
+    for (const [val, vel] of [[cur.r, vr], [cur.g, vg], [cur.b, vb]]) {
+      if (Math.abs(vel) < 0.001) continue;
+      const wall = vel > 0 ? 255 : 0;
+      const t = (wall - val) / vel;
+      if (t > 0 && t < timeToEnd) timeToEnd = t;
+    }
+
+    if (!isFinite(timeToEnd) || timeToEnd > 60000) {
+      // Can't extrapolate — fall back to snap
+      const key = `s:${cur.r},${cur.g},${cur.b}`;
+      if (lightLastKey[lightId] === key) continue;
+      lightLastKey[lightId] = key;
+      sendDirectState(lightId, buildDirectPayload(cur.r, cur.g, cur.b, cur.extra, { ...opts, tt: 0 }));
+      continue;
+    }
+
+    // Projected endpoint and transition duration
+    const pr = clampByte(cur.r + vr * timeToEnd);
+    const pg = clampByte(cur.g + vg * timeToEnd);
+    const pb = clampByte(cur.b + vb * timeToEnd);
+    const tt = Math.max(1, Math.round(timeToEnd / 100)); // deciseconds
+
+    // Dedup on endpoint only — tt naturally decreases each tick and doesn't need re-sending
+    const key = `f:${pr},${pg},${pb}`;
+    if (lightLastKey[lightId] === key) continue;
     lightLastKey[lightId] = key;
-    // tt=1 → 100 ms transition; bridge arrives at this value as the next tick fires
-    const payload = buildDirectPayload(r, g, b, extra, { ...opts, tt: 1 });
-    sendDirectState(lightId, payload);
+
+    sendDirectState(lightId, buildDirectPayload(pr, pg, pb, cur.extra, { ...opts, tt }));
   }
 }
 
@@ -173,7 +235,8 @@ function startBridgeTicker() {
 function stopBridgeTicker() {
   if (bridgeTicker) { clearInterval(bridgeTicker); bridgeTicker = null; }
   for (const k of Object.keys(lightCurrent)) delete lightCurrent[k];
-  for (const k of Object.keys(lightLastKey))  delete lightLastKey[k];
+  for (const k of Object.keys(lightPrev))    delete lightPrev[k];
+  for (const k of Object.keys(lightLastKey)) delete lightLastKey[k];
 }
 
 // Keep-alive HTTP agent — reuses TCP connections to the bridge, eliminates

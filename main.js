@@ -79,10 +79,44 @@ setInterval(() => {
   }
 }, 500);
 
+// ── Bridge health-check / auto-reconnect ──────────────────────────────────────
+// Runs every 30 s. Sends a lightweight GET to the bridge to confirm it's still
+// reachable (also keeps the TCP socket alive between DMX bursts) and silently
+// reconnects if the bridge has restarted or moved since the app launched.
+setInterval(async () => {
+  if (!config.bridge || !config.user) return;
+  try {
+    await new Promise((resolve, reject) => {
+      const req = http.request(
+        { hostname: config.bridge, port: 80, path: `/api/${config.user}/config`,
+          method: 'GET', agent: keepAliveAgent, timeout: 5000 },
+        res => { res.resume(); resolve(); }
+      );
+      req.on('error', reject);
+      req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+      req.end();
+    });
+  } catch {
+    // Bridge didn't respond — re-establish the hueApi session so node-hue-api
+    // calls (Control tab, light list) work again after a bridge restart.
+    if (config.bridge && config.user) {
+      try {
+        hueApi = await v3.api.createInsecureLocal(config.bridge).connect(config.user);
+        fetchLights().catch(() => {});
+      } catch {
+        hueApi = null;
+      }
+    }
+  }
+}, 30000);
+
 async function connectToSavedBridge() {
   if (!config.bridge || !config.user) return false;
   try {
     hueApi = await v3.api.createInsecureLocal(config.bridge).connect(config.user);
+    // Pre-populate light cache so DMX and Control tab work immediately on launch
+    // without requiring the user to visit the Lights tab first.
+    fetchLights().catch(() => {});
     return true;
   } catch {
     hueApi = null;
@@ -239,9 +273,12 @@ function stopBridgeTicker() {
   for (const k of Object.keys(lightLastKey)) delete lightLastKey[k];
 }
 
-// Keep-alive HTTP agent — reuses TCP connections to the bridge, eliminates
-// the ~20-50 ms TCP handshake that node-hue-api pays on every call
+// Keep-alive HTTP agent — reuses TCP connections to the bridge.
+// Free-socket timeout of 20 s ensures idle sockets are destroyed before the
+// Hue bridge closes them (~30 s), preventing silent ECONNRESET failures after
+// the app has been left running overnight with no DMX activity.
 const keepAliveAgent = new http.Agent({ keepAlive: true, maxSockets: Infinity });
+keepAliveAgent.on('free', socket => socket.setTimeout(20000, () => socket.destroy()));
 
 // Fast direct PUT to the Hue local REST API bypassing node-hue-api overhead
 function sendDirectState(lightId, payload) {
@@ -254,7 +291,7 @@ function sendDirectState(lightId, payload) {
     method:   'PUT',
     headers:  { 'Content-Type': 'application/json', 'Content-Length': body.length },
     agent:    keepAliveAgent,
-  }, res => res.resume()); // drain response without parsing
+  }, res => res.resume());
   req.on('error', () => {});
   req.write(body);
   req.end();

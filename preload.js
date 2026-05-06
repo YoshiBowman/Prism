@@ -50,6 +50,8 @@ contextBridge.exposeInMainWorld('hue', {
       'bridge:auto-connect',
       'bridge:found',
       'bridge:scan-progress',
+      'bridge:unreachable',
+      'bridge:reachable',
       'artnet:dmx-update',
       'artnet:status',
       'sacn:diag',

@@ -311,6 +311,14 @@ window.hue.on('bridge:auto-connect', async ({ connected, bridge }) => {
   }
 });
 
+window.hue.on('bridge:unreachable', () => {
+  toast('Bridge not responding — check connection or re-scan on the Bridge tab', 'error');
+});
+
+window.hue.on('bridge:reachable', () => {
+  toast('Bridge connection restored', 'success');
+});
+
 // ── Lights panel ──────────────────────────────────────────────────────────────
 
 const lightsList = document.getElementById('lights-list');

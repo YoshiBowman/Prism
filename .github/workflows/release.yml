@@ -54,6 +54,11 @@ jobs:
 
       - name: Build Windows / Linux
         if: matrix.os != 'macos-latest'
+        env:
+          # Prevent electron-builder from trying to auto-discover a code signing
+          # certificate on the CI runner — without this it exits silently on Windows
+          # when no cert is found, producing no .exe output.
+          CSC_IDENTITY_AUTO_DISCOVERY: false
         run: npm run build:${{ matrix.platform }} -- --publish never
 
       - name: Upload artifacts
@@ -63,10 +68,12 @@ jobs:
           path: |
             dist/*.dmg
             dist/*.exe
+            dist/*.zip
             dist/*.AppImage
             dist/*.deb
+            dist/*.blockmap
             dist/latest*.yml
-          if-no-files-found: ignore
+          if-no-files-found: warn
 
   release:
     needs: build

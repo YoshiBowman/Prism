@@ -97,40 +97,21 @@ setInterval(async () => {
       req.end();
     });
   } catch {
-    // Bridge didn't respond — silently re-establish (handles IP changes too)
+    // Bridge didn't respond — silently re-establish the session
     await connectToSavedBridge().catch(() => {});
   }
 }, 30000);
 
-// Try to connect to a specific bridge IP with the saved user token.
-async function _tryConnect(ip) {
-  const api = await v3.api.createInsecureLocal(ip).connect(config.user);
-  hueApi = api;
-  config.bridge = ip;   // update cached IP if it changed
-  saveConfig();
-  fetchLights().catch(() => {});
-  return true;
-}
-
 async function connectToSavedBridge() {
-  if (!config.user) return false;
-
-  // 1. Try the cached IP first (fast path — no discovery needed)
-  if (config.bridge) {
-    try { return await _tryConnect(config.bridge); } catch {}
-  }
-
-  // 2. Cached IP failed (bridge may have a new DHCP address) — auto-rediscover
+  if (!config.bridge || !config.user) return false;
   try {
-    const found = await v3.discovery.nupnpSearch();
-    for (const b of found) {
-      if (!b.ipaddress) continue;
-      try { return await _tryConnect(b.ipaddress); } catch {}
-    }
-  } catch {}
-
-  hueApi = null;
-  return false;
+    hueApi = await v3.api.createInsecureLocal(config.bridge).connect(config.user);
+    fetchLights().catch(() => {});
+    return true;
+  } catch {
+    hueApi = null;
+    return false;
+  }
 }
 
 // ── Network interfaces ────────────────────────────────────────────────────────

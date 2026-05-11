@@ -29,7 +29,6 @@ const DEFAULT_CONFIG = {
   noLimit: false,
   disabledLights: {},
   lightsOrder: [],
-  dmxPriorityThreshold: 100, // sACN priority >= this takes over native control
   scenes: {},                 // { sceneName: [ { id, on, rgb, bri } ] }
   lightStates: {},            // { lightId: { on, rgb, bri } } — persisted control-tab state
   lastTab: 'bridge',          // last active tab, restored on launch
@@ -522,10 +521,6 @@ function startSACN() {
       sacnDiag.wrongUniverse++;
       return;
     }
-
-    // Only take over if priority meets or exceeds configured threshold
-    const threshold = config.dmxPriorityThreshold ?? 100;
-    if (result.priority < threshold) return;
 
     markDmxActive();
     dmxBuffer = Buffer.from(result.dmxData);
@@ -1069,7 +1064,7 @@ ipcMain.handle('settings:save', (event, updates) => {
   const safeKeys = [
     'dmxAddress', 'universe', 'sacnUniverse', 'sacnMulticast',
     'protocol', 'host', 'transition', 'colorloop', 'white', 'noLimit',
-    'dmxPriorityThreshold', 'lightStates', 'lastTab',
+    'lightStates', 'lastTab',
   ];
   for (const key of safeKeys) {
     if (updates[key] !== undefined) config[key] = updates[key];

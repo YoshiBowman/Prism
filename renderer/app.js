@@ -537,7 +537,6 @@ document.getElementById('btn-update-dismiss').addEventListener('click', () => {
 const controlGrid       = document.getElementById('control-grid');
 const dmxOverrideBanner = document.getElementById('dmx-override-banner');
 const dmxOverrideInfo   = document.getElementById('dmx-override-info');
-const dmxThresholdInput = document.getElementById('dmx-threshold-input');
 const sceneSelect       = document.getElementById('scene-select');
 const sceneNameRow      = document.getElementById('scene-name-row');
 
@@ -728,13 +727,7 @@ async function sendLightState(lightId, s) {
 window.hue.on('dmx:takeover-change', ({ active }) => {
   dmxOverrideBanner.style.display = active ? 'flex' : 'none';
   controlGrid.querySelectorAll('.ctrl-tile').forEach(c => c.classList.toggle('dmx-active', active));
-  const threshold = parseInt(dmxThresholdInput.value) || 100;
-  dmxOverrideInfo.textContent = active ? `(priority ≥ ${threshold})` : '';
-});
-
-// Save priority threshold on change
-dmxThresholdInput.addEventListener('change', () => {
-  window.hue.saveSettings({ dmxPriorityThreshold: parseInt(dmxThresholdInput.value) || 100 });
+  dmxOverrideInfo.textContent = '';
 });
 
 // ── Scenes ────────────────────────────────────────────────────────────────────
@@ -986,8 +979,6 @@ async function refreshSettings() {
   document.getElementById('s-colorloop').checked    = !!cfg.colorloop;
   document.getElementById('s-white').checked        = !!cfg.white;
   document.getElementById('s-nolimit').checked      = !!cfg.noLimit;
-
-  if (dmxThresholdInput) dmxThresholdInput.value = cfg.dmxPriorityThreshold ?? 100;
 
   updateProtocolVisibility(cfg.protocol ?? 'artnet');
   updateMulticastHint();

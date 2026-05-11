@@ -97,31 +97,40 @@ setInterval(async () => {
       req.end();
     });
   } catch {
-    // Bridge didn't respond — re-establish the hueApi session so node-hue-api
-    // calls (Control tab, light list) work again after a bridge restart.
-    if (config.bridge && config.user) {
-      try {
-        hueApi = await v3.api.createInsecureLocal(config.bridge).connect(config.user);
-        fetchLights().catch(() => {});
-      } catch {
-        hueApi = null;
-      }
-    }
+    // Bridge didn't respond — silently re-establish (handles IP changes too)
+    await connectToSavedBridge().catch(() => {});
   }
 }, 30000);
 
+// Try to connect to a specific bridge IP with the saved user token.
+async function _tryConnect(ip) {
+  const api = await v3.api.createInsecureLocal(ip).connect(config.user);
+  hueApi = api;
+  config.bridge = ip;   // update cached IP if it changed
+  saveConfig();
+  fetchLights().catch(() => {});
+  return true;
+}
+
 async function connectToSavedBridge() {
-  if (!config.bridge || !config.user) return false;
-  try {
-    hueApi = await v3.api.createInsecureLocal(config.bridge).connect(config.user);
-    // Pre-populate light cache so DMX and Control tab work immediately on launch
-    // without requiring the user to visit the Lights tab first.
-    fetchLights().catch(() => {});
-    return true;
-  } catch {
-    hueApi = null;
-    return false;
+  if (!config.user) return false;
+
+  // 1. Try the cached IP first (fast path — no discovery needed)
+  if (config.bridge) {
+    try { return await _tryConnect(config.bridge); } catch {}
   }
+
+  // 2. Cached IP failed (bridge may have a new DHCP address) — auto-rediscover
+  try {
+    const found = await v3.discovery.nupnpSearch();
+    for (const b of found) {
+      if (!b.ipaddress) continue;
+      try { return await _tryConnect(b.ipaddress); } catch {}
+    }
+  } catch {}
+
+  hueApi = null;
+  return false;
 }
 
 // ── Network interfaces ────────────────────────────────────────────────────────

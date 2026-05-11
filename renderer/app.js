@@ -146,17 +146,20 @@ window.hue.on('bridge:found', (bridge) => {
 });
 
 window.hue.on('bridge:scan-progress', ({ phase, completed, total, subnets }) => {
-  if (phase === 'arp') {
-    scanProgressBar.style.width = '5%';
+  if (phase === 'saved') {
+    scanProgressBar.style.width = '3%';
+    scanProgressLabel.textContent = 'Checking last known bridge IP…';
+  } else if (phase === 'arp') {
+    scanProgressBar.style.width = '10%';
     scanProgressLabel.textContent = 'Checking ARP cache for known Hue bridges…';
   } else if (phase === 'ssdp') {
-    scanProgressBar.style.width = '15%';
+    scanProgressBar.style.width = '20%';
     scanProgressLabel.textContent = 'Sending UPnP/SSDP multicast on all interfaces…';
   } else if (phase === 'mdns') {
-    scanProgressBar.style.width = '25%';
+    scanProgressBar.style.width = '30%';
     scanProgressLabel.textContent = 'Searching via mDNS…';
   } else {
-    const pct = 25 + Math.round((completed / total) * 75);
+    const pct = 30 + Math.round((completed / total) * 70);
     scanProgressBar.style.width = `${pct}%`;
     scanProgressLabel.textContent =
       `Scanning ${subnets.map(s => s + '.0/24').join(', ')} — ${completed}/${total} hosts`;

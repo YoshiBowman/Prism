@@ -643,11 +643,12 @@ function calcDmxChannels() {
 
 // ── Discovery methods ─────────────────────────────────────────────────────────
 
-const HUE_OUI = ['00:17:88', 'ec:b5:fa', 'c4:29:96', 'b8:27:eb'];
+// Philips/Signify OUI prefixes for ARP-based discovery
+const HUE_OUI = ['00:17:88', 'ec:b5:fa', 'c4:29:96', 'b8:27:eb', '00:17:88', 'a4:34:d9'];
 
 // Probe a single IP on both HTTP :80 and HTTPS :443 for the Hue /api/config endpoint.
 // Hard setTimeout deadline prevents hanging when a host doesn't respond at the TCP level.
-function probeHueBridge(ip, timeoutMs = 900) {
+function probeHueBridge(ip, timeoutMs = 1500) {
   function tryProto(mod, port) {
     return new Promise((resolve, reject) => {
       let done = false;
@@ -929,6 +930,13 @@ ipcMain.handle('bridge:discover', async (event, ifaceIp, extraSubnets = []) => {
     if (!sender.isDestroyed()) sender.send('bridge:found', bridge);
   }
 
+  // ── Phase -1: Try the saved bridge IP first (instant — no scan needed) ──
+  if (config.bridge && config.user) {
+    if (!sender.isDestroyed()) sender.send('bridge:scan-progress', { phase: 'saved', completed: 0, total: 0, subnets: [] });
+    const savedResult = await probeHueBridge(config.bridge, 2000).catch(() => null);
+    if (savedResult) emit(savedResult);
+  }
+
   // ── Phase 0: ARP cache (instant — filters by Philips/Signify MAC OUI) ──
   if (!sender.isDestroyed()) sender.send('bridge:scan-progress', { phase: 'arp', completed: 0, total: 0, subnets: [] });
   const arpResults = await arpCacheScan().catch(() => []);
@@ -945,7 +953,14 @@ ipcMain.handle('bridge:discover', async (event, ifaceIp, extraSubnets = []) => {
   for (const b of mdnsResults) emit(b);
 
   // ── Phase 2: HTTP/HTTPS subnet scan fallback ──
-  const subnets = [...new Set([...getSubnetsToScan(ifaceIp), ...(extraSubnets || [])])];
+  // Always include the saved bridge's /24 so we find it even if it's on a different
+  // subnet from the selected NIC (e.g. different VLAN that's still routable).
+  const savedSubnet = config.bridge ? config.bridge.split('.').slice(0, 3).join('.') : null;
+  const subnets = [...new Set([
+    ...getSubnetsToScan(ifaceIp),
+    ...(extraSubnets || []),
+    ...(savedSubnet ? [savedSubnet] : []),
+  ])];
   if (subnets.length > 0) {
     const ips = [];
     for (const s of subnets) for (let i = 1; i <= 254; i++) ips.push(`${s}.${i}`);

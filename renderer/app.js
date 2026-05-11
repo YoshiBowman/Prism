@@ -59,6 +59,15 @@ function updateListenerBarVisibility(protocol) {
 
 lbProtocol.addEventListener('change', () => updateListenerBarVisibility(lbProtocol.value));
 
+// Keep listener bar ↔ settings universes in sync
+lbArtnetUniverse.addEventListener('input', () => {
+  document.getElementById('s-universe').value = lbArtnetUniverse.value;
+});
+lbSacnUniverse.addEventListener('input', () => {
+  document.getElementById('s-sacn-universe').value = lbSacnUniverse.value;
+  updateMulticastHint();
+});
+
 async function listenerBarStart() {
   // Save current values before starting
   const proto       = lbProtocol.value;
@@ -993,7 +1002,13 @@ async function refreshSettings() {
   setListenerRunning(artnetStatus.running);
 }
 
-document.getElementById('s-sacn-universe').addEventListener('input', updateMulticastHint);
+document.getElementById('s-sacn-universe').addEventListener('input', () => {
+  lbSacnUniverse.value = document.getElementById('s-sacn-universe').value;
+  updateMulticastHint();
+});
+document.getElementById('s-universe').addEventListener('input', () => {
+  lbArtnetUniverse.value = document.getElementById('s-universe').value;
+});
 
 document.getElementById('btn-save-settings').addEventListener('click', async () => {
   const transRaw = document.getElementById('s-transition').value.trim();

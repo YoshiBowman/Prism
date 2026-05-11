@@ -721,6 +721,12 @@ function buildControlCards(lights) {
 
     controlGrid.appendChild(tile);
   }
+
+  // Re-apply DMX override dimming if it was active when the tab was re-entered
+  if (state.dmxActive) {
+    dmxOverrideBanner.style.display = 'flex';
+    controlGrid.querySelectorAll('.ctrl-tile').forEach(c => c.classList.add('dmx-active'));
+  }
 }
 
 async function sendLightState(lightId, s) {
@@ -734,6 +740,7 @@ async function sendLightState(lightId, s) {
 
 // DMX takeover — dim tiles while DMX is active
 window.hue.on('dmx:takeover-change', ({ active }) => {
+  state.dmxActive = active; // persist so buildControlCards can re-apply on tab re-entry
   dmxOverrideBanner.style.display = active ? 'flex' : 'none';
   controlGrid.querySelectorAll('.ctrl-tile').forEach(c => c.classList.toggle('dmx-active', active));
   dmxOverrideInfo.textContent = '';

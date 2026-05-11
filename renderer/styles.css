@@ -657,7 +657,7 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
   display: flex;
   flex-direction: column;
   gap: 8px;    /* was 10px */
-  min-height: 216px;
+  min-height: 232px;
   /* specific properties — no transition:all */
   transition: border-color 150ms ease, opacity 300ms ease;
 }
@@ -737,31 +737,31 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 2px 0;
+  padding: 4px 0 2px;
 }
 .ctrl-color-swatch {
-  width: 56px; height: 56px;
+  width: 72px; height: 72px;
   border-radius: 50%;
   background: rgba(255,255,255,0.08);
   border: 1px solid var(--border);
   flex-shrink: 0;
-  transition: box-shadow 300ms ease, background 200ms ease;
+  transition: box-shadow 400ms ease, background 120ms ease;
 }
 .ctrl-tile.active .ctrl-color-swatch {
-  box-shadow: 0 0 28px color-mix(in srgb, var(--tile-color) 65%, transparent);
+  box-shadow: 0 0 32px color-mix(in srgb, var(--tile-color) 65%, transparent);
 }
 
 /* Hue + saturation strip picker */
 .ctrl-picker-strips {
   display: flex;
   flex-direction: column;
-  gap: 7px;
+  gap: 6px;
   padding: 0 0 4px;
 }
 .ctrl-hue-strip,
 .ctrl-sat-strip {
-  height: 12px;
-  border-radius: 6px;
+  height: 8px;
+  border-radius: 4px;
   position: relative;
   cursor: pointer;
   user-select: none;
@@ -782,10 +782,10 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
   position: absolute;
   top: 50%;
   transform: translate(-50%, -50%);
-  width: 18px; height: 18px;
+  width: 14px; height: 14px;
   border-radius: 50%;
-  border: 2.5px solid #fff;
-  box-shadow: 0 1px 5px rgba(0,0,0,0.55);
+  border: 2px solid #fff;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.6);
   pointer-events: none;
 }
 

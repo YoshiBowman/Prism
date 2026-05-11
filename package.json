@@ -1,6 +1,6 @@
 {
   "name": "dmx-hue",
-  "version": "1.5.11",
+  "version": "1.5.12",
   "description": "Philips Hue Art-Net / sACN bridge with GUI — control Hue lights via DMX",
   "author": {
     "name": "YoshiBowman",

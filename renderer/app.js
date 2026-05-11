@@ -22,7 +22,7 @@ function showTab(name) {
   if (name === 'lights'   && state.connected) refreshLights();
   if (name === 'settings') refreshSettings();
   if (name === 'monitor'  && state.lights.length > 0) buildMonitorCards(state.lights);
-  if (name === 'control') { buildControlCards(state.lights); loadScenes(); }
+  if (name === 'control') { buildControlCards(state.lights); loadScenes(); refreshControlSwatches(); }
 }
 
 tabs.forEach(t => t.addEventListener('click', () => {
@@ -472,6 +472,18 @@ window.hue.on('artnet:dmx-update', (dmx) => {
     const swatch = row.querySelector('.light-color-swatch');
     if (swatch) swatch.style.background = on ? `rgb(${r},${g},${b})` : 'rgba(255,255,255,0.05)';
   });
+
+  // Mirror live DMX colors onto the control-tab tile swatches
+  document.querySelectorAll('.ctrl-tile').forEach((tile, i) => {
+    const offset = base + i * channelsPerLight;
+    if (offset + 2 >= dmx.length) return;
+    const r = dmx[offset], g = dmx[offset + 1], b = dmx[offset + 2];
+    const on = r > 0 || g > 0 || b > 0;
+    const color = on ? `rgb(${r},${g},${b})` : 'rgba(255,255,255,0.05)';
+    const swatch = tile.querySelector('.ctrl-color-swatch');
+    if (swatch) swatch.style.background = color;
+    if (on) tile.style.setProperty('--tile-color', color);
+  });
 });
 
 // ── DMX bar visualization ─────────────────────────────────────────────────────
@@ -758,7 +770,7 @@ function buildControlCards(lights) {
         <button class="ctrl-power-btn" title="Toggle on/off">⏻</button>
       </div>
       <div class="ctrl-tile-mid">
-        <div class="ctrl-color-swatch" style="background:${s.on ? s.rgb : ''}"></div>
+        <div class="ctrl-color-swatch" style="background:${getLightColor(light)}"></div>
       </div>
       <div class="ctrl-tile-bot">
         <span class="ctrl-tile-name">${light.name}</span>
@@ -802,6 +814,23 @@ function buildControlCards(lights) {
   if (state.dmxActive) {
     dmxOverrideBanner.style.display = 'flex';
     controlGrid.querySelectorAll('.ctrl-tile').forEach(c => c.classList.add('dmx-active'));
+  }
+}
+
+// Fetch fresh bridge states and update ctrl-tile swatches to reflect reality.
+// Skipped when DMX is active — the dmx-update handler keeps them live instead.
+async function refreshControlSwatches() {
+  if (!state.connected || state.dmxActive) return;
+  const res = await window.hue.getLights();
+  if (!res || !res.lights) return;
+  for (const light of res.lights) {
+    const tile = controlGrid.querySelector(`[data-light-id="${light.id}"]`);
+    if (!tile) continue;
+    const color = getLightColor(light);
+    const swatch = tile.querySelector('.ctrl-color-swatch');
+    if (swatch) swatch.style.background = color;
+    tile.style.setProperty('--tile-color', color);
+    tile.classList.toggle('active', !!(light.state && light.state.on));
   }
 }
 

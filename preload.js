@@ -8,6 +8,7 @@ contextBridge.exposeInMainWorld('hue', {
 
   // Bridge
   discoverBridges:  (ifaceIp, extraSubnets) => ipcRenderer.invoke('bridge:discover', ifaceIp, extraSubnets),
+  cancelScan:       ()   => ipcRenderer.invoke('bridge:cancel-scan'),
   getScanSubnets:   ()   => ipcRenderer.invoke('bridge:get-scan-subnets'),
   verifyBridge:     (ip) => ipcRenderer.invoke('bridge:verify', ip),
   startPair:        (ip) => ipcRenderer.invoke('bridge:start-pair', ip),

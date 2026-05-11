@@ -918,7 +918,11 @@ function getSubnetsToScan(ifaceIp) {
 
 const yieldToEventLoop = () => new Promise(r => setImmediate(r));
 
+let scanCancelled = false;
+ipcMain.handle('bridge:cancel-scan', () => { scanCancelled = true; });
+
 ipcMain.handle('bridge:discover', async (event, ifaceIp, extraSubnets = []) => {
+  scanCancelled = false;
   const sender = event.sender;
   const found = [];
   const seen = new Set();
@@ -938,23 +942,27 @@ ipcMain.handle('bridge:discover', async (event, ifaceIp, extraSubnets = []) => {
   }
 
   // ── Phase 0: ARP cache (instant — filters by Philips/Signify MAC OUI) ──
+  if (scanCancelled) return { success: true, bridges: found };
   if (!sender.isDestroyed()) sender.send('bridge:scan-progress', { phase: 'arp', completed: 0, total: 0, subnets: [] });
   const arpResults = await arpCacheScan().catch(() => []);
   for (const b of arpResults) emit(b);
 
   // ── Phase 1: SSDP (UPnP multicast from every interface — subnet-independent) ──
+  if (scanCancelled) return { success: true, bridges: found };
   if (!sender.isDestroyed()) sender.send('bridge:scan-progress', { phase: 'ssdp', completed: 0, total: 0, subnets: [] });
   const ssdpResults = await ssdpDiscover(4000).catch(() => []);
   for (const b of ssdpResults) emit(b);
 
   // ── Phase 2: mDNS (finds bridges on any reachable subnet, incl. direct connections) ──
+  if (scanCancelled) return { success: true, bridges: found };
   if (!sender.isDestroyed()) sender.send('bridge:scan-progress', { phase: 'mdns', completed: 0, total: 0, subnets: [] });
   const mdnsResults = await mDNSDiscover(4500).catch(() => []);
   for (const b of mdnsResults) emit(b);
 
-  // ── Phase 2: HTTP/HTTPS subnet scan fallback ──
+  // ── Phase 3: HTTP/HTTPS subnet scan fallback ──
   // Always include the saved bridge's /24 so we find it even if it's on a different
   // subnet from the selected NIC (e.g. different VLAN that's still routable).
+  if (scanCancelled) return { success: true, bridges: found };
   const savedSubnet = config.bridge ? config.bridge.split('.').slice(0, 3).join('.') : null;
   const subnets = [...new Set([
     ...getSubnetsToScan(ifaceIp),
@@ -968,6 +976,7 @@ ipcMain.handle('bridge:discover', async (event, ifaceIp, extraSubnets = []) => {
     let completed = 0;
 
     for (let i = 0; i < ips.length; i += CONCURRENCY) {
+      if (scanCancelled) break;
       const batch = ips.slice(i, i + CONCURRENCY).map(ip => probeHueBridge(ip));
       const results = await Promise.all(batch);
       for (const r of results) { if (r) emit(r); }

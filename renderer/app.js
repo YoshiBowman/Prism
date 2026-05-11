@@ -183,19 +183,31 @@ function parseExtraSubnet() {
   return null;
 }
 
+function setScanRunning(running) {
+  document.getElementById('btn-scan').style.display        = running ? 'none' : '';
+  document.getElementById('btn-cancel-scan').style.display = running ? ''     : 'none';
+  scanProgressWrap.style.display = running ? '' : 'none';
+}
+
+document.getElementById('btn-cancel-scan').addEventListener('click', () => {
+  window.hue.cancelScan();
+  setScanRunning(false);
+  scanProgressLabel.textContent = 'Scan cancelled';
+  scanProgressWrap.style.display = '';
+});
+
 document.getElementById('btn-scan').addEventListener('click', async () => {
   bridgeList.innerHTML = '<div class="empty-state"><small>Scanning — results appear as bridges are found…</small></div>';
-  scanProgressWrap.style.display = '';
-  scanProgressBar.style.width    = '0%';
-  scanProgressLabel.textContent  = 'Starting scan…';
-  document.getElementById('btn-scan').disabled = true;
+  scanProgressBar.style.width   = '0%';
+  scanProgressLabel.textContent = 'Starting scan…';
+  setScanRunning(true);
 
   const ifaceIp = document.getElementById('discover-nic').value;
   const extra   = parseExtraSubnet();
   const res     = await window.hue.discoverBridges(ifaceIp, extra ? [extra] : []);
 
+  setScanRunning(false);
   scanProgressBar.style.width = '100%';
-  document.getElementById('btn-scan').disabled = false;
 
   if (!res.success) {
     bridgeList.innerHTML = `<div class="empty-state"><p>Scan error</p><small>${res.error}</small></div>`;
@@ -203,8 +215,11 @@ document.getElementById('btn-scan').addEventListener('click', async () => {
     return;
   }
 
-  scanProgressLabel.textContent = `Scan complete — ${res.bridges.length} bridge${res.bridges.length !== 1 ? 's' : ''} found`;
-  if (res.bridges.length === 0 && !bridgeList.querySelector('.bridge-item')) {
+  const count = res.bridges.length;
+  scanProgressLabel.textContent = count > 0
+    ? `Scan complete — ${count} bridge${count !== 1 ? 's' : ''} found`
+    : 'Scan complete';
+  if (count === 0 && !bridgeList.querySelector('.bridge-item')) {
     bridgeList.innerHTML = '<div class="empty-state"><p>No bridges found</p><small>Check that your Hue bridge is powered on and connected to this network</small></div>';
   }
 });
@@ -270,6 +285,9 @@ window.hue.on('bridge:pair-event', (event) => {
     pairDialog.className = 'card';
     setBridgeStatus(true, state.bridge || '');
     window.hue.bridgeStatus().then(s => setBridgeStatus(true, s.bridge));
+    // Clear the discovered list — no point showing "Connect" on a bridge we just connected to
+    bridgeList.innerHTML = '';
+    scanProgressWrap.style.display = 'none';
     toast('Bridge paired! Loading lights…', 'success');
     showTab('lights');
   } else if (event.type === 'error') {
@@ -307,6 +325,9 @@ window.hue.on('bridge:auto-connect', async ({ connected, bridge }) => {
 
   setBridgeStatus(connected, bridge, false);
   if (connected) {
+    // Clear any leftover scan results — already connected, no need to show the list
+    bridgeList.innerHTML = '';
+    scanProgressWrap.style.display = 'none';
     toast(`Connected to ${bridge}`, 'success');
     // Restore last active tab (default to lights when connected)
     const saved = state.settings.lastTab;

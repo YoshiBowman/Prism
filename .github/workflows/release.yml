@@ -50,16 +50,17 @@ jobs:
           APPLE_ID:                    ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID:               ${{ secrets.APPLE_TEAM_ID }}
-        run: npm run build:mac -- --publish never
+        run: npx electron-builder --mac --config electron-builder.js --publish never
 
-      - name: Build Windows / Linux
-        if: matrix.os != 'macos-latest'
+      - name: Build Windows
+        if: matrix.os == 'windows-latest'
         env:
-          # Prevent electron-builder from trying to auto-discover a code signing
-          # certificate on the CI runner — without this it exits silently on Windows
-          # when no cert is found, producing no .exe output.
           CSC_IDENTITY_AUTO_DISCOVERY: false
-        run: npm run build:${{ matrix.platform }} -- --publish never
+        run: npx electron-builder --win --config electron-builder.js --publish never
+
+      - name: Build Linux
+        if: matrix.os == 'ubuntu-latest'
+        run: npx electron-builder --linux --config electron-builder.js --publish never
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

@@ -47,7 +47,9 @@ function loadConfig() {
 }
 
 function saveConfig() {
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+  const tmp = CONFIG_PATH + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(config, null, 2));
+  fs.renameSync(tmp, CONFIG_PATH); // atomic replace — crash mid-write can't corrupt the live file
 }
 
 // ── Hue API state ────────────────────────────────────────────────────────────
@@ -426,6 +428,8 @@ function startArtnet() {
 
   artnetSocket.on('error', (err) => {
     artnetRunning = false;
+    try { artnetSocket.close(); } catch {} // prevent orphaned socket holding port 6454 after error
+    artnetSocket = null;
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('artnet:status', { running: false, error: err.message });
     }
@@ -530,6 +534,8 @@ function startSACN() {
 
   sacnSocket.on('error', (err) => {
     sacnRunning = false;
+    try { sacnSocket.close(); } catch {} // prevent orphaned socket holding port 5568 after error
+    sacnSocket = null;
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('artnet:status', { running: isAnyRunning(), sacnError: err.message });
     }
@@ -1301,5 +1307,7 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   stopArtnet();
+  stopSACN();        // ensure sACN socket is released; stopArtnet() alone left port 5568 open
+  stopBridgeTicker(); // safety net in case ticker is still running
   if (process.platform !== 'darwin') app.quit();
 });

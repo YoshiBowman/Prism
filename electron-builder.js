@@ -29,7 +29,10 @@ module.exports = {
     notarize: process.env.APPLE_TEAM_ID
       ? { teamId: process.env.APPLE_TEAM_ID }
       : false,
-    target: [{ target: 'dmg', arch: ['x64', 'arm64'] }],
+    target: [
+      { target: 'dmg', arch: ['x64', 'arm64'] },
+      { target: 'zip', arch: ['x64', 'arm64'] },
+    ],
   },
 
   win: {

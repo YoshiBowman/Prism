@@ -478,10 +478,12 @@ window.hue.on('update:available', ({ version }) => {
 });
 
 window.hue.on('update:progress', ({ percent }) => {
-  updateProgressWrap.style.display = 'flex';
-  updateProgressBar.style.width    = `${percent}%`;
-  updateBannerText.textContent     = `Downloading update… ${percent}%`;
-  btnUpdateDownload.style.display  = 'none';
+  updateProgressWrap.style.display  = 'flex';
+  updateProgressBar.style.width     = `${percent}%`;
+  updateBannerText.textContent      = `Downloading update… ${percent}%`;
+  btnUpdateDownload.style.display   = 'none';
+  btnUpdateDownload.disabled        = false;
+  btnUpdateDownload.textContent     = 'Download';
 });
 
 window.hue.on('update:downloaded', () => {
@@ -491,7 +493,19 @@ window.hue.on('update:downloaded', () => {
   btnUpdateDownload.style.display = 'none';
 });
 
-btnUpdateDownload.addEventListener('click', () => window.hue.downloadUpdate());
+window.hue.on('update:error', ({ message }) => {
+  updateBannerText.textContent    = '⬆ Update available';
+  updateProgressWrap.style.display = 'none';
+  btnUpdateDownload.style.display = '';
+  btnUpdateDownload.disabled      = false;
+  toast(`Update failed: ${message}`, 'error');
+});
+
+btnUpdateDownload.addEventListener('click', () => {
+  btnUpdateDownload.disabled = true;
+  btnUpdateDownload.textContent = 'Downloading…';
+  window.hue.downloadUpdate();
+});
 btnUpdateInstall.addEventListener('click',  () => window.hue.installUpdate());
 document.getElementById('btn-update-dismiss').addEventListener('click', () => {
   updateBanner.style.display = 'none';

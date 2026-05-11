@@ -59,6 +59,7 @@ contextBridge.exposeInMainWorld('hue', {
       'update:available',
       'update:progress',
       'update:downloaded',
+      'update:error',
     ];
     if (allowed.includes(channel)) ipcRenderer.on(channel, (_, ...args) => fn(...args));
   },

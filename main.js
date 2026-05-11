@@ -1258,9 +1258,18 @@ app.whenReady().then(() => {
       if (mainWindow && !mainWindow.isDestroyed())
         mainWindow.webContents.send('update:downloaded');
     });
-    autoUpdater.on('error', () => {});
+    autoUpdater.on('error', (err) => {
+      if (mainWindow && !mainWindow.isDestroyed())
+        mainWindow.webContents.send('update:error', { message: err ? err.message : 'Unknown error' });
+    });
 
-    ipcMain.handle('update:download', () => autoUpdater.downloadUpdate());
+    ipcMain.handle('update:download', async () => {
+      try { await autoUpdater.downloadUpdate(); }
+      catch (err) {
+        if (mainWindow && !mainWindow.isDestroyed())
+          mainWindow.webContents.send('update:error', { message: err ? err.message : 'Download failed' });
+      }
+    });
     ipcMain.handle('update:install',  () => { autoUpdater.quitAndInstall(); });
 
     setTimeout(() => autoUpdater.checkForUpdates().catch(() => {}), 5000);

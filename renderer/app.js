@@ -541,6 +541,74 @@ document.getElementById('btn-update-dismiss').addEventListener('click', () => {
   updateBanner.style.display = 'none';
 });
 
+// ── Color picker helpers ──────────────────────────────────────────────────────
+
+function hexToHsb(hex) {
+  const n = parseInt((hex || '#000000').replace('#', ''), 16);
+  const r = ((n >> 16) & 255) / 255, g = ((n >> 8) & 255) / 255, b = (n & 255) / 255;
+  const max = Math.max(r, g, b), d = max - Math.min(r, g, b);
+  const v = max, s = max === 0 ? 0 : d / max;
+  let h = 0;
+  if (d > 0) {
+    if      (max === r) h = (g - b) / d + (g < b ? 6 : 0);
+    else if (max === g) h = (b - r) / d + 2;
+    else                h = (r - g) / d + 4;
+    h /= 6;
+  }
+  return [h * 360, s, v]; // h: 0–360, s: 0–1, v: 0–1
+}
+
+function hsbToHex(h, s, v) {
+  h = ((h % 360) + 360) % 360;
+  const i = Math.floor(h / 60) % 6, f = h / 60 - Math.floor(h / 60);
+  const p = v*(1-s), q = v*(1-f*s), t = v*(1-(1-f)*s);
+  const [r, g, b] = [[v,t,p],[q,v,p],[p,v,t],[p,q,v],[t,p,v],[v,p,q]][i];
+  return '#' + [r, g, b].map(x => Math.round(x*255).toString(16).padStart(2,'0')).join('');
+}
+
+// Build a pair of inline hue + saturation strip pickers.
+// onColor(hex) fires on every drag interaction; hex is always full-brightness.
+function buildColorStrips(initHex, onColor) {
+  let [h, sat] = hexToHsb(initHex);
+
+  const el = document.createElement('div');
+  el.className = 'ctrl-picker-strips';
+  el.innerHTML = `
+    <div class="ctrl-hue-strip"><div class="ctrl-strip-thumb"></div></div>
+    <div class="ctrl-sat-strip"><div class="ctrl-strip-thumb"></div></div>`;
+
+  const hueStrip = el.querySelector('.ctrl-hue-strip');
+  const satStrip = el.querySelector('.ctrl-sat-strip');
+  const hueThumb = hueStrip.querySelector('.ctrl-strip-thumb');
+  const satThumb = satStrip.querySelector('.ctrl-strip-thumb');
+
+  function refresh() {
+    hueThumb.style.left       = `${(h / 360) * 100}%`;
+    hueThumb.style.background = `hsl(${h},100%,50%)`;
+    satStrip.style.setProperty('--sat-end', `hsl(${h},100%,50%)`);
+    satThumb.style.left       = `${sat * 100}%`;
+    satThumb.style.background = hsbToHex(h, sat, 1);
+  }
+
+  function pct(e, strip) {
+    const r = strip.getBoundingClientRect();
+    return Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
+  }
+
+  function wire(strip, fn) {
+    strip.addEventListener('pointerdown', e => { strip.setPointerCapture(e.pointerId); fn(pct(e, strip)); });
+    strip.addEventListener('pointermove', e => { if (e.buttons & 1) fn(pct(e, strip)); });
+  }
+
+  wire(hueStrip, t => { h = t * 360; refresh(); onColor(hsbToHex(h, sat, 1)); });
+  wire(satStrip, t => { sat = t;      refresh(); onColor(hsbToHex(h, sat, 1)); });
+  refresh();
+
+  // Allow external sync (e.g. when DMX or a scene changes the tile color)
+  el.setColor = hex => { [h, sat] = hexToHsb(hex); refresh(); };
+  return el;
+}
+
 // ── Control panel ─────────────────────────────────────────────────────────────
 
 const controlGrid       = document.getElementById('control-grid');
@@ -551,6 +619,7 @@ const sceneNameRow      = document.getElementById('scene-name-row');
 
 // Group selection
 const selectedLights = new Set();
+let groupHex = '#ffcc66'; // persists across group bar rebuilds
 
 function getGroupBar() { return document.getElementById('group-bar'); }
 
@@ -565,39 +634,49 @@ function updateGroupBar() {
     bar.id = 'group-bar';
     bar.innerHTML = `
       <span id="group-bar-label"></span>
-      <div class="control-row" style="flex:1;margin:0;gap:10px">
-        <span class="control-row-label" style="width:auto">Color</span>
-        <input type="color" class="color-input" id="group-color" value="#ffffff">
-        <span class="control-row-label" style="width:auto;margin-left:10px">Brightness</span>
-        <input type="range" min="1" max="100" value="100" class="bri-slider" id="group-bri" style="max-width:120px">
+      <div class="group-bar-color">
+        <div class="group-bar-swatch"></div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="font-size:11px;color:var(--text3)">Bri</span>
+        <input type="range" min="1" max="100" value="100" class="bri-slider" id="group-bri" style="width:110px">
         <span id="group-bri-val" class="bri-val">100%</span>
       </div>
       <button class="btn btn-secondary btn-sm" id="group-clear">✕ Clear</button>`;
     controlGrid.parentElement.insertBefore(bar, controlGrid);
 
-    const groupColor = bar.querySelector('#group-color');
-    const groupBri   = bar.querySelector('#group-bri');
+    const groupSwatch = bar.querySelector('.group-bar-swatch');
+    const groupBri    = bar.querySelector('#group-bri');
     const groupBriVal = bar.querySelector('#group-bri-val');
 
     const sendGroup = debounce(() => {
-      const rgb = groupColor.value;
+      const rgb = groupHex;
       const bri = parseInt(groupBri.value);
       for (const id of selectedLights) {
         controlState[id] = { ...controlState[id], rgb, bri, on: true };
         sendLightState(id, controlState[id]);
-        // sync individual card UI
         const tile = controlGrid.querySelector(`[data-light-id="${id}"]`);
         if (tile) {
-          controlState[id] = { ...controlState[id], rgb, bri, on: true };
           applyTileVisual(tile, controlState[id]);
           tile.querySelector('.ctrl-bri').value      = bri;
           tile.querySelector('.bri-val').textContent = `${bri}%`;
+          // keep per-tile strips in sync
+          const tileStrips = tile.querySelector('.ctrl-picker-strips');
+          if (tileStrips && tileStrips.setColor) tileStrips.setColor(rgb);
         }
       }
     }, 80);
 
-    groupColor.addEventListener('input', sendGroup);
-    groupBri.addEventListener('input', (e) => {
+    // Build hue+sat strips for group bar
+    const groupStrips = buildColorStrips(groupHex, hex => {
+      groupHex = hex;
+      groupSwatch.style.background = hex;
+      sendGroup();
+    });
+    bar.querySelector('.group-bar-color').appendChild(groupStrips);
+    groupSwatch.style.background = groupHex;
+
+    groupBri.addEventListener('input', e => {
       groupBriVal.textContent = `${e.target.value}%`;
       sendGroup();
     });
@@ -644,8 +723,6 @@ function applyTileVisual(tile, s) {
   tile.classList.toggle('active', !!s.on);
   const swatch = tile.querySelector('.ctrl-color-swatch');
   if (swatch) swatch.style.background = s.on ? s.rgb : '';
-  const colorInput = tile.querySelector('.ctrl-color-input');
-  if (colorInput) colorInput.value = s.rgb;
 }
 
 function buildControlCards(lights) {
@@ -681,10 +758,7 @@ function buildControlCards(lights) {
         <button class="ctrl-power-btn" title="Toggle on/off">⏻</button>
       </div>
       <div class="ctrl-tile-mid">
-        <div class="ctrl-color-wrap" title="Change color">
-          <div class="ctrl-color-swatch" style="background:${s.on ? s.rgb : ''}"></div>
-          <input type="color" class="ctrl-color-input" value="${s.rgb}">
-        </div>
+        <div class="ctrl-color-swatch" style="background:${s.on ? s.rgb : ''}"></div>
       </div>
       <div class="ctrl-tile-bot">
         <span class="ctrl-tile-name">${light.name}</span>
@@ -693,6 +767,15 @@ function buildControlCards(lights) {
           <span class="bri-val">${s.bri}%</span>
         </div>
       </div>`;
+
+    // Insert hue + sat strip picker between mid and bot
+    const sendColor = debounce(rgb => {
+      s.rgb = rgb;
+      applyTileVisual(tile, s);
+      sendLightState(light.id, s);
+    }, 80);
+    const strips = buildColorStrips(s.rgb, sendColor);
+    tile.querySelector('.ctrl-tile-mid').after(strips);
 
     tile.querySelector('.ctrl-sel-dot').addEventListener('click', (e) => {
       e.stopPropagation();
@@ -704,13 +787,6 @@ function buildControlCards(lights) {
       applyTileVisual(tile, s);
       sendLightState(light.id, s);
     });
-
-    const sendColor = debounce((rgb) => {
-      s.rgb = rgb;
-      applyTileVisual(tile, s);
-      sendLightState(light.id, s);
-    }, 80);
-    tile.querySelector('.ctrl-color-input').addEventListener('input', (e) => sendColor(e.target.value));
 
     const sendBri = debounce((bri) => { s.bri = bri; sendLightState(light.id, s); }, 80);
     tile.querySelector('.ctrl-bri').addEventListener('input', (e) => {

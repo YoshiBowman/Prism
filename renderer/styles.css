@@ -685,6 +685,7 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
 /* All tile content above the glow */
 .ctrl-tile-top,
 .ctrl-tile-mid,
+.ctrl-picker-strips,
 .ctrl-tile-bot { position: relative; z-index: 1; }
 
 /* Top row: select dot + power button */
@@ -731,36 +732,61 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
   box-shadow: 0 0 14px color-mix(in srgb, var(--tile-color) 50%, transparent);
 }
 
-/* Color swatch (center) — larger and more prominent per spec */
+/* Color swatch + strip pickers */
 .ctrl-tile-mid {
   display: flex;
   align-items: center;
   justify-content: center;
-  flex: 1;
-}
-.ctrl-color-wrap {
-  position: relative;
-  width: 80px; height: 80px;   /* was 68px — "let it breathe" per spec */
-  cursor: pointer;
+  padding: 2px 0;
 }
 .ctrl-color-swatch {
-  width: 100%; height: 100%;
+  width: 56px; height: 56px;
   border-radius: 50%;
   background: rgba(255,255,255,0.08);
   border: 1px solid var(--border);
+  flex-shrink: 0;
   transition: box-shadow 300ms ease, background 200ms ease;
 }
 .ctrl-tile.active .ctrl-color-swatch {
   box-shadow: 0 0 28px color-mix(in srgb, var(--tile-color) 65%, transparent);
 }
-.ctrl-color-input {
-  position: absolute;
-  inset: 0;
-  width: 100%; height: 100%;
-  opacity: 0;
+
+/* Hue + saturation strip picker */
+.ctrl-picker-strips {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 0 0 4px;
+}
+.ctrl-hue-strip,
+.ctrl-sat-strip {
+  height: 12px;
+  border-radius: 6px;
+  position: relative;
   cursor: pointer;
-  border: none;
-  padding: 0;
+  user-select: none;
+  touch-action: none;
+}
+.ctrl-hue-strip {
+  background: linear-gradient(to right,
+    hsl(0,100%,50%),   hsl(30,100%,50%),  hsl(60,100%,50%),
+    hsl(90,100%,50%),  hsl(120,100%,50%), hsl(150,100%,50%),
+    hsl(180,100%,50%), hsl(210,100%,50%), hsl(240,100%,50%),
+    hsl(270,100%,50%), hsl(300,100%,50%), hsl(330,100%,50%),
+    hsl(360,100%,50%));
+}
+.ctrl-sat-strip {
+  background: linear-gradient(to right, #fff, var(--sat-end, hsl(0,100%,50%)));
+}
+.ctrl-strip-thumb {
+  position: absolute;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 18px; height: 18px;
+  border-radius: 50%;
+  border: 2.5px solid #fff;
+  box-shadow: 0 1px 5px rgba(0,0,0,0.55);
+  pointer-events: none;
 }
 
 /* Bottom: name + brightness */
@@ -824,11 +850,32 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
   flex-wrap: wrap;
 }
 #group-bar-label {
-  font-size: 11px;    /* was 12px */
+  font-size: 11px;
   font-weight: 500;
   color: var(--accent2);
   white-space: nowrap;
   min-width: 90px;
+}
+.group-bar-color {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  min-width: 200px;
+}
+.group-bar-swatch {
+  width: 28px; height: 28px;
+  border-radius: 50%;
+  border: 1px solid var(--border2);
+  flex-shrink: 0;
+  background: #ffcc66;
+  transition: background 150ms ease;
+}
+/* strips inside group bar fill the available width, no extra bottom padding */
+.group-bar-color .ctrl-picker-strips {
+  flex: 1;
+  padding: 0;
+  gap: 6px;
 }
 
 /* ── Monitor panel ──────────────────────────────────────────────────────────── */

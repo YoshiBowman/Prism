@@ -1353,7 +1353,10 @@ function startCompanionServer() {
             else {
               state.on(true);
               if (entry.rgb) {
-                const [r, g, b] = entry.rgb;
+                const hex = entry.rgb.replace('#', '');
+                const r = parseInt(hex.substring(0, 2), 16);
+                const g = parseInt(hex.substring(2, 4), 16);
+                const b = parseInt(hex.substring(4, 6), 16);
                 const [h, s, vv] = rgbToHsb(r, g, b);
                 state.hue(Math.round(h * 65535));
                 state.saturation(Math.round(s * 100));

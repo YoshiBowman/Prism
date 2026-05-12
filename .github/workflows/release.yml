@@ -81,11 +81,19 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+
+      - name: Bundle Companion module
+        run: |
+          cd companion-module
+          zip -r ../dist/companion-module-prism.zip .
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

@@ -131,12 +131,17 @@ Switch to the **Monitor** tab to see live level meters for every mapped light. T
 
 Prism runs a local HTTP API on port **38765** that Bitfocus Companion can connect to, giving you Stream Deck buttons for your presets.
 
+> **Note:** The Prism module is not yet in the official Companion module registry. Install it manually as an offline module using the steps below.
+
 ### Installing the Companion Module
 
-1. Copy the `companion-module/` folder from this repo into your Companion `modules/` directory.
-2. Restart Companion.
-3. Add a new connection — search for **Prism**.
-4. Set the host to `localhost` (or the IP of the machine running Prism) and port to `38765`.
+1. **Download** `companion-module-prism.zip` from the [Releases](https://github.com/YoshiBowman/Prism/releases) page and extract it to a folder on your computer (e.g. `~/companion-modules/companion-module-prism`).
+2. **Open Companion** in your browser and go to **Settings → System**.
+3. Under **Extra module path**, enter the path to the folder you extracted the module into (the folder that contains `package.json`).
+4. Click **Save** and then **Restart Companion** using the button on the same page.
+5. Go to **Connections**, click **Add connection**, and search for **Prism**.
+6. Set the **Host** to `localhost` (or the IP of the machine running Prism if Companion is on a different machine) and **Port** to `38765`.
+7. Click **Save**. Companion will connect and load your presets automatically.
 
 ### Available Actions
 

@@ -57,6 +57,6 @@ module.exports = {
   publish: {
     provider: 'github',
     owner:    'YoshiBowman',
-    repo:     'DMX-Hue',
+    repo:     'Prism',
   },
 };

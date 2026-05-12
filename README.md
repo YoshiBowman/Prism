@@ -22,7 +22,7 @@ A desktop app that bridges your DMX lighting console to Philips Hue lights over 
 
 ## Download
 
-Pre-built installers are available on the [Releases](https://github.com/YoshiBowman/DMX-Hue/releases) page:
+Pre-built installers are available on the [Releases](https://github.com/YoshiBowman/Prism/releases) page:
 
 | Platform | File |
 |----------|------|
@@ -42,8 +42,8 @@ Pre-built installers are available on the [Releases](https://github.com/YoshiBow
 ### Setup
 
 ```bash
-git clone https://github.com/YoshiBowman/DMX-Hue.git
-cd DMX-Hue
+git clone https://github.com/YoshiBowman/Prism.git
+cd Prism
 npm install
 npm start
 ```

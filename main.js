@@ -648,37 +648,67 @@ function calcDmxChannels() {
 const HUE_OUI = ['00:17:88', 'ec:b5:fa', 'c4:29:96', 'b8:27:eb', '00:17:88', 'a4:34:d9'];
 
 // Probe a single IP on both HTTP :80 and HTTPS :443 for the Hue /api/config endpoint.
-// Hard setTimeout deadline prevents hanging when a host doesn't respond at the TCP level.
 function probeHueBridge(ip, timeoutMs = 1500) {
-  function tryProto(mod, port) {
+  function tryFetch(mod, port) {
+    const opts = {
+      hostname: ip, port, path: '/api/config',
+      rejectUnauthorized: false,
+      // Hue Bridge uses TLS 1.0/1.1 on older firmware — allow legacy versions
+      minVersion: 'TLSv1',
+      ciphers: 'ALL',
+    };
     return new Promise((resolve, reject) => {
       let done = false;
       const finish = (val) => { if (done) return; done = true; if (val) resolve(val); else reject(); };
       const deadline = setTimeout(() => finish(null), timeoutMs);
       try {
-        const req = mod.get(
-          { hostname: ip, port, path: '/api/config', rejectUnauthorized: false },
-          (res) => {
+        const req = mod.get(opts, (res) => {
+          // Follow one HTTP→HTTPS redirect
+          if ((res.statusCode === 301 || res.statusCode === 302) && res.headers.location) {
+            res.resume();
             clearTimeout(deadline);
-            let data = '';
-            res.on('data', c => { data += c; });
-            res.on('end', () => {
-              try {
-                const j = JSON.parse(data);
-                const ok = j.bridgeid || j.modelid;
-                console.log(`[probe] ${ip}:${port} response ok=${!!ok} keys=${Object.keys(j).join(',')}`);
-                finish(ok ? { ip, name: j.name || 'Hue Bridge', bridgeid: j.bridgeid } : null);
-              } catch (e) { console.log(`[probe] ${ip}:${port} parse error: ${e.message} body=${data.slice(0,100)}`); finish(null); }
-            });
-            res.on('error', () => finish(null));
+            tryFetch(https, 443).then(resolve).catch(() => reject());
+            return;
           }
-        );
-        req.on('error', (e) => { clearTimeout(deadline); console.log(`[probe] ${ip}:${port} error: ${e.code} ${e.message}`); finish(null); });
-        req.setTimeout(timeoutMs, () => { console.log(`[probe] ${ip}:${port} timeout`); try { req.destroy(); } catch {} finish(null); });
+          clearTimeout(deadline);
+          let data = '';
+          res.on('data', c => { data += c; });
+          res.on('end', () => {
+            try {
+              const j = JSON.parse(data);
+              // Accept any response that looks like a Hue bridge
+              const ok = j.bridgeid || j.modelid || j.apiversion || j.name;
+              finish(ok ? { ip, name: j.name || 'Hue Bridge', bridgeid: j.bridgeid || null } : null);
+            } catch { finish(null); }
+          });
+          res.on('error', () => finish(null));
+        });
+        req.on('error', () => { clearTimeout(deadline); finish(null); });
+        req.setTimeout(timeoutMs, () => { try { req.destroy(); } catch {} finish(null); });
       } catch { clearTimeout(deadline); finish(null); }
     });
   }
-  return Promise.any([tryProto(http, 80), tryProto(https, 443)]).catch(() => null);
+  return Promise.any([tryFetch(http, 80), tryFetch(https, 443)]).catch(() => null);
+}
+
+// Hue portal discovery — asks Signify's cloud which bridge is on this public IP.
+// Works even when local multicast (SSDP/mDNS) is blocked.
+function portalDiscover() {
+  return new Promise((resolve) => {
+    const req = https.get('https://discovery.meethue.com/', { rejectUnauthorized: true }, (res) => {
+      let data = '';
+      res.on('data', c => { data += c; });
+      res.on('end', () => {
+        try {
+          const arr = JSON.parse(data);
+          if (!Array.isArray(arr)) { resolve([]); return; }
+          resolve(arr.map(b => ({ ip: b.internalipaddress, name: 'Hue Bridge', bridgeid: b.id || null })).filter(b => b.ip));
+        } catch { resolve([]); }
+      });
+    });
+    req.on('error', () => resolve([]));
+    req.setTimeout(5000, () => { try { req.destroy(); } catch {} resolve([]); });
+  });
 }
 
 // Phase 0 — ARP cache: instant, filters by Philips/Signify OUI
@@ -741,7 +771,8 @@ function ssdpDiscover(timeoutMs = 4000) {
           const text = msg.toString();
           if (found.has(rinfo.address)) return;
           const isHue = text.includes('IpBridge') || text.includes('hue-bridgeid') ||
-                        /philips.*hue/i.test(text) || /urn:.*schemas-upnp-org.*Basic/i.test(text);
+                        /philips.*hue/i.test(text) || /urn:.*schemas-upnp-org.*Basic/i.test(text) ||
+                        /signify/i.test(text) || text.includes('_hue._tcp');
           if (isHue) {
             // Extract friendly name from SSDP headers if possible
             const serverLine = text.match(/SERVER:\s*(.+)/i);
@@ -949,11 +980,15 @@ ipcMain.handle('bridge:discover', async (event, ifaceIp, extraSubnets = []) => {
     }
   }
 
-  // ── Phase 0: ARP cache (instant — filters by Philips/Signify MAC OUI) ──
+  // ── Phase 0: ARP + portal in parallel (fast) ──
   if (scanCancelled) return { success: true, bridges: found };
   if (!sender.isDestroyed()) sender.send('bridge:scan-progress', { phase: 'arp', completed: 0, total: 0, subnets: [] });
-  const arpResults = await arpCacheScan().catch(() => []);
+  const [arpResults, portalResults] = await Promise.all([
+    arpCacheScan().catch(() => []),
+    portalDiscover().catch(() => []),
+  ]);
   for (const b of arpResults) emit(b);
+  for (const b of portalResults) emit(b);
 
   // ── Phase 1: SSDP (UPnP multicast from every interface — subnet-independent) ──
   if (scanCancelled) return { success: true, bridges: found };

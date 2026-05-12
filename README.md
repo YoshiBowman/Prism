@@ -1,3 +1,5 @@
+<img src="build/icon.png" alt="Prism" width="60" align="left" style="margin-right:12px"/>
+
 # Prism
 
 A desktop app that bridges your DMX lighting console to Philips Hue lights over your local network. Send Art-Net or sACN (E1.31) from any console or software and control real Hue bulbs in real time.

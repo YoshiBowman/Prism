@@ -1,4 +1,4 @@
-# DMX-HUE
+# Prism
 
 A desktop app that bridges your DMX lighting console to Philips Hue lights over your local network. Send Art-Net or sACN (E1.31) from any console or software and control real Hue bulbs in real time.
 
@@ -9,11 +9,11 @@ A desktop app that bridges your DMX lighting console to Philips Hue lights over 
 
 ## Features
 
-- **Automatic bridge discovery** — finds Hue bridges via ARP cache, SSDP/UPnP multicast, mDNS, and subnet scan. Works even without knowing the bridge's IP address.
+- **Automatic bridge discovery** — finds Hue bridges via ARP cache, SSDP/UPnP multicast, mDNS, portal lookup, and subnet scan. Works even without knowing the bridge's IP address.
 - **Art-Net & sACN (E1.31)** — listen on either protocol or both simultaneously. Universe number is configurable.
 - **Per-light DMX mapping** — drag to reorder lights, set the DMX start address, enable/disable individual lights.
-- **White / CT mode** — optional 5-channel mode adds Color Temperature and Brightness channels per light.
-- **Color Loop** — trigger a color cycle effect when RGB = 1, 1, 1.
+- **Control tab with presets** — manually set light colors and brightness, save named presets, and recall them instantly.
+- **Bitfocus Companion support** — trigger presets from a Stream Deck or any Companion-supported controller.
 - **Live Monitor** — per-channel level meters show incoming DMX values in real time with signal status.
 - **sACN diagnostics** — if packets arrive on the wrong universe the app tells you exactly what universe it's seeing so you can match your console.
 - **Cross-platform** — macOS, Windows, and Linux.
@@ -53,12 +53,10 @@ npm start
 ## Building Installers
 
 ```bash
-npm run build:mac    # → dist/DMX-HUE-*.dmg
-npm run build:win    # → dist/DMX-HUE-*.exe
-npm run build:linux  # → dist/DMX-HUE-*.AppImage  +  .deb
+npm run build:mac    # → dist/Prism-*.dmg
+npm run build:win    # → dist/Prism-*.exe
+npm run build:linux  # → dist/Prism-*.AppImage  +  .deb
 ```
-
-> **Note:** Building the Windows installer on macOS requires [Wine](https://www.winehq.org). It's easiest to build on the target platform or use a CI service.
 
 ---
 
@@ -66,8 +64,8 @@ npm run build:linux  # → dist/DMX-HUE-*.AppImage  +  .deb
 
 ### 1. Connect to your Hue Bridge
 
-1. Launch DMX-HUE and go to the **Bridge** tab.
-2. Click **Scan Network** — the app searches via ARP, SSDP, mDNS, and subnet scan automatically.
+1. Launch Prism and go to the **Bridge** tab.
+2. Click **Scan Network** — the app searches via ARP, SSDP, mDNS, portal, and subnet scan automatically.
 3. When your bridge appears, click **Connect**.
 4. A prompt will appear — **press the round link button on top of your physical Hue Bridge** within 30 seconds.
 5. The app pairs and loads your lights.
@@ -98,10 +96,10 @@ Additional options (bind interface, DMX start address, transition time) are in t
 
 ### 4. Configure your Console / Software
 
-Point your DMX console or software at the machine running DMX-HUE:
+Point your DMX console or software at the machine running Prism:
 
 **Art-Net**
-- Destination IP: the IP of the machine running DMX-HUE (or broadcast `255.255.255.255`)
+- Destination IP: the IP of the machine running Prism (or broadcast `255.255.255.255`)
 - Universe: must match the **Art-Net Univ.** setting in the app (default: 0)
 - Port: 6454 (standard Art-Net port)
 
@@ -112,25 +110,13 @@ Point your DMX console or software at the machine running DMX-HUE:
 
 ### 5. DMX Channel Layout
 
-Each light uses **3 channels** (RGB) by default:
+Each light uses **3 channels** (RGB):
 
 | Offset | Channel | Range |
 |--------|---------|-------|
 | +0 | Red | 0–255 |
 | +1 | Green | 0–255 |
 | +2 | Blue | 0–255 |
-
-With **White / CT Mode** enabled (Settings → Features), each light uses **5 channels**:
-
-| Offset | Channel | Range |
-|--------|---------|-------|
-| +0 | Red | 0–255 |
-| +1 | Green | 0–255 |
-| +2 | Blue | 0–255 |
-| +3 | Color Temperature | 0 (warm) – 255 (cool) |
-| +4 | Brightness | 0–255 |
-
-> When RGB = 0,0,0 and CT mode is active, the light switches to white CT mode using channels +3 and +4.
 
 ### 6. Monitor Incoming DMX
 
@@ -138,6 +124,33 @@ Switch to the **Monitor** tab to see live level meters for every mapped light. T
 - Green pulsing dot — packets are arriving
 - Universe and protocol in use
 - sACN diagnostic banner if there's a universe mismatch between the console and the app
+
+---
+
+## Bitfocus Companion Integration
+
+Prism runs a local HTTP API on port **38765** that Bitfocus Companion can connect to, giving you Stream Deck buttons for your presets.
+
+### Installing the Companion Module
+
+1. Copy the `companion-module/` folder from this repo into your Companion `modules/` directory.
+2. Restart Companion.
+3. Add a new connection — search for **Prism**.
+4. Set the host to `localhost` (or the IP of the machine running Prism) and port to `38765`.
+
+### Available Actions
+
+| Action | Description |
+|--------|-------------|
+| Apply Preset | Recalls a named preset from the Control tab |
+| Set Light Color | Sets a specific light to a color and brightness |
+| All Lights Off | Turns off all connected lights |
+
+### Available Feedbacks
+
+| Feedback | Description |
+|----------|-------------|
+| Preset Is Active | Colors a button when a specific preset is currently active |
 
 ---
 
@@ -159,7 +172,7 @@ Switch to the **Monitor** tab to see live level meters for every mapped light. T
 - Make sure port 5568 UDP is not blocked by a firewall.
 
 **Colors look wrong**
-- Hue bulbs use HSB colour space. The app converts RGB → HSB automatically. Very low values may appear off — try values above 20.
+- Hue bulbs use HSB colour space. Prism converts RGB → HSB automatically. Very low values may appear off — try values above 20.
 - Some Hue bulbs don't support full RGB (e.g. white-only bulbs). They will respond to brightness via the Blue channel.
 
 ---

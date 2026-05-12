@@ -996,9 +996,23 @@ ipcMain.handle('bridge:discover', async (event, ifaceIp, extraSubnets = []) => {
 ipcMain.handle('bridge:get-scan-subnets', () => getSubnetsToScan('0.0.0.0'));
 
 ipcMain.handle('bridge:verify', async (event, ip) => {
-  const result = await probeHueBridge(ip, 3000);
-  if (result) return { success: true, name: result.name, bridgeid: result.bridgeid };
-  return { success: false, error: `No Hue bridge responded at ${ip}` };
+  // Try saved credentials before probing — works even if /api/config is unreachable
+  // from Electron's Node HTTP stack (proxy, firewall quirk, etc.)
+  if (config.user) {
+    try {
+      const api = await v3.api.createInsecureLocal(ip).connect(config.user);
+      hueApi = api;
+      config.bridge = ip;
+      saveConfig();
+      fetchLights().catch(() => {});
+      return { success: true, name: ip, bridgeid: null, autoConnected: true };
+    } catch {}
+  }
+
+  // No saved credentials — probe first so we can show bridge name in pair dialog
+  const result = await probeHueBridge(ip, 5000);
+  if (!result) return { success: false };
+  return { success: true, name: result.name, bridgeid: result.bridgeid, autoConnected: false };
 });
 
 ipcMain.handle('bridge:start-pair', async (event, ip) => {

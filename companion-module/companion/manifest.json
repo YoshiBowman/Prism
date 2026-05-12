@@ -3,7 +3,7 @@
 	"name": "Prism",
 	"shortname": "Prism",
 	"description": "Control Philips Hue presets and lights via the Prism DMX bridge app",
-	"version": "2.0.2",
+	"version": "2.0.4",
 	"license": "MIT",
 	"repository": "git+https://github.com/YoshiBowman/Prism.git",
 	"bugs": "https://github.com/YoshiBowman/Prism/issues",

@@ -135,13 +135,16 @@ Prism runs a local HTTP API on port **38765** that Bitfocus Companion can connec
 
 ### Installing the Companion Module
 
-1. **Download** `companion-module-prism.zip` from the [Releases](https://github.com/YoshiBowman/Prism/releases) page and extract it to a folder on your computer (e.g. `~/companion-modules/companion-module-prism`).
-2. **Open Companion** in your browser and go to **Settings → System**.
-3. Under **Extra module path**, enter the path to the folder you extracted the module into (the folder that contains `package.json`).
-4. Click **Save** and then **Restart Companion** using the button on the same page.
-5. Go to **Connections**, click **Add connection**, and search for **Prism**.
-6. Set the **Host** to `localhost` (or the IP of the machine running Prism if Companion is on a different machine) and **Port** to `38765`.
-7. Click **Save**. Companion will connect and load your presets automatically.
+> You add the module by pointing Companion to a folder on your computer — **not** by importing a file through the Companion web UI.
+
+1. **Download** `companion-module-prism.zip` from the [Releases](https://github.com/YoshiBowman/Prism/releases) page.
+2. **Extract** it somewhere permanent on your computer (e.g. create a folder `~/companion-modules/` and extract there — you should end up with `~/companion-modules/companion-module-prism/`).
+3. **Open Companion** in your browser and go to **Settings → System**.
+4. Find the **"Developer modules path"** field and enter the path to the **parent folder** — the folder that *contains* `companion-module-prism/`, not the module folder itself (e.g. `/Users/yourname/companion-modules`).
+5. Click **Restart** on that same page.
+6. Go to **Connections → Add connection** and search for **Prism**.
+7. Set the **Host** to `localhost` (or the IP of the machine running Prism if Companion is on a different machine) and **Port** to `38765`.
+8. Click **Save**. Companion will connect and load your presets automatically.
 
 ### Available Actions
 

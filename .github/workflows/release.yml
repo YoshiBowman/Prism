@@ -92,9 +92,7 @@ jobs:
 
       - name: Bundle Companion module
         run: |
-          cd companion-module
-          npm ci --omit=dev
-          zip -r ../dist/companion-module-prism.zip .
+          zip -r dist/companion-module-prism.zip companion-module/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

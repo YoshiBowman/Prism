@@ -1,0 +1,25 @@
+{
+	"id": "prism-hue",
+	"name": "Prism",
+	"shortname": "Prism",
+	"description": "Control Philips Hue presets and lights via the Prism DMX bridge app",
+	"version": "2.0.2",
+	"license": "MIT",
+	"repository": "git+https://github.com/YoshiBowman/Prism.git",
+	"bugs": "https://github.com/YoshiBowman/Prism/issues",
+	"maintainers": [
+		{
+			"name": "YoshiBowman"
+		}
+	],
+	"legacyIds": [],
+	"runtime": {
+		"type": "node18",
+		"api": "nodejs-ipc",
+		"apiVersion": "0.0.0",
+		"entrypoint": "../dist/index.js"
+	},
+	"manufacturer": "YoshiBowman",
+	"products": ["Prism"],
+	"keywords": ["Hue", "DMX", "Art-Net", "sACN", "Lighting"]
+}

@@ -1,24 +1,19 @@
 {
-  "name": "companion-module-prism",
-  "version": "2.0.0",
-  "description": "Bitfocus Companion module for Prism — control Hue presets via Stream Deck",
-  "main": "src/index.js",
-  "scripts": {
-    "build": "tsc -p tsconfig.json"
-  },
-  "dependencies": {
-    "@companion-module/base": "^1.8.0"
-  },
-  "devDependencies": {
-    "typescript": "^5.0.0"
-  },
-  "companion": {
-    "name": "Prism",
-    "shortname": "Prism",
-    "id": "prism-hue",
-    "version": "2.0.0",
-    "manufacturer": "YoshiBowman",
-    "products": ["Prism"],
-    "description": "Control Philips Hue presets and scenes via Prism"
-  }
+	"name": "companion-module-prism",
+	"version": "2.0.2",
+	"description": "Prism — Philips Hue DMX bridge module for Bitfocus Companion",
+	"main": "dist/index.js",
+	"license": "MIT",
+	"author": "YoshiBowman",
+	"homepage": "https://github.com/YoshiBowman/Prism",
+	"bugs": {
+		"url": "https://github.com/YoshiBowman/Prism/issues"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/YoshiBowman/Prism.git"
+	},
+	"dependencies": {
+		"@companion-module/base": "^1.8.0"
+	}
 }

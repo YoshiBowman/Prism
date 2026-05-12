@@ -274,6 +274,19 @@ async function startPair(ip) {
     return;
   }
 
+  if (verify.autoConnected) {
+    state.pairing        = false;
+    pairDialog.className = 'card';
+    setBridgeStatus(true, ip);
+    window.hue.bridgeStatus().then(s => setBridgeStatus(true, s.bridge));
+    bridgeList.innerHTML = '';
+    scanProgressWrap.style.display = 'none';
+    manualIpInput.value  = '';
+    toast(`Connected to ${verify.name || ip}`, 'success');
+    showTab('lights');
+    return;
+  }
+
   document.getElementById('pair-bridge-name').textContent =
     verify.name + (verify.bridgeid ? ` (${verify.bridgeid.slice(-6)})` : '');
   pairStepVerify.style.display = 'none';

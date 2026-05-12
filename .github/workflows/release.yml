@@ -92,9 +92,11 @@ jobs:
 
       - name: Bundle Companion module
         run: |
-          cd companion-module
-          npm pack
-          mv *.tgz ../dist/
+          VERSION=$(node -p "require('./companion-module/package.json').version")
+          cp -r companion-module /tmp/companion-module-prism
+          cd /tmp
+          tar -czf companion-module-prism-${VERSION}.tgz companion-module-prism/
+          mv companion-module-prism-${VERSION}.tgz $GITHUB_WORKSPACE/dist/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

@@ -24,8 +24,6 @@ const DEFAULT_CONFIG = {
   protocol: 'artnet',
   host: '0.0.0.0',
   transition: 100,
-  colorloop: false,
-  white: false,
   noLimit: false,
   disabledLights: {},
   lightsOrder: [],
@@ -213,8 +211,6 @@ function clampByte(v) { return v < 0 ? 0 : v > 255 ? 255 : Math.round(v); }
 
 function tickBridge() {
   if (!hueApi || !config.bridge || !config.user) return;
-  const opts = { colorloop: config.colorloop, white: config.white };
-
   for (const [lightId, cur] of Object.entries(lightCurrent)) {
     if (config.disabledLights[lightId]) continue;
 
@@ -226,7 +222,7 @@ function tickBridge() {
       const key = `s:${cur.r},${cur.g},${cur.b}`;
       if (lightLastKey[lightId] === key) continue;
       lightLastKey[lightId] = key;
-      sendDirectState(lightId, buildDirectPayload(cur.r, cur.g, cur.b, cur.extra, { ...opts, tt: 0 }));
+      sendDirectState(lightId, buildDirectPayload(cur.r, cur.g, cur.b, { tt: 0 }));
       continue;
     }
 
@@ -240,7 +236,7 @@ function tickBridge() {
       const key = `s:${cur.r},${cur.g},${cur.b}`;
       if (lightLastKey[lightId] === key) continue;
       lightLastKey[lightId] = key;
-      sendDirectState(lightId, buildDirectPayload(cur.r, cur.g, cur.b, cur.extra, { ...opts, tt: 0 }));
+      sendDirectState(lightId, buildDirectPayload(cur.r, cur.g, cur.b, { tt: 0 }));
       continue;
     }
 
@@ -264,7 +260,7 @@ function tickBridge() {
       const key = `s:${cur.r},${cur.g},${cur.b}`;
       if (lightLastKey[lightId] === key) continue;
       lightLastKey[lightId] = key;
-      sendDirectState(lightId, buildDirectPayload(cur.r, cur.g, cur.b, cur.extra, { ...opts, tt: 0 }));
+      sendDirectState(lightId, buildDirectPayload(cur.r, cur.g, cur.b, { tt: 0 }));
       continue;
     }
 
@@ -279,7 +275,7 @@ function tickBridge() {
     if (lightLastKey[lightId] === key) continue;
     lightLastKey[lightId] = key;
 
-    sendDirectState(lightId, buildDirectPayload(pr, pg, pb, cur.extra, { ...opts, tt }));
+    sendDirectState(lightId, buildDirectPayload(pr, pg, pb, { tt }));
   }
 }
 
@@ -319,26 +315,9 @@ function sendDirectState(lightId, payload) {
 }
 
 // Build a plain-object payload (Hue API units) instead of a LightState object
-function buildDirectPayload(r, g, b, extraChannels, opts) {
-  // tt is supplied by the caller:
-  //   • ticker path  → tt=1 (100 ms) so the bridge glides to the projected value
-  //   • direct path  → tt=0 (instant snap)
+function buildDirectPayload(r, g, b, opts = {}) {
   const tt = opts.tt !== undefined ? opts.tt : 0;
-
-  if (r === 0 && g === 0 && b === 0) {
-    if (!opts.white || (extraChannels && extraChannels[1] === 0))
-      return { on: false, transitiontime: tt };
-  }
-
-  if (opts.colorloop && r === 1 && g === 1 && b === 1)
-    return { on: true, effect: 'colorloop', transitiontime: tt };
-
-  if (opts.white && r === 0 && g === 0 && b === 0 && extraChannels) {
-    const ct  = Math.round(153 + (extraChannels[0] / 255) * (500 - 153));
-    const bri = Math.max(1, Math.round((extraChannels[1] / 255) * 254));
-    return { on: true, ct, bri, effect: 'none', transitiontime: tt };
-  }
-
+  if (r === 0 && g === 0 && b === 0) return { on: false, transitiontime: tt };
   const [h, s, v] = rgbToHsb(r, g, b);
   return {
     on:             true,
@@ -367,29 +346,15 @@ function rgbToHsb(r, g, b) {
   return [h, s, v];
 }
 
-function buildLightState(r, g, b, extraChannels, opts) {
+function buildLightState(r, g, b, opts = {}) {
   const { LightState } = v3.lightStates;
   const state = new LightState();
 
-  if (r === 0 && g === 0 && b === 0) {
-    if (!opts.white || (extraChannels && extraChannels[1] === 0)) {
-      return state.off();
-    }
-  }
+  if (r === 0 && g === 0 && b === 0) return state.off();
 
   state.on(true);
   state.effect('none');
   state.transitiontime(Math.round((opts.transition || 100) / 100));
-
-  if (opts.colorloop && r === 1 && g === 1 && b === 1) {
-    return state.effect('colorloop');
-  }
-
-  if (opts.white && r === 0 && g === 0 && b === 0 && extraChannels) {
-    const ct = Math.round(153 + (extraChannels[0] / 255) * (500 - 153));
-    const bri = Math.max(1, Math.round((extraChannels[1] / 255) * 100));
-    return state.ct(ct).brightness(bri);
-  }
 
   const [h, s, v] = rgbToHsb(r, g, b);
   state.hue(Math.round(h * 65535));
@@ -402,7 +367,7 @@ function buildLightState(r, g, b, extraChannels, opts) {
 function processArtnet(data) {
   if (!hueApi) return;
 
-  const channelsPerLight = config.white ? 5 : 3;
+  const channelsPerLight = 3;
   const baseOffset = (config.dmxAddress - 1) + (config.transition === 'channel' ? 1 : 0);
 
   const orderedLights = getOrderedLights();
@@ -417,10 +382,7 @@ function processArtnet(data) {
     const r     = data[offset];
     const g     = data[offset + 1];
     const b     = data[offset + 2];
-    const extra = config.white ? [data[offset + 3] || 0, data[offset + 4] || 0] : null;
-
-    // Cache latest value — no bridge call here
-    updateCurrent(light.id, r, g, b, extra);
+    updateCurrent(light.id, r, g, b, null);
   }
 
   // Ensure the 100 ms bridge ticker is running
@@ -651,7 +613,7 @@ function getOrderedLights() {
 }
 
 function calcDmxChannels() {
-  const channelsPerLight = config.white ? 5 : 3;
+  const channelsPerLight = 3;
   const base = (config.dmxAddress - 1) + (config.transition === 'channel' ? 1 : 0);
   const orderedLights = getOrderedLights();
   const map = {};
@@ -660,9 +622,7 @@ function calcDmxChannels() {
     map[light.id] = {
       start,
       channels: channelsPerLight,
-      labels: config.white
-        ? ['R', 'G', 'B', 'CT', 'Bri'].map((l, j) => `ch${start + j}:${l}`)
-        : ['R', 'G', 'B'].map((l, j) => `ch${start + j}:${l}`),
+      labels: ['R', 'G', 'B'].map((l, j) => `ch${start + j}:${l}`),
     };
   });
   return map;
@@ -1147,7 +1107,7 @@ ipcMain.handle('settings:get', () => {
 ipcMain.handle('settings:save', (event, updates) => {
   const safeKeys = [
     'dmxAddress', 'universe', 'sacnUniverse', 'sacnMulticast',
-    'protocol', 'host', 'transition', 'colorloop', 'white', 'noLimit',
+    'protocol', 'host', 'transition', 'noLimit',
     'lightStates', 'lastTab',
   ];
   for (const key of safeKeys) {
@@ -1308,7 +1268,7 @@ async function pairBridge(ip, sender) {
 
   while (Date.now() < deadline) {
     try {
-      const result = await huePost(ip, '/api', { devicetype: 'dmx-hue#app' });
+      const result = await huePost(ip, '/api', { devicetype: 'prism#app' });
       const first = Array.isArray(result) ? result[0] : result;
 
       if (first && first.success && first.success.username) {
@@ -1339,6 +1299,108 @@ async function pairBridge(ip, sender) {
   sender.send('bridge:pair-event', { type: 'timeout' });
 }
 
+// ── Companion HTTP API ────────────────────────────────────────────────────────
+// Listens on localhost only so Companion (running on the same machine or LAN)
+// can trigger presets and query state without any Electron IPC.
+
+let companionServer = null;
+const COMPANION_PORT = 38765;
+
+function startCompanionServer() {
+  if (companionServer) return;
+
+  companionServer = http.createServer((req, res) => {
+    const url = new URL(req.url, `http://localhost`);
+    const send = (code, body) => {
+      const json = JSON.stringify(body);
+      res.writeHead(code, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(json);
+    };
+
+    // GET /api/status
+    if (req.method === 'GET' && url.pathname === '/api/status') {
+      send(200, {
+        connected: !!hueApi,
+        bridge: config.bridge || null,
+        activePreset: config._activePreset || null,
+        presets: config.scenes || {},
+      });
+      return;
+    }
+
+    // GET /api/presets
+    if (req.method === 'GET' && url.pathname === '/api/presets') {
+      send(200, { presets: Object.keys(config.scenes || {}) });
+      return;
+    }
+
+    // POST /api/presets/:name/apply
+    const applyMatch = url.pathname.match(/^\/api\/presets\/(.+)\/apply$/);
+    if (req.method === 'POST' && applyMatch) {
+      const name = decodeURIComponent(applyMatch[1]);
+      const scene = config.scenes && config.scenes[name];
+      if (!scene) { send(404, { error: 'Preset not found' }); return; }
+      if (!hueApi) { send(503, { error: 'Not connected to bridge' }); return; }
+
+      config._activePreset = name;
+      // Apply each light state from the preset
+      (async () => {
+        for (const entry of scene) {
+          try {
+            const { LightState } = v3.lightStates;
+            const state = new LightState();
+            if (!entry.on) { state.off(); }
+            else {
+              state.on(true);
+              if (entry.rgb) {
+                const [r, g, b] = entry.rgb;
+                const [h, s, vv] = rgbToHsb(r, g, b);
+                state.hue(Math.round(h * 65535));
+                state.saturation(Math.round(s * 100));
+                state.brightness(Math.max(1, Math.round(vv * 100)));
+              }
+              if (entry.bri !== undefined) state.brightness(entry.bri);
+              state.transitiontime(4);
+            }
+            await hueApi.lights.setLightState(entry.id, state);
+          } catch {}
+        }
+        // Notify renderer to refresh control tab swatches
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('companion:preset-applied', name);
+        }
+      })();
+
+      send(200, { ok: true, preset: name });
+      return;
+    }
+
+    // POST /api/lights/all/off
+    if (req.method === 'POST' && url.pathname === '/api/lights/all/off') {
+      if (!hueApi) { send(503, { error: 'Not connected' }); return; }
+      (async () => {
+        for (const light of lightsCache) {
+          try {
+            const { LightState } = v3.lightStates;
+            await hueApi.lights.setLightState(light.id, new LightState().off());
+          } catch {}
+        }
+      })();
+      send(200, { ok: true });
+      return;
+    }
+
+    send(404, { error: 'Not found' });
+  });
+
+  companionServer.listen(COMPANION_PORT, '0.0.0.0', () => {
+    console.log(`[companion] API listening on port ${COMPANION_PORT}`);
+  });
+  companionServer.on('error', (e) => {
+    console.warn(`[companion] Server error: ${e.message}`);
+  });
+}
+
 // ── Window ───────────────────────────────────────────────────────────────────
 
 function createWindow() {
@@ -1362,6 +1424,7 @@ function createWindow() {
 app.whenReady().then(() => {
   loadConfig();
   createWindow();
+  startCompanionServer();
 
   // Start bridge connection immediately (parallel with window load)
   const connectedPromise = connectToSavedBridge();

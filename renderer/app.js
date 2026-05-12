@@ -1001,7 +1001,7 @@ function buildMonitorCards(lights) {
 function updateMonitorCards(dmx) {
   const cfg = state.settings;
   if (!cfg.dmxAddress) return;
-  const channelsPerLight = cfg.white ? 5 : 3;
+  const channelsPerLight = 3;
   const base = (cfg.dmxAddress - 1) + (cfg.transition === 'channel' ? 1 : 0);
 
   monitorGrid.querySelectorAll('.monitor-card').forEach((card, i) => {
@@ -1110,8 +1110,6 @@ async function refreshSettings() {
   document.getElementById('s-sacn-universe').value  = cfg.sacnUniverse ?? 1;
   document.getElementById('s-sacn-multicast').checked = cfg.sacnMulticast !== false;
   document.getElementById('s-transition').value     = cfg.transition === 'channel' ? 'channel' : (cfg.transition ?? 100);
-  document.getElementById('s-colorloop').checked    = !!cfg.colorloop;
-  document.getElementById('s-white').checked        = !!cfg.white;
   document.getElementById('s-nolimit').checked      = !!cfg.noLimit;
 
   updateProtocolVisibility(cfg.protocol ?? 'artnet');
@@ -1145,8 +1143,6 @@ document.getElementById('btn-save-settings').addEventListener('click', async () 
     sacnMulticast: document.getElementById('s-sacn-multicast').checked,
     host:          document.getElementById('s-nic').value || '0.0.0.0',
     transition:    transRaw === 'channel' ? 'channel' : (parseInt(transRaw) || 100),
-    colorloop:     document.getElementById('s-colorloop').checked,
-    white:         document.getElementById('s-white').checked,
     noLimit:       document.getElementById('s-nolimit').checked,
   };
 

@@ -1,9 +1,9 @@
 'use strict';
 
 module.exports = {
-  appId:       'com.dmxhue.app',
-  productName: 'DMX-HUE',
-  copyright:   'Copyright © 2025',
+  appId:       'com.prism.app',
+  productName: 'Prism',
+  copyright:   'Copyright © 2026',
 
   directories: { output: 'dist' },
 
@@ -23,7 +23,7 @@ module.exports = {
     entitlementsInherit: 'build/entitlements.mac.plist',
     icon:                'build/icon.icns',
     extendInfo: {
-      NSLocalNetworkUsageDescription: 'DMX-HUE needs local network access to discover and control Philips Hue bridges and receive Art-Net / sACN DMX data.',
+      NSLocalNetworkUsageDescription: 'Prism needs local network access to discover and control Philips Hue bridges and receive Art-Net / sACN DMX data.',
       NSBonjourServices: ['_hue._tcp', '_ssdp._udp'],
     },
     notarize: process.env.APPLE_TEAM_ID

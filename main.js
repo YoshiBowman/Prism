@@ -665,14 +665,16 @@ function probeHueBridge(ip, timeoutMs = 1500) {
             res.on('end', () => {
               try {
                 const j = JSON.parse(data);
-                finish((j.bridgeid || j.modelid) ? { ip, name: j.name || 'Hue Bridge', bridgeid: j.bridgeid } : null);
-              } catch { finish(null); }
+                const ok = j.bridgeid || j.modelid;
+                console.log(`[probe] ${ip}:${port} response ok=${!!ok} keys=${Object.keys(j).join(',')}`);
+                finish(ok ? { ip, name: j.name || 'Hue Bridge', bridgeid: j.bridgeid } : null);
+              } catch (e) { console.log(`[probe] ${ip}:${port} parse error: ${e.message} body=${data.slice(0,100)}`); finish(null); }
             });
             res.on('error', () => finish(null));
           }
         );
-        req.on('error', () => { clearTimeout(deadline); finish(null); });
-        req.setTimeout(timeoutMs, () => { try { req.destroy(); } catch {} finish(null); });
+        req.on('error', (e) => { clearTimeout(deadline); console.log(`[probe] ${ip}:${port} error: ${e.code} ${e.message}`); finish(null); });
+        req.setTimeout(timeoutMs, () => { console.log(`[probe] ${ip}:${port} timeout`); try { req.destroy(); } catch {} finish(null); });
       } catch { clearTimeout(deadline); finish(null); }
     });
   }
@@ -935,11 +937,16 @@ ipcMain.handle('bridge:discover', async (event, ifaceIp, extraSubnets = []) => {
     if (!sender.isDestroyed()) sender.send('bridge:found', bridge);
   }
 
-  // ── Phase -1: Try the saved bridge IP first (instant — no scan needed) ──
+  // ── Phase -1: Try the saved bridge IP first (no probe — direct connect) ──
   if (config.bridge && config.user) {
     if (!sender.isDestroyed()) sender.send('bridge:scan-progress', { phase: 'saved', completed: 0, total: 0, subnets: [] });
-    const savedResult = await probeHueBridge(config.bridge, 2000).catch(() => null);
-    if (savedResult) emit(savedResult);
+    try {
+      await v3.api.createInsecureLocal(config.bridge).connect(config.user);
+      emit({ ip: config.bridge, name: 'Hue Bridge', bridgeid: null });
+    } catch {
+      const savedResult = await probeHueBridge(config.bridge, 2000).catch(() => null);
+      if (savedResult) emit(savedResult);
+    }
   }
 
   // ── Phase 0: ARP cache (instant — filters by Philips/Signify MAC OUI) ──
@@ -996,8 +1003,7 @@ ipcMain.handle('bridge:discover', async (event, ifaceIp, extraSubnets = []) => {
 ipcMain.handle('bridge:get-scan-subnets', () => getSubnetsToScan('0.0.0.0'));
 
 ipcMain.handle('bridge:verify', async (event, ip) => {
-  // Try saved credentials before probing — works even if /api/config is unreachable
-  // from Electron's Node HTTP stack (proxy, firewall quirk, etc.)
+  // Try saved credentials first (no probe needed)
   if (config.user) {
     try {
       const api = await v3.api.createInsecureLocal(ip).connect(config.user);
@@ -1009,10 +1015,9 @@ ipcMain.handle('bridge:verify', async (event, ip) => {
     } catch {}
   }
 
-  // No saved credentials — probe first so we can show bridge name in pair dialog
-  const result = await probeHueBridge(ip, 5000);
-  if (!result) return { success: false };
-  return { success: true, name: result.name, bridgeid: result.bridgeid, autoConnected: false };
+  // No saved credentials — skip probe, go straight to link-button pairing.
+  // Wrong IPs will fail at the pairing step instead of here.
+  return { success: true, name: ip, bridgeid: null, autoConnected: false };
 });
 
 ipcMain.handle('bridge:start-pair', async (event, ip) => {

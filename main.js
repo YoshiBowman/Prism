@@ -103,10 +103,23 @@ setInterval(async () => {
   }
 }, 30000);
 
+// Try HTTP first (older firmware), fall back to HTTPS (newer firmware ≥ ~2023).
+async function localConnect(ip, username) {
+  try {
+    return await v3.api.createInsecureLocal(ip).connect(username);
+  } catch (e) {
+    const msg = String(e.message || '');
+    if (msg.includes('EHOSTUNREACH') || msg.includes('ECONNREFUSED') || msg.includes('ECONNRESET') || msg.includes('ETIMEDOUT')) {
+      return await v3.api.createLocal(ip).connect(username);
+    }
+    throw e;
+  }
+}
+
 async function connectToSavedBridge() {
   if (!config.bridge || !config.user) return false;
   try {
-    hueApi = await v3.api.createInsecureLocal(config.bridge).connect(config.user);
+    hueApi = await localConnect(config.bridge, config.user);
     fetchLights().catch(() => {});
     return true;
   } catch {
@@ -972,7 +985,7 @@ ipcMain.handle('bridge:discover', async (event, ifaceIp, extraSubnets = []) => {
   if (config.bridge && config.user) {
     if (!sender.isDestroyed()) sender.send('bridge:scan-progress', { phase: 'saved', completed: 0, total: 0, subnets: [] });
     try {
-      await v3.api.createInsecureLocal(config.bridge).connect(config.user);
+      await localConnect(config.bridge, config.user);
       emit({ ip: config.bridge, name: 'Hue Bridge', bridgeid: null });
     } catch {
       const savedResult = await probeHueBridge(config.bridge, 2000).catch(() => null);
@@ -1041,7 +1054,7 @@ ipcMain.handle('bridge:verify', async (event, ip) => {
   // Try saved credentials first (no probe needed)
   if (config.user) {
     try {
-      const api = await v3.api.createInsecureLocal(ip).connect(config.user);
+      const api = await localConnect(ip, config.user);
       hueApi = api;
       config.bridge = ip;
       saveConfig();
@@ -1243,7 +1256,7 @@ ipcMain.handle('scenes:delete', (event, name) => {
 async function pairBridge(ip, sender) {
   let unauthApi;
   try {
-    unauthApi = await v3.api.createInsecureLocal(ip).connect();
+    unauthApi = await localConnect(ip, undefined);
   } catch (err) {
     sender.send('bridge:pair-event', { type: 'error', message: `Cannot reach bridge: ${err.message}` });
     return;
@@ -1259,7 +1272,7 @@ async function pairBridge(ip, sender) {
       config.bridge = ip;
       config.user = user.username;
       saveConfig();
-      hueApi = await v3.api.createInsecureLocal(ip).connect(config.user);
+      hueApi = await localConnect(ip, config.user);
       sender.send('bridge:pair-event', { type: 'success' });
       return;
     } catch (err) {

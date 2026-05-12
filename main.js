@@ -1270,38 +1270,69 @@ ipcMain.handle('scenes:delete', (event, name) => {
 
 // ── Bridge pairing ───────────────────────────────────────────────────────────
 
-async function pairBridge(ip, sender) {
-  let unauthApi;
-  try {
-    unauthApi = await localConnect(ip, undefined);
-  } catch (err) {
-    sender.send('bridge:pair-event', { type: 'error', message: `Cannot reach bridge: ${err.message}` });
-    return;
-  }
+// POST to the Hue pairing endpoint over raw HTTPS — no node-hue-api connect needed.
+function huePost(ip, path, body) {
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify(body);
+    const agent = new https.Agent({ rejectUnauthorized: false, minVersion: 'TLSv1', ciphers: 'ALL' });
+    // Try HTTPS first; fall back to HTTP if HTTPS gets a hard error
+    function attempt(mod, port) {
+      const req = mod.request(
+        { hostname: ip, port, path, method: 'POST', agent: port === 443 ? agent : undefined,
+          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } },
+        (res) => {
+          let data = '';
+          res.on('data', c => { data += c; });
+          res.on('end', () => {
+            try { resolve(JSON.parse(data)); } catch { reject(new Error('Bad JSON from bridge')); }
+          });
+        }
+      );
+      req.on('error', (e) => {
+        if (port === 443) { reject(e); return; }
+        // HTTP failed — try HTTPS
+        attempt(https, 443);
+      });
+      req.setTimeout(5000, () => { req.destroy(); if (port === 443) reject(new Error('timeout')); else attempt(https, 443); });
+      req.write(payload);
+      req.end();
+    }
+    attempt(http, 80);
+  });
+}
 
+async function pairBridge(ip, sender) {
   sender.send('bridge:pair-event', { type: 'waiting', remaining: 30 });
 
   const deadline = Date.now() + 30000;
 
   while (Date.now() < deadline) {
     try {
-      const user = await unauthApi.users.createUser('dmx-hue-gui', 'main-app');
-      config.bridge = ip;
-      config.user = user.username;
-      saveConfig();
-      hueApi = await localConnect(ip, config.user);
-      sender.send('bridge:pair-event', { type: 'success' });
-      return;
-    } catch (err) {
-      const msg = String(err.message || '');
-      if ((err.getHueErrorType && err.getHueErrorType() === 101) || msg.toLowerCase().includes('link button')) {
+      const result = await huePost(ip, '/api', { devicetype: 'dmx-hue#app' });
+      const first = Array.isArray(result) ? result[0] : result;
+
+      if (first && first.success && first.success.username) {
+        config.bridge = ip;
+        config.user = first.success.username;
+        saveConfig();
+        hueApi = await localConnect(ip, config.user);
+        sender.send('bridge:pair-event', { type: 'success' });
+        return;
+      }
+
+      const errType = first && first.error && first.error.type;
+      if (errType === 101) {
+        // Link button not pressed — keep waiting
         const remaining = Math.max(0, Math.round((deadline - Date.now()) / 1000));
         sender.send('bridge:pair-event', { type: 'waiting', remaining });
         await new Promise(r => setTimeout(r, 1000));
       } else {
-        sender.send('bridge:pair-event', { type: 'error', message: err.message });
+        sender.send('bridge:pair-event', { type: 'error', message: first?.error?.description || JSON.stringify(result) });
         return;
       }
+    } catch (err) {
+      sender.send('bridge:pair-event', { type: 'error', message: `Cannot reach bridge: ${err.message}` });
+      return;
     }
   }
 

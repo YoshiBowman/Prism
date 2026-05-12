@@ -103,16 +103,33 @@ setInterval(async () => {
   }
 }, 30000);
 
-// Try HTTP first (older firmware), fall back to HTTPS (newer firmware ≥ ~2023).
+// Build a node-hue-api Api object over HTTPS without cert validation or cert-pinning.
+// Used when the bridge rejects HTTP (port 80 closed on newer firmware).
+async function localConnectHttps(ip, username) {
+  const axios = require('axios');
+  const NHTransport = require('node-hue-api/lib/api/http/Transport');
+  const NHApi      = require('node-hue-api/lib/api/Api');
+
+  const agent = new https.Agent({
+    rejectUnauthorized: false,
+    minVersion: 'TLSv1',
+    ciphers: 'ALL',
+  });
+  const apiBaseUrl = `https://${ip}/api`;
+  // Verify the bridge is reachable before handing back the Api object
+  await axios.get(`https://${ip}/api/config`, { httpsAgent: agent, timeout: 5000 });
+  const transport = new NHTransport(username, axios.create({ baseURL: apiBaseUrl, httpsAgent: agent }));
+  return new NHApi({ remote: false, baseUrl: apiBaseUrl, username: username || null }, transport);
+}
+
+// Try HTTP first (older firmware), fall back to cert-free HTTPS (newer firmware).
 async function localConnect(ip, username) {
   try {
     return await v3.api.createInsecureLocal(ip).connect(username);
   } catch (e) {
-    const msg = String(e.message || '');
-    if (msg.includes('EHOSTUNREACH') || msg.includes('ECONNREFUSED') || msg.includes('ECONNRESET') || msg.includes('ETIMEDOUT')) {
-      return await v3.api.createLocal(ip).connect(username);
-    }
-    throw e;
+    // HTTP failed for any non-Hue-API reason — try HTTPS
+    if (e.getHueErrorType && e.getHueErrorType()) throw e;
+    return await localConnectHttps(ip, username);
   }
 }
 

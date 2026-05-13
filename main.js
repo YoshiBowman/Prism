@@ -1136,6 +1136,8 @@ ipcMain.handle('artnet:stop', () => {
   // stopBridgeTicker() is called inside stopArtnet/stopSACN; calling it here
   // as a safety net in case both were already stopped individually
   stopBridgeTicker();
+  // Explicitly broadcast stopped state — stopArtnet/stopSACN don't emit events
+  sendToAll('artnet:status', buildStatusPayload());
   return { success: true };
 });
 

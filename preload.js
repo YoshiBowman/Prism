@@ -44,6 +44,14 @@ contextBridge.exposeInMainWorld('hue', {
   downloadUpdate: () => ipcRenderer.invoke('update:download'),
   installUpdate:  () => ipcRenderer.invoke('update:install'),
 
+  // Tray / window management
+  openMainWindow: () => ipcRenderer.invoke('tray:open-main'),
+  quit:           () => ipcRenderer.invoke('tray:quit'),
+
+  // Login item (launch at login)
+  getLoginItem:   ()        => ipcRenderer.invoke('login-item:get'),
+  setLoginItem:   (enabled) => ipcRenderer.invoke('login-item:set', enabled),
+
   // Events from main process
   on: (channel, fn) => {
     const allowed = [
@@ -57,6 +65,7 @@ contextBridge.exposeInMainWorld('hue', {
       'artnet:status',
       'sacn:diag',
       'dmx:takeover-change',
+      'companion:preset-applied',
       'update:available',
       'update:progress',
       'update:downloaded',

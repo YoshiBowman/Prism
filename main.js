@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, Tray, nativeImage, screen } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -51,8 +51,11 @@ function saveConfig() {
 
 // ── Hue API state ────────────────────────────────────────────────────────────
 
-let hueApi = null;
-let mainWindow = null;
+let hueApi      = null;
+let mainWindow  = null;
+let tray        = null;
+let popoverWin  = null;
+let connectedPromise = null;   // resolves when initial bridge connect attempt finishes
 
 // ── DMX priority takeover tracking ────────────────────────────────────────────
 
@@ -77,6 +80,14 @@ setInterval(() => {
     }
   }
 }, 500);
+
+// ── Broadcast helper ─────────────────────────────────────────────────────────
+// Sends a status event to every open window (main + tray popover).
+// Used for channels both windows care about (e.g. artnet:status).
+function sendToAll(channel, ...args) {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, ...args);
+  if (popoverWin && !popoverWin.isDestroyed()) popoverWin.webContents.send(channel, ...args);
+}
 
 // ── Bridge health-check / auto-reconnect ──────────────────────────────────────
 // Runs every 30 s. Sends a lightweight GET to the bridge to confirm it's still
@@ -421,17 +432,13 @@ function startArtnet() {
     artnetRunning = false;
     try { artnetSocket.close(); } catch {} // prevent orphaned socket holding port 6454 after error
     artnetSocket = null;
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('artnet:status', { running: false, error: err.message });
-    }
+    sendToAll('artnet:status', { running: false, error: err.message });
   });
 
   artnetSocket.bind(ARTNET_PORT, config.host === '0.0.0.0' ? undefined : config.host, () => {
     try { artnetSocket.setBroadcast(true); } catch {}
     artnetRunning = true;
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('artnet:status', { running: true });
-    }
+    sendToAll('artnet:status', { running: true });
   });
 
   return { success: true };
@@ -523,9 +530,7 @@ function startSACN() {
     sacnRunning = false;
     try { sacnSocket.close(); } catch {} // prevent orphaned socket holding port 5568 after error
     sacnSocket = null;
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('artnet:status', { running: isAnyRunning(), sacnError: err.message });
-    }
+    sendToAll('artnet:status', { running: isAnyRunning(), sacnError: err.message });
   });
 
   sacnSocket.bind(SACN_PORT, () => {
@@ -548,9 +553,7 @@ function startSACN() {
       }
     } catch {}
     sacnRunning = true;
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('artnet:status', buildStatusPayload());
-    }
+    sendToAll('artnet:status', buildStatusPayload());
   });
 
   return { success: true };
@@ -1422,15 +1425,130 @@ function createWindow() {
   });
 
   mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+
+  mainWindow.on('closed', () => {
+    mainWindow = null;
+    // Hide from Dock when main window closes — keep running in tray
+    if (process.platform === 'darwin' && app.dock) app.dock.hide();
+  });
 }
+
+// ── Tray / popover ────────────────────────────────────────────────────────────
+
+function createTray() {
+  const iconPath = path.join(__dirname, 'build', 'icon.png');
+  let icon = nativeImage.createFromPath(iconPath);
+  // Resize to menu-bar size; on macOS a template image would be ideal but the
+  // app icon works fine as a small colour icon for now.
+  if (process.platform === 'darwin') icon = icon.resize({ width: 18, height: 18 });
+
+  tray = new Tray(icon);
+  tray.setToolTip('Prism');
+  tray.on('click', (_, bounds) => togglePopover(bounds));
+}
+
+function createPopoverWin() {
+  popoverWin = new BrowserWindow({
+    width:      300,
+    height:     195,
+    show:       false,
+    frame:      false,
+    resizable:  false,
+    movable:    false,
+    alwaysOnTop: true,
+    transparent: true,
+    hasShadow:  false,   // CSS box-shadow provides shadow inside transparent window
+    skipTaskbar: true,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+
+  popoverWin.loadFile(path.join(__dirname, 'renderer', 'popover.html'));
+
+  // Auto-hide when focus moves elsewhere (native popover behaviour)
+  popoverWin.on('blur', () => {
+    if (popoverWin && !popoverWin.isDestroyed()) popoverWin.hide();
+  });
+}
+
+function togglePopover(trayBounds) {
+  if (!popoverWin || popoverWin.isDestroyed()) return;
+
+  if (popoverWin.isVisible()) { popoverWin.hide(); return; }
+
+  const { width: popW, height: popH } = popoverWin.getBounds();
+  let x = Math.round(trayBounds.x + trayBounds.width  / 2 - popW / 2);
+  const y = Math.round(trayBounds.y + trayBounds.height + 2);
+
+  // Clamp horizontally so the popover doesn't bleed off screen
+  const disp = screen.getDisplayMatching(trayBounds);
+  x = Math.max(disp.workArea.x,
+        Math.min(x, disp.workArea.x + disp.workArea.width - popW));
+
+  popoverWin.setPosition(x, y);
+  popoverWin.show();
+  popoverWin.focus();
+}
+
+// Show (or create) the main window and restore Dock presence on macOS
+function openMainWindow() {
+  if (process.platform === 'darwin' && app.dock) app.dock.show();
+
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow();
+    // Send auto-connect result once the page finishes loading
+    mainWindow.webContents.once('did-finish-load', async () => {
+      mainWindow.webContents.executeJavaScript(
+        `document.body.dataset.platform = '${process.platform}'`
+      );
+      const connected = connectedPromise ? await connectedPromise : !!hueApi;
+      if (mainWindow && !mainWindow.isDestroyed())
+        mainWindow.webContents.send('bridge:auto-connect', { connected, bridge: config.bridge });
+    });
+  } else {
+    mainWindow.show();
+    mainWindow.focus();
+  }
+}
+
+// ── Tray IPC ──────────────────────────────────────────────────────────────────
+
+ipcMain.handle('tray:open-main', () => { openMainWindow(); return { success: true }; });
+
+ipcMain.handle('tray:quit', () => {
+  stopArtnet();
+  stopSACN();
+  stopBridgeTicker();
+  app.quit();
+});
+
+ipcMain.handle('login-item:get', () => app.getLoginItemSettings().openAtLogin);
+
+ipcMain.handle('login-item:set', (_, enabled) => {
+  app.setLoginItemSettings({ openAtLogin: enabled });
+  return { success: true };
+});
 
 app.whenReady().then(() => {
   loadConfig();
-  createWindow();
   startCompanionServer();
 
-  // Start bridge connection immediately (parallel with window load)
-  const connectedPromise = connectToSavedBridge();
+  // Create tray icon and hidden popover — these live for the entire app lifetime
+  createTray();
+  createPopoverWin();
+
+  // On macOS start as a tray-only app (no Dock icon until main window is opened)
+  if (process.platform === 'darwin' && app.dock) app.dock.hide();
+
+  // Connect to saved bridge in the background immediately
+  connectedPromise = connectToSavedBridge();
+
+  // Show the main window on first launch (no bridge configured yet) so the
+  // user can go through setup. After that the app starts silently in the tray.
+  if (!config.bridge) openMainWindow();
 
   // ── Auto-updater (production only) ────────────────────────────────────────
   if (app.isPackaged) {
@@ -1461,29 +1579,23 @@ app.whenReady().then(() => {
           mainWindow.webContents.send('update:error', { message: err ? err.message : 'Download failed' });
       }
     });
-    ipcMain.handle('update:install',  () => { autoUpdater.quitAndInstall(); });
+    ipcMain.handle('update:install', () => { autoUpdater.quitAndInstall(); });
 
     setTimeout(() => autoUpdater.checkForUpdates().catch(() => {}), 5000);
   }
 
-  // Send auto-connect result once the page is ready (whichever finishes last)
-  mainWindow.webContents.once('did-finish-load', async () => {
-    mainWindow.webContents.executeJavaScript(
-      `document.body.dataset.platform = '${process.platform}'`
-    );
-    const connected = await connectedPromise;
-    if (mainWindow && !mainWindow.isDestroyed())
-      mainWindow.webContents.send('bridge:auto-connect', { connected, bridge: config.bridge });
-  });
-
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
-  });
+  // Dock icon clicked (macOS) — bring the main window back up
+  app.on('activate', () => openMainWindow());
 });
 
 app.on('window-all-closed', () => {
-  stopArtnet();
-  stopSACN();        // ensure sACN socket is released; stopArtnet() alone left port 5568 open
-  stopBridgeTicker(); // safety net in case ticker is still running
-  if (process.platform !== 'darwin') app.quit();
+  if (process.platform === 'darwin') {
+    // Keep running in the menu bar — listener stays active, Dock stays hidden
+    if (app.dock) app.dock.hide();
+  } else {
+    stopArtnet();
+    stopSACN();
+    stopBridgeTicker();
+    app.quit();
+  }
 });

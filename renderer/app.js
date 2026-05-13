@@ -1091,6 +1091,12 @@ async function refreshSettings() {
   document.getElementById('s-transition').value     = cfg.transition === 'channel' ? 'channel' : (cfg.transition ?? 100);
   document.getElementById('s-nolimit').checked      = !!cfg.noLimit;
 
+  // Launch at Login (read from OS — not stored in config.json)
+  const loginItemEl = document.getElementById('s-login-item');
+  if (loginItemEl) {
+    window.hue.getLoginItem().then(enabled => { loginItemEl.checked = !!enabled; }).catch(() => {});
+  }
+
   updateProtocolVisibility(cfg.protocol ?? 'artnet');
   updateMulticastHint();
 
@@ -1102,6 +1108,14 @@ async function refreshSettings() {
 
   const artnetStatus = await window.hue.artnetStatus();
   setListenerRunning(artnetStatus.running);
+}
+
+// Launch at Login — saves immediately (OS setting, not in config.json)
+const loginItemEl = document.getElementById('s-login-item');
+if (loginItemEl) {
+  loginItemEl.addEventListener('change', () => {
+    window.hue.setLoginItem(loginItemEl.checked).catch(() => {});
+  });
 }
 
 document.getElementById('s-sacn-universe').addEventListener('input', () => {

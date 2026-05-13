@@ -1,6 +1,6 @@
 {
 	"name": "companion-module-prism",
-	"version": "2.0.6",
+	"version": "2.1.0",
 	"description": "Prism — Philips Hue DMX bridge module for Bitfocus Companion",
 	"main": "dist/index.js",
 	"license": "MIT",

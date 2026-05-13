@@ -15,6 +15,12 @@ module.exports = {
     'node_modules/**/*',
   ],
 
+  // Ship the tray icon outside the ASAR so nativeImage can read it at runtime.
+  // process.resourcesPath points here in packaged builds.
+  extraResources: [
+    { from: 'build/icon.png', to: 'tray-icon.png' },
+  ],
+
   mac: {
     category:            'public.app-category.utilities',
     hardenedRuntime:     true,

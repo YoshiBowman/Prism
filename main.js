@@ -1438,10 +1438,13 @@ function createWindow() {
 // ── Tray / popover ────────────────────────────────────────────────────────────
 
 function createTray() {
-  const iconPath = path.join(__dirname, 'build', 'icon.png');
+  // In packaged builds the icon is placed in Resources/ via extraResources.
+  // In development __dirname is the project root so build/icon.png is correct.
+  const iconPath = app.isPackaged
+    ? path.join(process.resourcesPath, 'tray-icon.png')
+    : path.join(__dirname, 'build', 'icon.png');
+
   let icon = nativeImage.createFromPath(iconPath);
-  // Resize to menu-bar size; on macOS a template image would be ideal but the
-  // app icon works fine as a small colour icon for now.
   if (process.platform === 'darwin') icon = icon.resize({ width: 18, height: 18 });
 
   tray = new Tray(icon);
@@ -1530,7 +1533,9 @@ ipcMain.handle('tray:quit', () => {
 ipcMain.handle('login-item:get', () => app.getLoginItemSettings().openAtLogin);
 
 ipcMain.handle('login-item:set', (_, enabled) => {
-  app.setLoginItemSettings({ openAtLogin: enabled });
+  // openAsHidden tells macOS to start the app without bringing it to the
+  // foreground — essential for a tray-only background launch.
+  app.setLoginItemSettings({ openAtLogin: enabled, openAsHidden: true });
   return { success: true };
 });
 

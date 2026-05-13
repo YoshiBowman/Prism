@@ -46,7 +46,7 @@
 
 <!-- Update banner (shown app-wide) -->
 <div id="update-banner" style="display:none">
-  <span id="update-banner-text">⬆ Update available</span>
+  <span id="update-banner-text">Update available</span>
   <div id="update-progress-wrap" style="display:none;flex:1;max-width:160px">
     <div class="scan-progress-bar-bg">
       <div id="update-progress-bar" class="scan-progress-bar-fill"></div>
@@ -98,7 +98,7 @@
         </div>
 
         <div class="tip-banner" style="margin-bottom:8px">
-          🔘 When connecting you'll need to <strong>press the round button on top of your Hue Bridge</strong> to authorize. Have it nearby before clicking Connect.
+          When connecting you'll need to <strong>press the round button on top of your Hue Bridge</strong> to authorize. Have it nearby before clicking Connect.
         </div>
 
         <div class="field" style="margin-bottom:8px">
@@ -150,7 +150,7 @@
           ✓ Bridge found — <span id="pair-bridge-name"></span>
         </div>
         <div class="pair-link-instruction">
-          <div class="pair-link-icon">🔘</div>
+          <div class="pair-link-icon">◉</div>
           <div>
             <strong>Press the round link button on top of your Hue Bridge</strong>
             <p>The button is on the physical hardware. You have <span id="pair-countdown">30</span> seconds.</p>
@@ -173,8 +173,7 @@
       <span class="hint">Drag rows to reorder DMX channel assignment · Toggle to enable/disable a light</span>
     </div>
     <div id="lights-list">
-      <div class="empty-state">
-        <div class="icon">💡</div>
+      <div class="empty-state empty-state--left">
         <p>Connect to a bridge first</p>
       </div>
     </div>
@@ -185,7 +184,7 @@
 
     <!-- DMX override banner -->
     <div id="dmx-override-banner" style="display:none">
-      <span>⚡ DMX Override Active</span>
+      <span>DMX Override Active</span>
       <span id="dmx-override-info" class="hint"></span>
       <span class="hint" style="margin-left:auto">Native control resumes 2 s after last DMX packet</span>
     </div>
@@ -210,7 +209,6 @@
     <!-- Per-light control grid -->
     <div id="control-grid">
       <div class="empty-state">
-        <div class="icon">🎛️</div>
         <p>Connect to a bridge and load lights first</p>
       </div>
     </div>
@@ -226,12 +224,11 @@
       <span id="monitor-universe-label" class="hint" style="margin-left:auto"></span>
     </div>
     <div id="sacn-diag-bar" style="display:none">
-      <span id="sacn-diag-icon">📡</span>
+      <span id="sacn-diag-icon"></span>
       <span id="sacn-diag-text"></span>
     </div>
     <div id="monitor-grid">
       <div class="empty-state">
-        <div class="icon">📡</div>
         <p>Connect to a bridge and start the listener to monitor channels</p>
       </div>
     </div>

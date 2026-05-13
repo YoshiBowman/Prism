@@ -751,43 +751,26 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
   box-shadow: 0 0 32px color-mix(in srgb, var(--tile-color) 65%, transparent);
 }
 
-/* Hue + saturation strip picker */
+/* Native OS color picker */
 .ctrl-picker-strips {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
   padding: 0 0 4px;
 }
-.ctrl-hue-strip,
-.ctrl-sat-strip {
-  height: 8px;
-  border-radius: 4px;
-  position: relative;
+
+.ctrl-color-input {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 32px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
   cursor: pointer;
-  user-select: none;
-  touch-action: none;
+  padding: 3px;
+  background: none;
+  transition: border-color 150ms ease;
 }
-.ctrl-hue-strip {
-  background: linear-gradient(to right,
-    hsl(0,100%,50%),   hsl(30,100%,50%),  hsl(60,100%,50%),
-    hsl(90,100%,50%),  hsl(120,100%,50%), hsl(150,100%,50%),
-    hsl(180,100%,50%), hsl(210,100%,50%), hsl(240,100%,50%),
-    hsl(270,100%,50%), hsl(300,100%,50%), hsl(330,100%,50%),
-    hsl(360,100%,50%));
-}
-.ctrl-sat-strip {
-  background: linear-gradient(to right, #fff, var(--sat-end, hsl(0,100%,50%)));
-}
-.ctrl-strip-thumb {
-  position: absolute;
-  top: 50%;
-  transform: translate(-50%, -50%);
-  width: 14px; height: 14px;
-  border-radius: 50%;
-  border: 2px solid #fff;
-  box-shadow: 0 1px 4px rgba(0,0,0,0.6);
-  pointer-events: none;
-}
+.ctrl-color-input:hover { border-color: var(--border2); }
+.ctrl-color-input::-webkit-color-swatch-wrapper { padding: 0; border-radius: 5px; }
+.ctrl-color-input::-webkit-color-swatch { border: none; border-radius: 5px; }
 
 /* Bottom: name + brightness */
 .ctrl-tile-bot {
@@ -871,11 +854,13 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
   background: #ffcc66;
   transition: background 150ms ease;
 }
-/* strips inside group bar fill the available width, no extra bottom padding */
+/* color input inside group bar fills the available width */
 .group-bar-color .ctrl-picker-strips {
   flex: 1;
   padding: 0;
-  gap: 6px;
+}
+.group-bar-color .ctrl-color-input {
+  height: 28px;
 }
 
 /* ── Monitor panel ──────────────────────────────────────────────────────────── */
@@ -1020,6 +1005,11 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
   padding: 48px 16px;  /* was 60px 20px */
   color: var(--text3);
   text-align: center;
+}
+.empty-state--left {
+  align-items: flex-start;
+  text-align: left;
+  padding-left: 0;
 }
 .empty-state .icon { font-size: 36px; }  /* was 40px */
 .empty-state p     { font-size: 13px; color: var(--text2); }

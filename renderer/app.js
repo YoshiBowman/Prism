@@ -374,7 +374,7 @@ document.getElementById('btn-refresh-lights').addEventListener('click', refreshL
 
 async function refreshLights() {
   if (!state.connected) {
-    lightsList.innerHTML = '<div class="empty-state"><div class="icon">💡</div><p>Not connected to a bridge</p></div>';
+    lightsList.innerHTML = '<div class="empty-state empty-state--left"><p>Not connected to a bridge</p></div>';
     return;
   }
   const res   = await window.hue.getLights();
@@ -385,7 +385,7 @@ async function refreshLights() {
 function renderLights() {
   lightsList.innerHTML = '';
   if (state.lights.length === 0) {
-    lightsList.innerHTML = '<div class="empty-state"><div class="icon">💡</div><p>No lights found</p><small>Make sure your lights are powered on</small></div>';
+    lightsList.innerHTML = '<div class="empty-state empty-state--left"><p>No lights found</p><small>Make sure your lights are powered on</small></div>';
     buildMonitorCards([]);
     return;
   }
@@ -528,7 +528,7 @@ const btnUpdateDownload  = document.getElementById('btn-update-download');
 const btnUpdateInstall   = document.getElementById('btn-update-install');
 
 window.hue.on('update:available', ({ version }) => {
-  updateBannerText.textContent = `⬆ Update available: v${version}`;
+  updateBannerText.textContent = `Update available: v${version}`;
   updateBanner.style.display = 'flex';
 });
 
@@ -549,7 +549,7 @@ window.hue.on('update:downloaded', () => {
 });
 
 window.hue.on('update:error', ({ message }) => {
-  updateBannerText.textContent    = '⬆ Update available';
+  updateBannerText.textContent    = 'Update available';
   updateProgressWrap.style.display = 'none';
   btnUpdateDownload.style.display = '';
   btnUpdateDownload.disabled      = false;
@@ -594,43 +594,22 @@ function hsbToHex(h, s, v) {
 // Build a pair of inline hue + saturation strip pickers.
 // onColor(hex) fires on every drag interaction; hex is always full-brightness.
 function buildColorStrips(initHex, onColor) {
-  let [h, sat] = hexToHsb(initHex);
-
   const el = document.createElement('div');
   el.className = 'ctrl-picker-strips';
-  el.innerHTML = `
-    <div class="ctrl-hue-strip"><div class="ctrl-strip-thumb"></div></div>
-    <div class="ctrl-sat-strip"><div class="ctrl-strip-thumb"></div></div>`;
 
-  const hueStrip = el.querySelector('.ctrl-hue-strip');
-  const satStrip = el.querySelector('.ctrl-sat-strip');
-  const hueThumb = hueStrip.querySelector('.ctrl-strip-thumb');
-  const satThumb = satStrip.querySelector('.ctrl-strip-thumb');
+  // Hidden native color input — opens the OS color picker on click
+  const input = document.createElement('input');
+  input.type = 'color';
+  input.value = initHex;
+  input.className = 'ctrl-color-input';
 
-  function refresh() {
-    hueThumb.style.left       = `${(h / 360) * 100}%`;
-    hueThumb.style.background = `hsl(${h},100%,50%)`;
-    satStrip.style.setProperty('--sat-end', `hsl(${h},100%,50%)`);
-    satThumb.style.left       = `${sat * 100}%`;
-    satThumb.style.background = hsbToHex(h, sat, 1);
-  }
+  input.addEventListener('input', () => onColor(input.value));
+  input.addEventListener('change', () => onColor(input.value));
 
-  function pct(e, strip) {
-    const r = strip.getBoundingClientRect();
-    return Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
-  }
+  el.appendChild(input);
 
-  function wire(strip, fn) {
-    strip.addEventListener('pointerdown', e => { strip.setPointerCapture(e.pointerId); fn(pct(e, strip)); });
-    strip.addEventListener('pointermove', e => { if (e.buttons & 1) fn(pct(e, strip)); });
-  }
-
-  wire(hueStrip, t => { h = t * 360; refresh(); onColor(hsbToHex(h, sat, 1)); });
-  wire(satStrip, t => { sat = t;      refresh(); onColor(hsbToHex(h, sat, 1)); });
-  refresh();
-
-  // Allow external sync (e.g. when DMX or a scene changes the tile color)
-  el.setColor = hex => { [h, sat] = hexToHsb(hex); refresh(); };
+  // Allow external sync
+  el.setColor = hex => { input.value = hex; };
   return el;
 }
 
@@ -754,7 +733,7 @@ function buildControlCards(lights) {
   selectedLights.clear();
   updateGroupBar();
   if (!lights || lights.length === 0) {
-    controlGrid.innerHTML = '<div class="empty-state"><div class="icon">💡</div><p>Connect to a bridge and load lights first</p></div>';
+    controlGrid.innerHTML = '<div class="empty-state"><p>Connect to a bridge and load lights first</p></div>';
     return;
   }
   controlGrid.innerHTML = '';
@@ -1043,13 +1022,13 @@ window.hue.on('sacn:diag', ({ rawCount, lastUniverse, wrongUniverse, configured,
   }
   if (lastUniverse === null) {
     sacnDiagBar.className = '';
-    sacnDiagIcon.textContent = '⚠️';
+    sacnDiagIcon.textContent = '';
     sacnDiagText.textContent = `sACN: ${rawCount} packets received but none matched E1.31 format (last: ${lastSize} bytes)`;
     return;
   }
   if (lastUniverse !== configured) {
     sacnDiagBar.className = 'mismatch';
-    sacnDiagIcon.textContent = '⚠️';
+    sacnDiagIcon.textContent = '';
     sacnDiagText.textContent =
       `sACN: Receiving universe ${lastUniverse} — app is configured for universe ${configured}. ` +
       `Change sACN Universe in Settings to ${lastUniverse}.`;

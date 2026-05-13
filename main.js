@@ -1498,20 +1498,30 @@ function togglePopover(trayBounds) {
   popoverWin.focus();
 }
 
+// Send the current bridge connection state to the main window.
+function sendBridgeStatus() {
+  if (mainWindow && !mainWindow.isDestroyed())
+    mainWindow.webContents.send('bridge:auto-connect', { connected: !!hueApi, bridge: config.bridge });
+}
+
 // Show (or create) the main window and restore Dock presence on macOS
 function openMainWindow() {
   if (process.platform === 'darwin' && app.dock) app.dock.show();
 
   if (!mainWindow || mainWindow.isDestroyed()) {
     createWindow();
-    // Send auto-connect result once the page finishes loading
-    mainWindow.webContents.once('did-finish-load', async () => {
+    mainWindow.webContents.once('did-finish-load', () => {
       mainWindow.webContents.executeJavaScript(
         `document.body.dataset.platform = '${process.platform}'`
       );
-      const connected = connectedPromise ? await connectedPromise : !!hueApi;
-      if (mainWindow && !mainWindow.isDestroyed())
-        mainWindow.webContents.send('bridge:auto-connect', { connected, bridge: config.bridge });
+      // Fire immediately so the listener bar / settings populate right away —
+      // don't wait on the bridge connection promise.
+      sendBridgeStatus();
+      // If still connecting, fire again once the attempt resolves so the
+      // status dot updates without the user having to do anything.
+      if (!hueApi && connectedPromise) {
+        connectedPromise.then(() => sendBridgeStatus()).catch(() => {});
+      }
     });
   } else {
     mainWindow.show();
@@ -1550,8 +1560,22 @@ app.whenReady().then(() => {
   // On macOS start as a tray-only app (no Dock icon until main window is opened)
   if (process.platform === 'darwin' && app.dock) app.dock.hide();
 
-  // Connect to saved bridge in the background immediately
-  connectedPromise = connectToSavedBridge();
+  // Connect to saved bridge in the background immediately.
+  // If the network isn't ready yet (common at login), retry every 8 s for
+  // up to 2 minutes before handing off to the 30 s health-check interval.
+  connectedPromise = connectToSavedBridge().then(ok => {
+    if (ok || !config.bridge) return ok;
+    let attempts = 0;
+    const startupRetry = setInterval(async () => {
+      if (hueApi || ++attempts >= 15) { clearInterval(startupRetry); return; }
+      const connected = await connectToSavedBridge().catch(() => false);
+      if (connected) {
+        clearInterval(startupRetry);
+        sendBridgeStatus();   // notify main window if it's open
+      }
+    }, 8000); // every 8 s  →  15 attempts  →  2 minutes
+    return false;
+  });
 
   // Show the main window on first launch (no bridge configured yet) so the
   // user can go through setup. After that the app starts silently in the tray.

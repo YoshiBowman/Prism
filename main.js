@@ -27,6 +27,7 @@ const DEFAULT_CONFIG = {
   noLimit: false,
   disabledLights: {},
   lightsOrder: [],
+  lightAddresses: {},         // { lightId: dmxStartChannel } — custom per-light patch (1-based)
   scenes: {},                 // { sceneName: [ { id, on, rgb, bri } ] }
   lightStates: {},            // { lightId: { on, rgb, bri } } — persisted control-tab state
   lastTab: 'bridge',          // last active tab, restored on launch
@@ -146,9 +147,14 @@ async function connectToSavedBridge() {
   if (!config.bridge || !config.user) return false;
   try {
     hueApi = await localConnect(config.bridge, config.user);
+    // Clear rate-limit and dedup caches so every light re-sends its current
+    // state on the next tick after a reconnect.
+    for (const k of Object.keys(lightLastKey))   delete lightLastKey[k];
+    for (const k of Object.keys(lightLastSendMs)) delete lightLastSendMs[k];
     fetchLights().catch(() => {});
     return true;
-  } catch {
+  } catch (err) {
+    console.warn('[bridge] reconnect failed:', err.message);
     hueApi = null;
     return false;
   }
@@ -183,7 +189,7 @@ const OPCODE_OUTPUT = 0x5000;
 
 let artnetSocket = null;
 let artnetRunning = false;
-let dmxBuffer = Buffer.alloc(512, 0);
+const dmxBuffers = {};   // { universeNum: Buffer } — latest received DMX frame per universe
 
 // ── Smart intermediary ────────────────────────────────────────────────────────
 // The Hue bridge processes ~10 commands/sec total across all lights.  Sending
@@ -203,7 +209,8 @@ let dmxBuffer = Buffer.alloc(512, 0);
 //                  smooth transition and tracks the console perfectly.
 //   • End-of-fade → velocity drops to ~0, a single snap correction confirms final state.
 
-const TICKER_MS = 250;
+const TICKER_MS  = 250;
+const FOLLOW_TT  = Math.round((TICKER_MS + 50) / 100); // 3 deciseconds = 300 ms
 
 // { lightId: { r, g, b, extra } }  — latest value from DMX frames
 const lightCurrent = {};
@@ -211,6 +218,19 @@ const lightCurrent = {};
 const lightPrev    = {};
 // { lightId: string }              — last sent endpoint key (dedup)
 const lightLastKey = {};
+// { lightId: number }              — timestamp of last actual send per light (PER-LIGHT rate limit)
+// NOTE: This intentionally replaces the old single global _lastDirectSendMs.
+//       A global timer had a critical flaw: light 1 always reset the timer in
+//       the same synchronous tick loop, so light 2 was always blocked (0 ms
+//       elapsed) and never sent commands.  Per-light timers let every light send
+//       independently without starving each other.
+const lightLastSendMs = {};
+
+// ── 5-second rolling command-rate diagnostic ──────────────────────────────────
+// Logs to stdout so you can confirm the actual rate hitting the bridge.
+// Leave enabled until the unreachability issue is confirmed resolved.
+let _diagSendCount   = 0;
+let _diagWindowStart = Date.now();
 
 let bridgeTicker = null;
 
@@ -219,6 +239,31 @@ function updateCurrent(lightId, r, g, b, extra) {
 }
 
 function clampByte(v) { return v < 0 ? 0 : v > 255 ? 255 : Math.round(v); }
+
+// Send a direct state update, respecting both the dedup cache and the
+// PER-LIGHT rate limit.
+//
+// Returns true if the command was dispatched.  Returns false — WITHOUT updating
+// lightLastKey — if the key is unchanged (dedup) or this light's cooldown has
+// not elapsed yet.  The next tick will retry automatically.
+//
+// The per-light minimum gap (default 500 ms = 2 cmd/sec per light) means:
+//  • Every light gets fair access — no light can starve another.
+//  • With 2 lights both sending at 2/sec, the total rate is 4 cmd/sec,
+//    well below the bridge's ~10 cmd/sec budget.
+//  • "Disable Rate Limiting" in Settings raises the limit to 0 (no floor).
+function tryDirectSend(lightId, key, payload) {
+  // Dedup — same endpoint already sent; nothing to do
+  if (lightLastKey[lightId] === key) return false;
+  // Per-light rate limit: minimum gap between consecutive sends TO THIS LIGHT
+  const minGap = config.noLimit ? 0 : 500; // 500 ms → 2 cmd/sec per light
+  const lastMs = lightLastSendMs[lightId] || 0;
+  if (minGap > 0 && Date.now() - lastMs < minGap) return false;
+  lightLastKey[lightId]   = key;
+  lightLastSendMs[lightId] = Date.now();
+  sendDirectState(lightId, payload);
+  return true;
+}
 
 function tickBridge() {
   if (!hueApi || !config.bridge || !config.user) return;
@@ -231,9 +276,8 @@ function tickBridge() {
     if (!prev) {
       // First tick — no history yet, just send current
       const key = `s:${cur.r},${cur.g},${cur.b}`;
-      if (lightLastKey[lightId] === key) continue;
-      lightLastKey[lightId] = key;
-      sendDirectState(lightId, buildDirectPayload(cur.r, cur.g, cur.b, { tt: 0 }));
+      const tt0 = (cur.r === 0 && cur.g === 0 && cur.b === 0) ? 0 : FOLLOW_TT;
+      tryDirectSend(lightId, key, buildDirectPayload(cur.r, cur.g, cur.b, { tt: tt0 }));
       continue;
     }
 
@@ -243,11 +287,12 @@ function tickBridge() {
     const maxDelta = Math.max(Math.abs(dr), Math.abs(dg), Math.abs(db));
 
     if (maxDelta < 2) {
-      // Static — instant correction, dedup prevents redundant calls
+      // Static — dedup prevents redundant calls
       const key = `s:${cur.r},${cur.g},${cur.b}`;
-      if (lightLastKey[lightId] === key) continue;
-      lightLastKey[lightId] = key;
-      sendDirectState(lightId, buildDirectPayload(cur.r, cur.g, cur.b, { tt: 0 }));
+      const isBlackout  = cur.r === 0 && cur.g === 0 && cur.b === 0;
+      const wasFading   = (lightLastKey[lightId] || '').startsWith('f:');
+      const ttStatic    = isBlackout ? 0 : wasFading ? 1 : FOLLOW_TT;
+      tryDirectSend(lightId, key, buildDirectPayload(cur.r, cur.g, cur.b, { tt: ttStatic }));
       continue;
     }
 
@@ -267,11 +312,10 @@ function tickBridge() {
     }
 
     if (!isFinite(timeToEnd) || timeToEnd > 60000) {
-      // Can't extrapolate — fall back to snap
-      const key = `s:${cur.r},${cur.g},${cur.b}`;
-      if (lightLastKey[lightId] === key) continue;
-      lightLastKey[lightId] = key;
-      sendDirectState(lightId, buildDirectPayload(cur.r, cur.g, cur.b, { tt: 0 }));
+      // Can't extrapolate — fall back to follow transition
+      const key   = `s:${cur.r},${cur.g},${cur.b}`;
+      const ttFb  = (cur.r === 0 && cur.g === 0 && cur.b === 0) ? 0 : FOLLOW_TT;
+      tryDirectSend(lightId, key, buildDirectPayload(cur.r, cur.g, cur.b, { tt: ttFb }));
       continue;
     }
 
@@ -283,10 +327,7 @@ function tickBridge() {
 
     // Dedup on endpoint only — tt naturally decreases each tick and doesn't need re-sending
     const key = `f:${pr},${pg},${pb}`;
-    if (lightLastKey[lightId] === key) continue;
-    lightLastKey[lightId] = key;
-
-    sendDirectState(lightId, buildDirectPayload(pr, pg, pb, { tt }));
+    tryDirectSend(lightId, key, buildDirectPayload(pr, pg, pb, { tt }));
   }
 }
 
@@ -296,9 +337,10 @@ function startBridgeTicker() {
 
 function stopBridgeTicker() {
   if (bridgeTicker) { clearInterval(bridgeTicker); bridgeTicker = null; }
-  for (const k of Object.keys(lightCurrent)) delete lightCurrent[k];
-  for (const k of Object.keys(lightPrev))    delete lightPrev[k];
-  for (const k of Object.keys(lightLastKey)) delete lightLastKey[k];
+  for (const k of Object.keys(lightCurrent))   delete lightCurrent[k];
+  for (const k of Object.keys(lightPrev))      delete lightPrev[k];
+  for (const k of Object.keys(lightLastKey))   delete lightLastKey[k];
+  for (const k of Object.keys(lightLastSendMs)) delete lightLastSendMs[k];
 }
 
 // Keep-alive HTTP agent — reuses TCP connections to the bridge.
@@ -311,6 +353,17 @@ keepAliveAgent.on('free', socket => socket.setTimeout(20000, () => socket.destro
 // Fast direct PUT to the Hue local REST API bypassing node-hue-api overhead
 function sendDirectState(lightId, payload) {
   if (!config.bridge || !config.user) return;
+
+  // ── 5-second rolling rate diagnostic ─────────────────────────────────────
+  _diagSendCount++;
+  const _now = Date.now();
+  if (_now - _diagWindowStart >= 5000) {
+    const elapsed = (_now - _diagWindowStart) / 1000;
+    console.log(`[bridge] ${_diagSendCount} commands in last ${elapsed.toFixed(1)}s (${(_diagSendCount / elapsed).toFixed(1)}/sec avg)`);
+    _diagSendCount   = 0;
+    _diagWindowStart = _now;
+  }
+
   const body = Buffer.from(JSON.stringify(payload));
   const req  = http.request({
     hostname: config.bridge,
@@ -319,15 +372,63 @@ function sendDirectState(lightId, payload) {
     method:   'PUT',
     headers:  { 'Content-Type': 'application/json', 'Content-Length': body.length },
     agent:    keepAliveAgent,
-  }, res => res.resume());
-  req.on('error', () => {});
+  }, res => {
+    // Read the response body — the Hue API returns HTTP 200 even for errors,
+    // with JSON like [{"error":{"type":1,"description":"unauthorized user"}}].
+    // Status-code checking alone misses these failures.
+    let data = '';
+    res.on('data', c => { data += c; });
+    res.on('end', () => {
+      if (res.statusCode >= 400) {
+        console.warn(`[bridge] PUT light ${lightId} → HTTP ${res.statusCode}: ${data.slice(0, 200)}`);
+      } else if (data.includes('"error"')) {
+        console.warn(`[bridge] PUT light ${lightId} → API error: ${data.slice(0, 200)}`);
+      }
+    });
+  });
+  req.on('error', err => console.warn(`[bridge] PUT light ${lightId} error: ${err.message}`));
   req.write(body);
   req.end();
 }
 
+// Raw HTTP/HTTPS request helper for the Hue local REST API.
+// Tries port 80 first; falls back to cert-free HTTPS on failure.
+// Returns the parsed JSON body (rejects on network errors or bad JSON).
+function hueBridgeRequest(method, apiPath, body) {
+  return new Promise((resolve, reject) => {
+    const payload = body ? Buffer.from(JSON.stringify(body)) : null;
+    const tlsAgent = new https.Agent({ rejectUnauthorized: false, minVersion: 'TLSv1', ciphers: 'ALL' });
+
+    function attempt(mod, port) {
+      const opts = {
+        hostname: config.bridge,
+        port,
+        path:     `/api/${config.user}${apiPath}`,
+        method,
+        agent:    port === 443 ? tlsAgent : keepAliveAgent,
+      };
+      if (payload) opts.headers = { 'Content-Type': 'application/json', 'Content-Length': payload.length };
+
+      const req = mod.request(opts, res => {
+        let data = '';
+        res.on('data', c => { data += c; });
+        res.on('end', () => {
+          try { resolve(JSON.parse(data)); }
+          catch { reject(new Error('Bad JSON from bridge')); }
+        });
+      });
+      req.on('error', e => { if (port === 80) attempt(https, 443); else reject(e); });
+      req.setTimeout(8000, () => { req.destroy(); if (port === 443) reject(new Error('timeout')); else attempt(https, 443); });
+      if (payload) req.write(payload);
+      req.end();
+    }
+    attempt(http, 80);
+  });
+}
+
 // Build a plain-object payload (Hue API units) instead of a LightState object
 function buildDirectPayload(r, g, b, opts = {}) {
-  const tt = opts.tt !== undefined ? opts.tt : 0;
+  const tt = opts.tt !== undefined ? opts.tt : FOLLOW_TT;
   if (r === 0 && g === 0 && b === 0) return { on: false, transitiontime: tt };
   const [h, s, v] = rgbToHsb(r, g, b);
   return {
@@ -375,34 +476,79 @@ function buildLightState(r, g, b, opts = {}) {
   return state;
 }
 
-function processArtnet(data) {
+// Returns the set of universe numbers this protocol's socket should accept.
+// Always includes the base (globally-configured) universe plus any universe
+// explicitly assigned to at least one light via a custom patch.
+// Cached watched-universe set — rebuilt whenever lightAddresses or the base universe changes.
+// Avoids allocating a new Set on every incoming sACN packet (which can be thousands/sec).
+let _watchedUniversesCache = null;
+let _watchedUniversesBase  = null;
+
+function getWatchedUniverses(baseUniverse) {
+  if (_watchedUniversesCache && _watchedUniversesBase === baseUniverse) {
+    return _watchedUniversesCache;
+  }
+  const universes = new Set([baseUniverse]);
+  for (const patch of Object.values(config.lightAddresses || {})) {
+    if (patch == null || typeof patch === 'number') continue;
+    if (patch.universe != null) universes.add(patch.universe);
+  }
+  _watchedUniversesBase  = baseUniverse;
+  _watchedUniversesCache = universes;
+  return universes;
+}
+
+// Call this whenever lightAddresses changes so the cache is rebuilt on next use.
+function invalidateWatchedUniverses() {
+  _watchedUniversesCache = null;
+}
+
+// processArtnet(data, packetUniverse, defaultUniverse)
+//   packetUniverse  — the universe number in the received packet
+//   defaultUniverse — the globally-configured universe for this protocol
+//                     (config.universe for Art-Net / config.sacnUniverse for sACN)
+// Lights with no custom patch respond to defaultUniverse; lights with a custom
+// universe patch respond only when packetUniverse matches their patched universe.
+function processArtnet(data, packetUniverse, defaultUniverse) {
   if (!hueApi) return;
 
-  const channelsPerLight = 3;
-  const baseOffset = (config.dmxAddress - 1) + (config.transition === 'channel' ? 1 : 0);
+  // Cache the raw frame so the renderer can read per-universe live data
+  dmxBuffers[packetUniverse] = Buffer.from(data);
 
-  const orderedLights = getOrderedLights();
+  const channelsPerLight = 3;
+  const baseOffset       = (config.dmxAddress - 1) + (config.transition === 'channel' ? 1 : 0);
+  const lightAddresses   = config.lightAddresses || {};
+  const orderedLights    = getOrderedLights();
 
   for (let i = 0; i < orderedLights.length; i++) {
     const light = orderedLights[i];
     if (config.disabledLights[light.id]) continue;
 
-    const offset = baseOffset + i * channelsPerLight;
-    if (offset + 2 >= data.length) break;
+    const raw = lightAddresses[light.id];
+    // Backward compat: plain number stored → treat as { channel: n }
+    const patch = (raw != null && typeof raw === 'number') ? { channel: raw } : raw;
 
-    const r     = data[offset];
-    const g     = data[offset + 1];
-    const b     = data[offset + 2];
-    updateCurrent(light.id, r, g, b, null);
+    // Determine which universe this light is patched to
+    const lightUniverse = patch?.universe ?? defaultUniverse;
+    // Skip lights that belong to a different universe in this packet
+    if (lightUniverse !== packetUniverse) continue;
+
+    // Determine the 0-based offset within this universe's buffer
+    const offset = patch?.channel != null
+      ? (patch.channel - 1)
+      : baseOffset + i * channelsPerLight;
+
+    if (offset + 2 >= data.length) continue;
+
+    updateCurrent(light.id, data[offset], data[offset + 1], data[offset + 2], null);
   }
 
-  // Ensure the 100 ms bridge ticker is running
   startBridgeTicker();
 
-  // Forward DMX buffer snapshot to renderer for live display
+  // Send the frame + universe number to the renderer for live display
   if (mainWindow && !mainWindow.isDestroyed()) {
     const snapshot = Array.from(data.slice(0, Math.min(data.length, 512)));
-    mainWindow.webContents.send('artnet:dmx-update', snapshot);
+    mainWindow.webContents.send('artnet:dmx-update', snapshot, packetUniverse);
   }
 }
 
@@ -419,13 +565,12 @@ function startArtnet() {
     if (opCode !== OPCODE_OUTPUT) return;
 
     const msgUniverse = msg.readUInt16LE(14);
-    if (msgUniverse !== config.universe) return;
+    if (!getWatchedUniverses(config.universe).has(msgUniverse)) return;
 
-    const length = msg.readUInt16BE(16);
+    const length  = msg.readUInt16BE(16);
     const dmxData = msg.slice(18, 18 + length);
-    dmxBuffer = Buffer.from(dmxData);
-    markDmxActive(); // Art-Net always takes over
-    processArtnet(dmxData);
+    markDmxActive();
+    processArtnet(dmxData, msgUniverse, config.universe);
   });
 
   artnetSocket.on('error', (err) => {
@@ -469,14 +614,44 @@ let sacnRunning = false;
 // Diagnostics — visible in the Monitor tab
 const sacnDiag = { rawCount: 0, lastUniverse: null, lastSize: 0, wrongUniverse: 0 };
 
+// Throttle the diag IPC send to at most once per second.
+// emitSacnDiag() is called on every incoming sACN packet; without throttling,
+// heavy traffic (e.g. 150 universes) would flood the main-process event loop
+// with thousands of IPC sends/sec, backing up the event queue and delaying
+// the keepAlive socket timeouts that prevent ECONNRESET on the bridge.
+let _sacnDiagLastAt = 0;
 function emitSacnDiag() {
+  const now = Date.now();
+  if (now - _sacnDiagLastAt < 1000) return;
+  _sacnDiagLastAt = now;
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('sacn:diag', { ...sacnDiag, configured: config.sacnUniverse });
+    mainWindow.webContents.send('sacn:diag', {
+      ...sacnDiag,
+      configured: config.sacnUniverse,
+      watched: [...getWatchedUniverses(config.sacnUniverse)],
+    });
   }
 }
 
 function sacnMulticastGroup(universe) {
   return `239.255.${(universe >> 8) & 0xff}.${universe & 0xff}`;
+}
+
+// Join a sACN multicast group on the socket that is currently bound.
+// Safe to call for groups already joined (errors are swallowed).
+function joinSacnGroup(universe) {
+  if (!sacnSocket || !config.sacnMulticast) return;
+  const group = sacnMulticastGroup(universe);
+  if (config.host !== '0.0.0.0') {
+    try { sacnSocket.addMembership(group, config.host); } catch {}
+  } else {
+    for (const addrs of Object.values(os.networkInterfaces())) {
+      for (const a of addrs) {
+        if (a.family !== 'IPv4' || a.internal) continue;
+        try { sacnSocket.addMembership(group, a.address); } catch {}
+      }
+    }
+  }
 }
 
 function parseSACN(msg) {
@@ -509,6 +684,24 @@ function startSACN() {
     sacnDiag.rawCount++;
     sacnDiag.lastSize = msg.length;
 
+    // ── Fast pre-filter ───────────────────────────────────────────────────────
+    // In E1.31 the universe is a 16-bit BE value at byte offset 113.
+    // Read those two bytes before doing any further work so we can drop the
+    // overwhelming majority of packets (all non-watched universes) in ~1 µs
+    // rather than running the full parseSACN validation on every one of them.
+    // This is critical when a sender is transmitting 100+ universes: without
+    // this guard, parseSACN runs thousands of times per second and saturates
+    // the event loop, delaying the keepAlive socket timeouts and causing
+    // ECONNRESET failures on the Hue bridge connection.
+    if (msg.length >= 115) {
+      const rawUniv = msg.readUInt16BE(113);
+      if (!getWatchedUniverses(config.sacnUniverse).has(rawUniv)) {
+        sacnDiag.wrongUniverse++;
+        emitSacnDiag(); // throttled to 1/sec — negligible cost
+        return;
+      }
+    }
+
     const result = parseSACN(msg);
     if (!result) { emitSacnDiag(); return; }
 
@@ -516,14 +709,8 @@ function startSACN() {
     sacnDiag.lastPriority = result.priority;
     emitSacnDiag();
 
-    if (result.universe !== config.sacnUniverse) {
-      sacnDiag.wrongUniverse++;
-      return;
-    }
-
     markDmxActive();
-    dmxBuffer = Buffer.from(result.dmxData);
-    processArtnet(result.dmxData);
+    processArtnet(result.dmxData, result.universe, config.sacnUniverse);
   });
 
   sacnSocket.on('error', (err) => {
@@ -537,18 +724,10 @@ function startSACN() {
     try {
       sacnSocket.setBroadcast(true);
       if (config.sacnMulticast) {
-        const group = sacnMulticastGroup(config.sacnUniverse);
-        if (config.host !== '0.0.0.0') {
-          // Specific interface requested
-          sacnSocket.addMembership(group, config.host);
-        } else {
-          // Join on every non-loopback IPv4 interface so multicast works on all network segments
-          for (const addrs of Object.values(os.networkInterfaces())) {
-            for (const a of addrs) {
-              if (a.family !== 'IPv4' || a.internal) continue;
-              try { sacnSocket.addMembership(group, a.address); } catch {}
-            }
-          }
+        // Join the default universe AND every per-light universe override so
+        // the OS delivers packets for all watched universes to this socket.
+        for (const universe of getWatchedUniverses(config.sacnUniverse)) {
+          joinSacnGroup(universe);
         }
       }
     } catch {}
@@ -595,7 +774,8 @@ async function fetchLights() {
       state: l.state,
     }));
     return lightsCache;
-  } catch {
+  } catch (err) {
+    console.error('[fetchLights] ERROR:', err);
     return lightsCache;
   }
 }
@@ -617,15 +797,30 @@ function getOrderedLights() {
 
 function calcDmxChannels() {
   const channelsPerLight = 3;
-  const base = (config.dmxAddress - 1) + (config.transition === 'channel' ? 1 : 0);
-  const orderedLights = getOrderedLights();
+  const base             = (config.dmxAddress - 1) + (config.transition === 'channel' ? 1 : 0);
+  const orderedLights    = getOrderedLights();
+  const lightAddresses   = config.lightAddresses || {};
   const map = {};
   orderedLights.forEach((light, i) => {
-    const start = base + i * channelsPerLight + 1;
+    const raw   = lightAddresses[light.id];
+    // Backward compat: plain number → treat as { channel: n }
+    const patch = (raw != null && typeof raw === 'number') ? { channel: raw } : raw;
+
+    const customChannel  = patch?.channel  ?? null;
+    const customUniverse = patch?.universe ?? null;
+    const isCustom       = patch != null;
+
+    const start    = customChannel  != null ? customChannel  : base + i * channelsPerLight + 1;
+    // Default universe is protocol-specific: Art-Net uses config.universe, sACN uses config.sacnUniverse
+    const defaultUniverse = config.protocol === 'sacn' ? (config.sacnUniverse ?? 1) : (config.universe ?? 0);
+    const universe = customUniverse != null ? customUniverse : defaultUniverse;
+
     map[light.id] = {
       start,
+      universe,
       channels: channelsPerLight,
-      labels: ['R', 'G', 'B'].map((l, j) => `ch${start + j}:${l}`),
+      labels:   ['R', 'G', 'B'].map((l, j) => `ch${start + j}:${l}`),
+      custom:   isCustom,
     };
   });
   return map;
@@ -1076,13 +1271,22 @@ ipcMain.handle('bridge:status', () => {
 });
 
 ipcMain.handle('lights:get', async () => {
-  const lights = await fetchLights();
-  const dmxMap = calcDmxChannels();
+  const lights         = await fetchLights();
+  const dmxMap         = calcDmxChannels();
+  const ordered        = getOrderedLights();
+  const lightAddresses = config.lightAddresses || {};
   return {
-    lights: getOrderedLights().map(l => ({
+    lights: ordered.map(l => ({
       ...l,
-      dmx: dmxMap[l.id] || null,
-      disabled: !!config.disabledLights[l.id],
+      dmx:           dmxMap[l.id] || null,
+      disabled:      !!config.disabledLights[l.id],
+      customAddress: (() => {
+          const raw = lightAddresses[l.id];
+          if (raw == null) return null;
+          // Backward compat: plain number → expose as { channel: n, universe: null }
+          if (typeof raw === 'number') return { channel: raw, universe: null };
+          return raw;
+        })(),
     })),
   };
 });
@@ -1101,6 +1305,95 @@ ipcMain.handle('lights:toggle-disabled', (event, lightId) => {
   }
   saveConfig();
   return { disabled: !!config.disabledLights[lightId] };
+});
+
+// ── Per-light DMX address patching ────────────────────────────────────────────
+
+// Set or clear the per-light DMX patch.
+//   patch = null                    → sequential (no override)
+//   patch = { channel?, universe? } → either field optional; null field = use global default
+// When both fields are absent/null the patch is cleared entirely.
+ipcMain.handle('lights:set-address', (event, lightId, patch) => {
+  if (!config.lightAddresses) config.lightAddresses = {};
+  if (
+    patch == null ||
+    (typeof patch === 'object' && patch.channel == null && patch.universe == null)
+  ) {
+    delete config.lightAddresses[lightId];
+  } else if (typeof patch === 'number') {
+    // Legacy call — treat as channel-only
+    config.lightAddresses[lightId] = { channel: patch };
+  } else {
+    // Store only the fields that are actually set so we don't clobber missing ones
+    const stored = {};
+    if (patch.channel  != null) stored.channel  = Number(patch.channel);
+    if (patch.universe != null) stored.universe = Number(patch.universe);
+    config.lightAddresses[lightId] = stored;
+    // If sACN is already running, join the new universe's multicast group immediately
+    // so packets arrive without requiring a listener restart.
+    if (stored.universe != null && sacnRunning) joinSacnGroup(stored.universe);
+  }
+  invalidateWatchedUniverses();
+  saveConfig();
+  return { success: true };
+});
+
+// ── Hue bulb discovery ────────────────────────────────────────────────────────
+
+// POST /lights — tells the bridge to open a 40-second Zigbee inclusion window.
+ipcMain.handle('lights:search-new', async () => {
+  if (!config.bridge || !config.user) return { success: false, error: 'Not connected' };
+  try {
+    await hueBridgeRequest('POST', '/lights', {});
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+// GET /lights/new — poll for lights found during the active scan.
+// Returns { scanning: bool, lights: [{ id, name }] }
+ipcMain.handle('lights:get-new', async () => {
+  if (!config.bridge || !config.user) return { success: false, error: 'Not connected' };
+  try {
+    const result = await hueBridgeRequest('GET', '/lights/new', null);
+    // result shape: { "lastscan": "active" | "<timestamp>", "<id>": { name: "..." }, ... }
+    const { lastscan, ...rest } = result;
+    const lights = Object.entries(rest).map(([id, info]) => ({ id, name: info.name || `Light ${id}` }));
+    return { success: true, scanning: lastscan === 'active', lights };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+// Rename a light on the bridge and update our local cache.
+ipcMain.handle('lights:rename', async (event, lightId, name) => {
+  if (!config.bridge || !config.user) return { success: false, error: 'Not connected' };
+  try {
+    await hueBridgeRequest('PUT', `/lights/${lightId}`, { name });
+    const cached = lightsCache.find(l => String(l.id) === String(lightId));
+    if (cached) cached.name = name;
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+// Delete a light from the bridge and remove it from local state.
+ipcMain.handle('lights:delete', async (event, lightId) => {
+  if (!config.bridge || !config.user) return { success: false, error: 'Not connected' };
+  try {
+    await hueBridgeRequest('DELETE', `/lights/${lightId}`, null);
+    lightsCache = lightsCache.filter(l => String(l.id) !== String(lightId));
+    // Clean up all per-light config entries
+    delete config.disabledLights[lightId];
+    if (config.lightAddresses) { delete config.lightAddresses[lightId]; invalidateWatchedUniverses(); }
+    config.lightsOrder = (config.lightsOrder || []).filter(id => String(id) !== String(lightId));
+    saveConfig();
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
 });
 
 ipcMain.handle('settings:get', () => {

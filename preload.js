@@ -17,10 +17,15 @@ contextBridge.exposeInMainWorld('hue', {
   bridgeStatus:     ()   => ipcRenderer.invoke('bridge:status'),
 
   // Lights
-  getLights:       ()           => ipcRenderer.invoke('lights:get'),
-  setLightOrder:   (order)      => ipcRenderer.invoke('lights:set-order', order),
-  toggleDisabled:  (lightId)    => ipcRenderer.invoke('lights:toggle-disabled', lightId),
-  setLightState:   (id, state)  => ipcRenderer.invoke('lights:set-state', id, state),
+  getLights:       ()             => ipcRenderer.invoke('lights:get'),
+  setLightOrder:   (order)        => ipcRenderer.invoke('lights:set-order', order),
+  toggleDisabled:  (lightId)      => ipcRenderer.invoke('lights:toggle-disabled', lightId),
+  setLightState:   (id, state)    => ipcRenderer.invoke('lights:set-state', id, state),
+  setLightAddress: (id, addr)     => ipcRenderer.invoke('lights:set-address', id, addr),
+  searchNewLights: ()             => ipcRenderer.invoke('lights:search-new'),
+  getNewLights:    ()             => ipcRenderer.invoke('lights:get-new'),
+  renameLight:     (id, name)     => ipcRenderer.invoke('lights:rename', id, name),
+  deleteLight:     (id)           => ipcRenderer.invoke('lights:delete', id),
 
   // Scenes
   getScenes:    ()            => ipcRenderer.invoke('scenes:get'),

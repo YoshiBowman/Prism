@@ -29,11 +29,11 @@
     </select>
   </div>
   <div class="lb-field" id="lb-artnet-field">
-    <label>Art-Net Univ.</label>
+    <label>Default Univ.</label>
     <input id="lb-artnet-universe" class="input input-sm" type="number" min="0" max="32767" placeholder="0">
   </div>
   <div class="lb-field" id="lb-sacn-field" style="display:none">
-    <label>sACN Univ.</label>
+    <label>Default Univ.</label>
     <input id="lb-sacn-universe" class="input input-sm" type="number" min="1" max="63999" placeholder="1">
   </div>
   <button id="lb-start" class="btn btn-primary btn-sm">▶ Start</button>
@@ -170,8 +170,30 @@
   <div id="panel-lights" class="panel">
     <div id="lights-toolbar">
       <button id="btn-refresh-lights" class="btn btn-secondary btn-sm">↻ Refresh</button>
-      <span class="hint">Drag rows to reorder DMX channel assignment · Toggle to enable/disable a light</span>
+      <button id="btn-find-lights"    class="btn btn-secondary btn-sm">+ Find New Lights</button>
+      <span class="hint">Drag to reorder · DMX column sets custom start address · Toggle enables/disables</span>
     </div>
+
+    <!-- Bulb discovery section (hidden until "Find New Lights" clicked) -->
+    <div id="lights-discovery" style="display:none">
+      <div class="discovery-header">
+        <div class="spinner" id="discovery-spinner"></div>
+        <span id="discovery-status-text">Scanning for new lights (40 s)…</span>
+        <button id="btn-discovery-done" class="btn btn-secondary btn-sm" style="margin-left:auto">Done</button>
+      </div>
+      <div id="discovery-results"></div>
+    </div>
+
+    <div id="lights-col-header">
+      <span class="lch-handle"></span>
+      <span class="lch-swatch"></span>
+      <span class="lch-fixture">Fixture</span>
+      <span class="lch-address">Address</span>
+      <span class="lch-patch">Patch</span>
+      <span class="lch-btn"></span>
+      <span class="lch-toggle"></span>
+    </div>
+
     <div id="lights-list">
       <div class="empty-state empty-state--left">
         <p>Connect to a bridge first</p>
@@ -254,15 +276,16 @@
         </div>
 
         <div class="field">
-          <label>Art-Net Universe <span style="color:var(--text3)">(0 – 32767)</span></label>
+          <label>Default Universe <span style="color:var(--text3)">(0 – 32767)</span> <span class="info-icon" data-tooltip="This universe applies to all fixtures. You can override it per fixture in the patch list below.">ⓘ</span></label>
           <input id="s-universe" class="input" type="number" min="0" max="32767" placeholder="0">
+          <div class="hint">Applied to all lights unless overridden per fixture</div>
         </div>
 
         <div id="sacn-fields">
           <div class="field">
-            <label>sACN Universe <span style="color:var(--text3)">(1 – 63999)</span></label>
+            <label>Default Universe (sACN) <span style="color:var(--text3)">(1 – 63999)</span> <span class="info-icon" data-tooltip="This universe applies to all fixtures using sACN. You can override it per fixture in the patch list below.">ⓘ</span></label>
             <input id="s-sacn-universe" class="input" type="number" min="1" max="63999" placeholder="1">
-            <div class="hint">Multicast group: <span id="sacn-multicast-group">239.255.0.1</span></div>
+            <div class="hint">Applied to all lights unless overridden per fixture · Multicast group: <span id="sacn-multicast-group">239.255.0.1</span></div>
           </div>
           <div class="checkbox-row" style="border:none;padding:0;margin-bottom:16px">
             <div>

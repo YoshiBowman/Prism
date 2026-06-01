@@ -11,6 +11,9 @@ const state = {
   pairing: false,
 };
 
+// Per-universe DMX frame cache — keyed by universe number, updated on artnet:dmx-update
+const dmxByUniverse = {};
+
 // ── Tabs ─────────────────────────────────────────────────────────────────────
 
 const tabs   = document.querySelectorAll('.tab');
@@ -62,10 +65,12 @@ lbProtocol.addEventListener('change', () => updateListenerBarVisibility(lbProtoc
 // Keep listener bar ↔ settings universes in sync
 lbArtnetUniverse.addEventListener('input', () => {
   document.getElementById('s-universe').value = lbArtnetUniverse.value;
+  refreshEffectivePatch();
 });
 lbSacnUniverse.addEventListener('input', () => {
   document.getElementById('s-sacn-universe').value = lbSacnUniverse.value;
   updateMulticastHint();
+  refreshEffectivePatch();
 });
 
 async function listenerBarStart() {
@@ -377,9 +382,14 @@ async function refreshLights() {
     lightsList.innerHTML = '<div class="empty-state empty-state--left"><p>Not connected to a bridge</p></div>';
     return;
   }
-  const res   = await window.hue.getLights();
-  state.lights = res.lights || [];
-  renderLights();
+  try {
+    const res = await window.hue.getLights();
+    state.lights = res.lights || [];
+    renderLights();
+  } catch (err) {
+    console.error('[refreshLights] ERROR:', err);
+    lightsList.innerHTML = `<div class="empty-state empty-state--left"><p>Error loading lights</p><small>${err.message}</small></div>`;
+  }
 }
 
 function renderLights() {
@@ -389,9 +399,40 @@ function renderLights() {
     buildMonitorCards([]);
     return;
   }
-  for (const light of state.lights) lightsList.appendChild(buildLightRow(light));
+  for (const light of state.lights) {
+    try {
+      lightsList.appendChild(buildLightRow(light));
+    } catch (err) {
+      console.error('[renderLights] buildLightRow threw for light', light && light.id, light && light.name, err);
+    }
+  }
   buildMonitorCards(state.lights);
   buildControlCards(state.lights);
+  buildDmxBars();
+}
+
+// Update the Effective Patch summary in every visible light row.
+// Called whenever the default universe input changes (live) or after a patch save.
+function refreshEffectivePatch() {
+  const proto       = lbProtocol.value;
+  const defaultUniv = proto === 'sacn'
+    ? (parseInt(lbSacnUniverse.value) || 1)
+    : (parseInt(lbArtnetUniverse.value) || 0);
+
+  lightsList.querySelectorAll('.light-row').forEach(row => {
+    const light = state.lights.find(l => String(l.id) === String(row.dataset.id));
+    if (!light || !light.dmx) return;
+    const effectiveUniv = light.customAddress?.universe ?? defaultUniv;
+    const patchText = `${effectiveUniv}-${light.dmx.start}`;
+    const el = row.querySelector('.effective-patch');
+    if (el) el.textContent = patchText;
+  });
+
+  // Also update the placeholder in any currently-open popup
+  if (activePopup) {
+    const univInput = activePopup.querySelector('.light-opts-univ');
+    if (univInput) univInput.placeholder = `Using default (${defaultUniv})`;
+  }
 }
 
 function buildLightRow(light) {
@@ -402,11 +443,31 @@ function buildLightRow(light) {
 
   const swatchColor = getLightColor(light);
   const dmx         = light.dmx;
-  const chBadges    = dmx ? dmx.labels.map(l => {
+  const seqStart    = dmx ? dmx.start : null;
+  const customCh   = light.customAddress?.channel  ?? null;
+  const customUniv = light.customAddress?.universe ?? null;
+
+  // Channel badges — turn purple when a custom patch is active
+  const chBadges = dmx ? dmx.labels.map(l => {
     const [, name] = l.split(':');
     const cls = { R: 'r', G: 'g', B: 'b', CT: 'ct', Bri: 'bri' }[name] || '';
-    return `<span class="ch-badge ${cls}">${l}</span>`;
+    return `<span class="ch-badge ${cls}${dmx.custom ? ' custom-patch' : ''}">${l}</span>`;
   }).join('') : '';
+
+  // Universe badge — shown only when a non-default universe is patched
+  const univBadge = customUniv != null
+    ? `<span class="ch-badge universe-badge">U${customUniv}</span>`
+    : '';
+
+  // Patch column — "universe-startchannel" format, e.g. "22-1"
+  // Read default universe from the listener bar (source of truth for current session),
+  // falling back to saved config if the field is empty.
+  const proto       = lbProtocol.value;
+  const defaultUniv = proto === 'sacn'
+    ? (parseInt(lbSacnUniverse.value)   || state.settings.sacnUniverse || 1)
+    : (parseInt(lbArtnetUniverse.value) || state.settings.universe     || 0);
+  const effectiveUniv = customUniv ?? defaultUniv;
+  const effectivePatch = dmx ? `${effectiveUniv}-${dmx.start}` : '—';
 
   row.innerHTML = `
     <span class="drag-handle" title="Drag to reorder">⠿</span>
@@ -414,14 +475,25 @@ function buildLightRow(light) {
     <div class="light-info">
       <div class="light-name">${light.name}</div>
       <div class="light-meta">ID: ${light.id} &nbsp;·&nbsp; ${light.state && light.state.reachable !== false ? 'Reachable' : 'Unreachable'}</div>
-      <div class="light-dmx-channels">${chBadges}</div>
+      <div class="light-dmx-channels">${univBadge}${chBadges}</div>
     </div>
+    <div class="light-addr-wrap" title="Custom DMX start channel (leave blank for sequential)">
+      <span class="light-addr-label">ch</span>
+      <input type="number" class="light-addr-input" min="1" max="512"
+        value="${customCh != null ? customCh : ''}"
+        placeholder="${seqStart != null ? seqStart : '—'}">
+    </div>
+    <div class="light-patch-col">
+      <span class="effective-patch">${effectivePatch}</span>
+    </div>
+    <button class="btn btn-secondary btn-sm btn-light-opts" title="Rename · Patch universe · Delete">⋯</button>
     <label class="toggle" title="${light.disabled ? 'Enable' : 'Disable'} in DMX mapping">
       <input type="checkbox" ${light.disabled ? '' : 'checked'}>
       <span class="toggle-slider"></span>
     </label>
   `;
 
+  // ── Toggle disabled ────────────────────────────────────────────────────────
   row.querySelector('input[type=checkbox]').addEventListener('change', async () => {
     await window.hue.toggleDisabled(light.id);
     light.disabled = !light.disabled;
@@ -429,6 +501,26 @@ function buildLightRow(light) {
     refreshLights();
   });
 
+  // ── Custom DMX channel (inline) ────────────────────────────────────────────
+  const addrInput = row.querySelector('.light-addr-input');
+  addrInput.addEventListener('change', async () => {
+    const raw  = addrInput.value.trim();
+    const num  = parseInt(raw);
+    const ch   = (raw === '' || isNaN(num)) ? null : Math.max(1, Math.min(512, num));
+    const univ = light.customAddress?.universe ?? null;
+    await window.hue.setLightAddress(light.id, { channel: ch, universe: univ });
+    light.customAddress = (ch == null && univ == null) ? null : { channel: ch, universe: univ };
+    refreshLights();
+  });
+  addrInput.addEventListener('mousedown', e => e.stopPropagation());
+
+  // ── Options popup (⋯) ─────────────────────────────────────────────────────
+  row.querySelector('.btn-light-opts').addEventListener('click', e => {
+    e.stopPropagation();
+    openLightOptionsPopup(light, e.currentTarget);
+  });
+
+  // ── Drag-and-drop reorder ──────────────────────────────────────────────────
   row.addEventListener('dragstart', (e) => { dragSrc = row; row.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; });
   row.addEventListener('dragend',   ()  => { row.classList.remove('dragging'); document.querySelectorAll('.light-row').forEach(r => r.classList.remove('drag-over')); });
   row.addEventListener('dragover',  (e) => { e.preventDefault(); if (dragSrc && dragSrc !== row) row.classList.add('drag-over'); });
@@ -447,6 +539,177 @@ function buildLightRow(light) {
   });
 
   return row;
+}
+
+// ── Light options popup (⋯) ───────────────────────────────────────────────────
+// Provides: multi-universe DMX patch (universe + channel), rename, delete.
+
+let activePopup = null;
+
+function closeActivePopup() {
+  if (activePopup) { activePopup.remove(); activePopup = null; }
+}
+document.addEventListener('mousedown', e => {
+  if (activePopup && !activePopup.contains(e.target)) closeActivePopup();
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeActivePopup(); });
+
+function openLightOptionsPopup(light, trigger) {
+  closeActivePopup();
+
+  const _proto = lbProtocol.value;
+  const mainUniverse = _proto === 'sacn'
+    ? (parseInt(lbSacnUniverse.value)   || (state.settings.sacnUniverse ?? 1))
+    : (parseInt(lbArtnetUniverse.value) || (state.settings.universe     ?? 0));
+  const seqLabel     = light.dmx ? `${light.dmx.start}` : '—';
+  const customCh     = light.customAddress?.channel  ?? null;
+  const customUniv   = light.customAddress?.universe ?? null;
+
+  const popup = document.createElement('div');
+  popup.className = 'light-opts-popup';
+  popup.addEventListener('mousedown', e => e.stopPropagation());
+
+  popup.innerHTML = `
+    <div class="light-opts-title">${light.name}</div>
+
+    <div class="light-opts-section-label">DMX Patch</div>
+    <div class="light-opts-patch-row">
+      <div class="light-opts-field">
+        <div style="display:flex;align-items:center;gap:5px;margin-bottom:3px">
+          <span class="light-opts-field-label" style="margin-bottom:0">Universe Override</span>
+          <span class="custom-badge pop-univ-custom" style="${customUniv != null ? '' : 'display:none'}">Custom</span>
+        </div>
+        <input type="number" class="input light-opts-univ${customUniv != null ? ' input-custom-patch' : ''}" min="0" max="63999"
+          value="${customUniv != null ? customUniv : ''}"
+          placeholder="Using default (${mainUniverse})">
+      </div>
+      <div class="light-opts-field">
+        <span class="light-opts-field-label">Channel</span>
+        <input type="number" class="input light-opts-ch" min="1" max="512"
+          value="${customCh != null ? customCh : ''}"
+          placeholder="${seqLabel}">
+      </div>
+    </div>
+    <button class="btn btn-secondary btn-sm light-opts-patch-clear"
+      style="${customCh == null && customUniv == null ? 'display:none' : ''}">
+      Clear patch
+    </button>
+
+    <div class="light-opts-divider"></div>
+
+    <div class="light-opts-section-label">Rename</div>
+    <div class="light-opts-rename-row">
+      <input type="text" class="input light-opts-rename"
+        value="${light.name.replace(/"/g, '&quot;')}" placeholder="Light name…">
+      <button class="btn btn-primary btn-sm light-opts-rename-confirm">✓</button>
+    </div>
+
+    <div class="light-opts-divider"></div>
+
+    <button class="btn btn-danger btn-sm light-opts-delete" style="width:100%">Delete from bridge</button>
+  `;
+
+  // ── Save patch when inputs change ──────────────────────────────────────────
+  async function savePatch() {
+    const univStr = popup.querySelector('.light-opts-univ').value.trim();
+    const chStr   = popup.querySelector('.light-opts-ch').value.trim();
+    const univ    = univStr !== '' ? parseInt(univStr) : null;
+    const ch      = chStr   !== '' ? parseInt(chStr)   : null;
+    await window.hue.setLightAddress(light.id, { channel: ch, universe: univ });
+    light.customAddress = (ch == null && univ == null) ? null : { channel: ch, universe: univ };
+    // Sync inline channel input in the light row
+    const addrInput = lightsList.querySelector(`.light-row[data-id="${light.id}"] .light-addr-input`);
+    if (addrInput) addrInput.value = ch != null ? ch : '';
+    popup.querySelector('.light-opts-patch-clear').style.display =
+      (ch == null && univ == null) ? 'none' : '';
+    // Toggle Custom badge and accent border on the universe input
+    const univInput   = popup.querySelector('.light-opts-univ');
+    const customBadge = popup.querySelector('.pop-univ-custom');
+    univInput.classList.toggle('input-custom-patch', univ !== null);
+    if (customBadge) customBadge.style.display = univ !== null ? '' : 'none';
+    refreshLights();
+  }
+  popup.querySelector('.light-opts-univ').addEventListener('change', savePatch);
+  popup.querySelector('.light-opts-ch').addEventListener('change',   savePatch);
+
+  // ── Clear patch ────────────────────────────────────────────────────────────
+  popup.querySelector('.light-opts-patch-clear').addEventListener('click', async () => {
+    popup.querySelector('.light-opts-univ').value = '';
+    popup.querySelector('.light-opts-ch').value   = '';
+    await window.hue.setLightAddress(light.id, null);
+    light.customAddress = null;
+    popup.querySelector('.light-opts-patch-clear').style.display = 'none';
+    // Clear Custom badge and accent border
+    popup.querySelector('.light-opts-univ').classList.remove('input-custom-patch');
+    const customBadge = popup.querySelector('.pop-univ-custom');
+    if (customBadge) customBadge.style.display = 'none';
+    refreshLights();
+  });
+
+  // ── Rename ─────────────────────────────────────────────────────────────────
+  async function doRename() {
+    const newName = popup.querySelector('.light-opts-rename').value.trim();
+    if (!newName || newName === light.name) return;
+    const res = await window.hue.renameLight(light.id, newName);
+    if (res.success) {
+      light.name = newName;
+      popup.querySelector('.light-opts-title').textContent = newName;
+      const nameEl = lightsList.querySelector(`.light-row[data-id="${light.id}"] .light-name`);
+      if (nameEl) nameEl.textContent = newName;
+      toast(`Renamed to "${newName}"`, 'success');
+    } else {
+      toast(`Rename failed: ${res.error || ''}`, 'error');
+    }
+  }
+  popup.querySelector('.light-opts-rename-confirm').addEventListener('click', doRename);
+  popup.querySelector('.light-opts-rename').addEventListener('keydown', e => {
+    if (e.key === 'Enter') doRename();
+  });
+
+  // ── Delete ─────────────────────────────────────────────────────────────────
+  const deleteBtn = popup.querySelector('.light-opts-delete');
+  let deleteTimer = null;
+  deleteBtn.addEventListener('click', async () => {
+    if (deleteBtn.dataset.confirm === 'true') {
+      clearTimeout(deleteTimer);
+      const res = await window.hue.deleteLight(light.id);
+      if (res.success) {
+        closeActivePopup();
+        const row = lightsList.querySelector(`.light-row[data-id="${light.id}"]`);
+        if (row) row.remove();
+        state.lights = state.lights.filter(l => String(l.id) !== String(light.id));
+        toast(`"${light.name}" removed from bridge`, 'info');
+      } else {
+        toast(`Delete failed: ${res.error || ''}`, 'error');
+        deleteBtn.dataset.confirm = '';
+        deleteBtn.textContent = 'Delete from bridge';
+      }
+    } else {
+      deleteBtn.dataset.confirm = 'true';
+      deleteBtn.textContent = 'Confirm delete?';
+      deleteTimer = setTimeout(() => {
+        if (deleteBtn.dataset.confirm === 'true') {
+          deleteBtn.dataset.confirm = '';
+          deleteBtn.textContent = 'Delete from bridge';
+        }
+      }, 3000);
+    }
+  });
+
+  // ── Position ───────────────────────────────────────────────────────────────
+  document.body.appendChild(popup);
+  const rect = trigger.getBoundingClientRect();
+  const pw   = popup.offsetWidth  || 240;
+  const ph   = popup.offsetHeight || 300;
+  let left   = rect.right - pw;
+  let top    = rect.bottom + 4;
+  if (left < 8)                           left = 8;
+  if (left + pw > window.innerWidth - 8)  left = window.innerWidth  - pw - 8;
+  if (top  + ph > window.innerHeight - 8) top  = rect.top - ph - 4;
+  popup.style.left = `${Math.round(left)}px`;
+  popup.style.top  = `${Math.round(top)}px`;
+
+  activePopup = popup;
 }
 
 function getLightColor(light) {
@@ -468,35 +731,54 @@ function getLightColor(light) {
 }
 
 // Live DMX swatch updates
-window.hue.on('artnet:dmx-update', (dmx) => {
-  updateDmxBars(dmx);
-  onDmxPacket(dmx);
+window.hue.on('artnet:dmx-update', (dmx, universe) => {
+  // Store frame in per-universe cache
+  const univ = universe ?? state.settings.universe ?? 0;
+  dmxByUniverse[univ] = dmx;
+
+  updateDmxBars();
+  onDmxPacket(univ);
 
   const { dmxAddress, white, transition } = state.settings;
   if (!dmxAddress) return;
   const channelsPerLight = white ? 5 : 3;
   const base = (dmxAddress - 1) + (transition === 'channel' ? 1 : 0);
+  // Use the protocol-aware default universe (same logic as updateDmxBars / updateMonitorCards)
+  const proto    = lbProtocol.value;
+  const mainUniv = proto === 'sacn'
+    ? (parseInt(lbSacnUniverse.value)   || (state.settings.sacnUniverse ?? 1))
+    : (parseInt(lbArtnetUniverse.value) || (state.settings.universe     ?? 0));
 
-  document.querySelectorAll('.light-row').forEach((row, i) => {
-    const offset = base + i * channelsPerLight;
-    if (offset + 2 >= dmx.length) return;
-    const r = dmx[offset], g = dmx[offset + 1], b = dmx[offset + 2];
-    const on = r > 0 || g > 0 || b > 0;
-    const swatch = row.querySelector('.light-color-swatch');
-    if (swatch) swatch.style.background = on ? `rgb(${r},${g},${b})` : 'rgba(255,255,255,0.05)';
-  });
+  // Use per-light addressing from state.lights (supports custom patches)
+  for (let i = 0; i < state.lights.length; i++) {
+    const light = state.lights[i];
+    const patch = light.customAddress;
+    const lightUniv   = patch?.universe ?? mainUniv;
+    const lightBuffer = dmxByUniverse[lightUniv] || [];
+    const offset = patch?.channel != null
+      ? (patch.channel - 1)
+      : base + i * channelsPerLight;
 
-  // Mirror live DMX colors onto the control-tab tile swatches
-  document.querySelectorAll('.ctrl-tile').forEach((tile, i) => {
-    const offset = base + i * channelsPerLight;
-    if (offset + 2 >= dmx.length) return;
-    const r = dmx[offset], g = dmx[offset + 1], b = dmx[offset + 2];
+    if (offset + 2 >= lightBuffer.length) continue;
+    const r = lightBuffer[offset], g = lightBuffer[offset + 1], b = lightBuffer[offset + 2];
     const on = r > 0 || g > 0 || b > 0;
-    const color = on ? `rgb(${r},${g},${b})` : 'rgba(255,255,255,0.05)';
-    const swatch = tile.querySelector('.ctrl-color-swatch');
-    if (swatch) swatch.style.background = color;
-    if (on) tile.style.setProperty('--tile-color', color);
-  });
+
+    // Update lights-tab swatch
+    const row = lightsList.querySelector(`.light-row[data-id="${light.id}"]`);
+    if (row) {
+      const swatch = row.querySelector('.light-color-swatch');
+      if (swatch) swatch.style.background = on ? `rgb(${r},${g},${b})` : 'rgba(255,255,255,0.05)';
+    }
+
+    // Update control-tab tile swatch
+    const tile = controlGrid.querySelector(`[data-light-id="${light.id}"]`);
+    if (tile) {
+      const color = on ? `rgb(${r},${g},${b})` : 'rgba(255,255,255,0.05)';
+      const swatch = tile.querySelector('.ctrl-color-swatch');
+      if (swatch) swatch.style.background = color;
+      if (on) tile.style.setProperty('--tile-color', color);
+    }
+  }
 });
 
 // ── DMX bar visualization ─────────────────────────────────────────────────────
@@ -504,17 +786,46 @@ window.hue.on('artnet:dmx-update', (dmx) => {
 function buildDmxBars() {
   const wrap = document.getElementById('dmx-bar-wrap');
   wrap.innerHTML = '';
-  for (let i = 0; i < 64; i++) {
-    const bar = document.createElement('div');
-    bar.className   = 'dmx-bar';
-    bar.style.height = '0px';
-    wrap.appendChild(bar);
+  if (state.lights && state.lights.length > 0) {
+    // One bar per fixture channel, tagged with the light id and channel offset
+    for (const light of state.lights) {
+      if (!light.dmx) continue;
+      for (let j = 0; j < light.dmx.channels; j++) {
+        const bar = document.createElement('div');
+        bar.className        = 'dmx-bar';
+        bar.dataset.lightId  = light.id;
+        bar.dataset.chOffset = j;
+        bar.style.height     = '0px';
+        wrap.appendChild(bar);
+      }
+    }
+  } else {
+    // No lights loaded yet — show 64 generic placeholder bars
+    for (let i = 0; i < 64; i++) {
+      const bar = document.createElement('div');
+      bar.className    = 'dmx-bar';
+      bar.style.height = '0px';
+      wrap.appendChild(bar);
+    }
   }
 }
 
-function updateDmxBars(dmx) {
-  document.querySelectorAll('.dmx-bar').forEach((bar, i) => {
-    bar.style.height = `${Math.round(((dmx[i] || 0) / 255) * 24)}px`;
+function updateDmxBars() {
+  const cfg = state.settings;
+  const proto    = lbProtocol.value;
+  const mainUniv = proto === 'sacn'
+    ? (parseInt(lbSacnUniverse.value)   || cfg.sacnUniverse || 1)
+    : (parseInt(lbArtnetUniverse.value) || cfg.universe     || 0);
+
+  document.querySelectorAll('.dmx-bar[data-light-id]').forEach(bar => {
+    const light     = state.lights.find(l => String(l.id) === String(bar.dataset.lightId));
+    if (!light || !light.dmx) return;
+    const patch     = light.customAddress;
+    const lightUniv = patch?.universe ?? mainUniv;
+    const buf       = dmxByUniverse[lightUniv] || [];
+    // light.dmx.start is 1-based; subtract 1 for 0-based array index
+    const val = buf[(light.dmx.start - 1) + parseInt(bar.dataset.chOffset)] || 0;
+    bar.style.height = `${Math.round((val / 255) * 24)}px`;
   });
 }
 
@@ -929,19 +1240,19 @@ function updateSignalAge() {
   }
 }
 
-function onDmxPacket(dmx) {
+function onDmxPacket(packetUniverse) {
   lastPacketMs = Date.now();
   monitorSignalDot.classList.add('active');
   monitorSignalLabel.textContent = 'Receiving';
 
   const cfg   = state.settings;
   const proto = cfg.protocol || 'artnet';
-  const univ  = proto === 'sacn' ? (cfg.sacnUniverse ?? 1) : (cfg.universe ?? 0);
+  const univ  = packetUniverse ?? (proto === 'sacn' ? (cfg.sacnUniverse ?? 1) : (cfg.universe ?? 0));
   monitorUniverseLabel.textContent =
     `${proto === 'sacn' ? 'sACN' : proto === 'both' ? 'Art-Net+sACN' : 'Art-Net'} · Universe ${univ}`;
 
   if (!signalAgeTimer) signalAgeTimer = setInterval(updateSignalAge, 250);
-  updateMonitorCards(dmx);
+  updateMonitorCards();
 }
 
 function buildMonitorCards(lights) {
@@ -977,14 +1288,33 @@ function buildMonitorCards(lights) {
   }
 }
 
-function updateMonitorCards(dmx) {
+function updateMonitorCards() {
   const cfg = state.settings;
   if (!cfg.dmxAddress) return;
   const channelsPerLight = 3;
-  const base = (cfg.dmxAddress - 1) + (cfg.transition === 'channel' ? 1 : 0);
+  const base     = (cfg.dmxAddress - 1) + (cfg.transition === 'channel' ? 1 : 0);
+  // Read from listener bar (same source of truth used everywhere else), fall back to saved config
+  const proto    = lbProtocol.value;
+  const mainUniv = proto === 'sacn'
+    ? (parseInt(lbSacnUniverse.value)   || cfg.sacnUniverse || 1)
+    : (parseInt(lbArtnetUniverse.value) || cfg.universe     || 0);
 
-  monitorGrid.querySelectorAll('.monitor-card').forEach((card, i) => {
-    const offset   = base + i * channelsPerLight;
+  // Build a quick lookup: lightId → index in state.lights (for sequential offset calc)
+  const lightIndex = {};
+  state.lights.forEach((l, i) => { lightIndex[l.id] = i; });
+
+  monitorGrid.querySelectorAll('.monitor-card').forEach(card => {
+    const lightId = card.dataset.lightId;
+    const light   = state.lights.find(l => String(l.id) === String(lightId));
+    const idx     = lightIndex[lightId] ?? 0;
+
+    const patch      = light?.customAddress;
+    const lightUniv  = patch?.universe ?? mainUniv;
+    const dmx        = dmxByUniverse[lightUniv] || [];
+    const offset     = patch?.channel != null
+      ? (patch.channel - 1)
+      : base + idx * channelsPerLight;
+
     const channels = card.querySelectorAll('.monitor-channel');
     let anyActive  = false;
 
@@ -1008,7 +1338,7 @@ const sacnDiagBar  = document.getElementById('sacn-diag-bar');
 const sacnDiagText = document.getElementById('sacn-diag-text');
 const sacnDiagIcon = document.getElementById('sacn-diag-icon');
 
-window.hue.on('sacn:diag', ({ rawCount, lastUniverse, wrongUniverse, configured, lastSize }) => {
+window.hue.on('sacn:diag', ({ rawCount, lastUniverse, wrongUniverse, configured, watched, lastSize }) => {
   const proto = (state.settings && state.settings.protocol) || 'artnet';
   if (proto === 'artnet') { sacnDiagBar.style.display = 'none'; return; }
 
@@ -1026,7 +1356,9 @@ window.hue.on('sacn:diag', ({ rawCount, lastUniverse, wrongUniverse, configured,
     sacnDiagText.textContent = `sACN: ${rawCount} packets received but none matched E1.31 format (last: ${lastSize} bytes)`;
     return;
   }
-  if (lastUniverse !== configured) {
+  // Only warn if the last universe is completely unknown — not just an override universe
+  const watchedSet = new Set(watched || [configured]);
+  if (!watchedSet.has(lastUniverse)) {
     sacnDiagBar.className = 'mismatch';
     sacnDiagIcon.textContent = '';
     sacnDiagText.textContent =
@@ -1034,9 +1366,10 @@ window.hue.on('sacn:diag', ({ rawCount, lastUniverse, wrongUniverse, configured,
       `Change sACN Universe in Settings to ${lastUniverse}.`;
     return;
   }
+  const univList = watched && watched.length > 1 ? watched.join(', ') : `${configured}`;
   sacnDiagBar.className = 'ok';
   sacnDiagIcon.textContent = '✓';
-  sacnDiagText.textContent = `sACN: Receiving universe ${lastUniverse} · ${rawCount} packets`;
+  sacnDiagText.textContent = `sACN: Receiving · Universes ${univList} · ${rawCount} packets`;
 });
 
 // ── NIC selectors ─────────────────────────────────────────────────────────────
@@ -1148,6 +1481,132 @@ document.getElementById('btn-save-settings').addEventListener('click', async () 
     await window.hue.startArtnet();
   }
 });
+
+// ── Light discovery (Find New Lights) ─────────────────────────────────────────
+
+let discoveryTimer     = null;
+let discoveryPollCount = 0;
+
+document.getElementById('btn-find-lights').addEventListener('click', startDiscovery);
+
+document.getElementById('btn-discovery-done').addEventListener('click', async () => {
+  clearInterval(discoveryTimer);
+  discoveryTimer = null;
+  document.getElementById('lights-discovery').style.display = 'none';
+  await refreshLights();
+});
+
+async function startDiscovery() {
+  if (!state.connected) { toast('Connect to a bridge first', 'error'); return; }
+
+  const discoveryEl = document.getElementById('lights-discovery');
+  const resultsEl   = document.getElementById('discovery-results');
+  const statusEl    = document.getElementById('discovery-status-text');
+  const spinnerEl   = document.getElementById('discovery-spinner');
+
+  // Reset state
+  clearInterval(discoveryTimer);
+  discoveryTimer     = null;
+  discoveryPollCount = 0;
+  resultsEl.innerHTML = '<div class="hint" style="padding:8px 0">Starting scan…</div>';
+  statusEl.textContent = 'Scanning for new lights (40 s)…';
+  spinnerEl.style.display = '';
+  discoveryEl.style.display = '';
+
+  const res = await window.hue.searchNewLights();
+  if (!res.success) {
+    toast(`Discovery failed: ${res.error || ''}`, 'error');
+    discoveryEl.style.display = 'none';
+    return;
+  }
+
+  const seenIds = new Set();
+
+  function buildDiscoveryItem(found) {
+    const item = document.createElement('div');
+    item.className = 'discovery-found-row';
+    item.innerHTML = `
+      <div class="light-color-swatch" style="background:rgba(255,255,255,0.1);width:28px;height:28px;flex-shrink:0"></div>
+      <div class="discovery-found-info">
+        <span class="discovery-found-name">${found.name}</span>
+        <input class="input discovery-rename-input" type="text" value="${found.name.replace(/"/g,'&quot;')}" style="display:none">
+        <span class="hint">ID: ${found.id}</span>
+      </div>
+      <button class="btn btn-secondary btn-sm discovery-rename-btn"     title="Rename">✎</button>
+      <button class="btn btn-primary   btn-sm discovery-rename-confirm" style="display:none" title="Confirm">✓</button>
+    `;
+
+    const nameSpan   = item.querySelector('.discovery-found-name');
+    const nameInput  = item.querySelector('.discovery-rename-input');
+    const renameBtn  = item.querySelector('.discovery-rename-btn');
+    const confirmBtn = item.querySelector('.discovery-rename-confirm');
+
+    function enterEdit() {
+      nameSpan.style.display   = 'none';
+      nameInput.style.display  = '';
+      renameBtn.style.display  = 'none';
+      confirmBtn.style.display = '';
+      nameInput.focus(); nameInput.select();
+    }
+    async function doRename() {
+      const newName = nameInput.value.trim();
+      if (newName && newName !== found.name) {
+        const r = await window.hue.renameLight(found.id, newName);
+        if (r.success) {
+          found.name = newName;
+          nameSpan.textContent = newName;
+          toast(`Renamed to "${newName}"`, 'success');
+        } else {
+          toast(`Rename failed: ${r.error || ''}`, 'error');
+        }
+      }
+      nameSpan.style.display   = '';
+      nameInput.style.display  = 'none';
+      renameBtn.style.display  = '';
+      confirmBtn.style.display = 'none';
+    }
+
+    renameBtn.addEventListener('click',  enterEdit);
+    confirmBtn.addEventListener('click', doRename);
+    nameInput.addEventListener('keydown', e => {
+      if (e.key === 'Enter')  doRename();
+      if (e.key === 'Escape') {
+        nameSpan.style.display = ''; nameInput.style.display = 'none';
+        renameBtn.style.display = ''; confirmBtn.style.display = 'none';
+      }
+    });
+
+    return item;
+  }
+
+  async function pollForNewLights() {
+    discoveryPollCount++;
+    const r = await window.hue.getNewLights();
+    if (!r.success) return;
+
+    for (const found of r.lights) {
+      if (seenIds.has(found.id)) continue;
+      seenIds.add(found.id);
+      const placeholder = resultsEl.querySelector('.hint');
+      if (placeholder) placeholder.remove();
+      resultsEl.appendChild(buildDiscoveryItem(found));
+    }
+
+    // Stop polling when scan ends or after ~42 s (14 × 3 s)
+    if (!r.scanning || discoveryPollCount >= 14) {
+      clearInterval(discoveryTimer);
+      discoveryTimer = null;
+      spinnerEl.style.display = 'none';
+      statusEl.textContent = seenIds.size > 0
+        ? `Found ${seenIds.size} new light${seenIds.size !== 1 ? 's' : ''}. Click Done to add them to your list.`
+        : 'Scan complete — no new lights found. Make sure the bulb is powered on and close to the bridge.';
+    }
+  }
+
+  discoveryTimer = setInterval(pollForNewLights, 3000);
+  // First poll after a short delay so the bridge has time to start the scan
+  setTimeout(pollForNewLights, 4000);
+}
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 

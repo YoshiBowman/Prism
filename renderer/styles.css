@@ -513,7 +513,7 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
 .light-row.drag-over    { border-color: var(--accent2); background: rgba(124,58,237,0.08); }
 .light-row.disabled-light { opacity: .45; }
 
-.drag-handle { color: var(--text3); cursor: grab; font-size: 16px; padding: 2px 4px; line-height: 1; }
+.drag-handle { color: var(--text3); cursor: grab; font-size: 16px; padding: 2px 4px; line-height: 1; width: 20px; flex-shrink: 0; }
 .drag-handle:active { cursor: grabbing; }
 
 .light-color-swatch {
@@ -546,6 +546,331 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
 .ch-badge.b   { border-left: 2px solid var(--blue); }
 .ch-badge.ct  { border-left: 2px solid var(--yellow); }
 .ch-badge.bri { border-left: 2px solid var(--text2); }
+
+/* ── Light address patch input ──────────────────────────────────────────────── */
+
+.light-addr-wrap {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  width: 80px;
+}
+.light-addr-label {
+  font-size: 10px;
+  color: var(--text3);
+  white-space: nowrap;
+  letter-spacing: 0.03em;
+}
+.light-addr-input {
+  width: 56px;
+  height: 28px;
+  padding: 2px 6px;
+  font-size: 12px;
+  font-family: monospace;
+  text-align: center;
+  background: var(--glass2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  outline: none;
+  transition: border-color 150ms ease, background 150ms ease;
+  /* remove number spinner arrows */
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+.light-addr-input::-webkit-inner-spin-button,
+.light-addr-input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+.light-addr-input:focus        { border-color: rgba(167,139,250,0.6); background: var(--glass3); }
+.light-addr-input::placeholder { color: var(--text3); }
+/* patched light: tint the input border so it's obvious an override is active */
+.light-row .light-addr-input:not(:placeholder-shown) {
+  border-color: rgba(167,139,250,0.55);
+  background: rgba(167,139,250,0.08);
+}
+
+/* Custom-patch channel badges get an accent left-border */
+.ch-badge.custom-patch {
+  border-left-color: var(--accent2);
+  background: rgba(167,139,250,0.08);
+  color: var(--text);
+}
+
+/* Universe badge — shown when a light is patched to a non-default universe */
+.ch-badge.universe-badge {
+  border-left-color: var(--blue);
+  background: rgba(96,165,250,0.12);
+  color: var(--blue);
+  font-weight: 600;
+}
+
+/* ⋯ options button on each light row */
+.btn-light-opts {
+  flex-shrink: 0;
+  width: 30px;
+  height: 28px;
+  padding: 0;
+  font-size: 16px;
+  line-height: 1;
+  opacity: 0;
+  transition: opacity 150ms ease, background 150ms ease, border-color 150ms ease;
+}
+.light-row:hover .btn-light-opts { opacity: 1; }
+
+/* ── Light options popup ─────────────────────────────────────────────────────── */
+
+.light-opts-popup {
+  position: fixed;
+  z-index: 9999;
+  width: 230px;
+  background: #111827;
+  border: 1px solid var(--border2);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 32px rgba(0,0,0,0.55), 0 2px 8px rgba(0,0,0,0.35);
+  padding: 12px 14px 14px;
+  animation: fadeIn .12s ease;
+}
+
+.light-opts-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text2);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin-bottom: 10px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.light-opts-section-label {
+  font-size: 10px;
+  color: var(--text3);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin-bottom: 6px;
+}
+
+.light-opts-patch-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.light-opts-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: 1;
+}
+
+.light-opts-field-label {
+  font-size: 10px;
+  color: var(--text3);
+}
+
+.light-opts-field .input {
+  height: 28px;
+  padding: 2px 8px;
+  font-size: 12px;
+  font-family: monospace;
+  text-align: center;
+}
+
+.light-opts-patch-clear {
+  font-size: 11px;
+  padding: 3px 8px;
+  height: 26px;
+  margin-top: 4px;
+  width: 100%;
+}
+
+.light-opts-divider {
+  height: 0;
+  border-top: 1px solid var(--border);
+  margin: 10px 0;
+}
+
+.light-opts-rename-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.light-opts-rename-row .input {
+  flex: 1;
+  height: 28px;
+  padding: 2px 8px;
+  font-size: 13px;
+}
+
+.light-opts-delete {
+  width: 100%;
+  margin-top: 8px;
+  font-size: 12px;
+  height: 30px;
+}
+
+/* ── Patch sheet column header ──────────────────────────────────────────────── */
+/*
+  Must be a structural mirror of .light-row so every column aligns.
+  Each span here has the same width as its counterpart flex item in the row:
+    lch-handle  = .drag-handle        (20px)
+    lch-swatch  = .light-color-swatch (36px)
+    lch-fixture = .light-info         (flex:1)
+    lch-address = .light-addr-wrap    (80px)
+    lch-patch   = .light-patch-col    (72px)
+    lch-btn     = .btn-light-opts     (30px)
+    lch-toggle  = .toggle             (36px)
+*/
+#lights-col-header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 0 16px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--text3);
+  user-select: none;
+}
+.lch-handle  { width: 20px; flex-shrink: 0; }
+.lch-swatch  { width: 36px; flex-shrink: 0; }
+.lch-fixture { flex: 1; }
+.lch-address { width: 80px; flex-shrink: 0; text-align: center; }
+.lch-patch   { width: 72px; flex-shrink: 0; }
+.lch-btn     { width: 30px; flex-shrink: 0; }
+.lch-toggle  { width: 36px; flex-shrink: 0; }
+
+/* ── "Custom" badge — accent pill used inside the per-light options popup ────── */
+
+.custom-badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(124,58,237,0.15);
+  border: 1px solid rgba(124,58,237,0.45);
+  color: var(--accent2);
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+/* ── Patch column ───────────────────────────────────────────────────────────── */
+
+.light-patch-col {
+  width: 72px;
+  flex-shrink: 0;
+}
+.effective-patch {
+  font-size: 12px;
+  font-family: monospace;
+  color: var(--text2);
+  white-space: nowrap;
+}
+
+/* ── Universe override input — accent border when a custom value is set ─────── */
+
+.input-custom-patch {
+  border-color: rgba(124,58,237,0.55) !important;
+  background: rgba(124,58,237,0.06) !important;
+}
+
+/* ── ⓘ Info icon with CSS tooltip ──────────────────────────────────────────── */
+
+.info-icon {
+  display: inline-block;
+  font-size: 12px;
+  color: var(--text3);
+  cursor: help;
+  position: relative;
+  vertical-align: middle;
+  margin-left: 4px;
+  transition: color 150ms ease;
+}
+.info-icon:hover { color: var(--text2); }
+.info-icon::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 6px);
+  transform: translateX(-50%);
+  background: #1e293b;
+  border: 1px solid var(--border2);
+  border-radius: var(--radius-sm);
+  padding: 7px 10px;
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text2);
+  white-space: normal;
+  width: 210px;
+  line-height: 1.5;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 150ms ease;
+  z-index: 2000;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.45);
+}
+.info-icon:hover::after { opacity: 1; }
+
+/* ── Bulb discovery section ──────────────────────────────────────────────────── */
+
+#lights-discovery {
+  background: var(--glass);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px 16px;
+  margin-bottom: 16px;
+  animation: fadeIn .2s ease;
+}
+
+.discovery-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+  font-size: 13px;
+  color: var(--text2);
+}
+#discovery-status-text { flex: 1; font-size: 13px; }
+
+.discovery-found-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+  border-top: 1px solid var(--border);
+  font-size: 13px;
+  animation: fadeIn .2s ease;
+}
+.discovery-found-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.discovery-found-name {
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.discovery-rename-input {
+  height: 28px;
+  padding: 2px 8px;
+  font-size: 13px;
+  width: 160px;
+}
 
 /* ── Settings panel ─────────────────────────────────────────────────────────── */
 

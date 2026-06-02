@@ -13,11 +13,17 @@ A desktop app that bridges your DMX lighting console to Philips Hue lights over 
 
 - **Automatic bridge discovery** — finds Hue bridges via ARP cache, SSDP/UPnP multicast, mDNS, portal lookup, and subnet scan. Works even without knowing the bridge's IP address.
 - **Art-Net & sACN (E1.31)** — listen on either protocol or both simultaneously. Universe number is configurable.
-- **Per-light DMX mapping** — drag to reorder lights, set the DMX start address, enable/disable individual lights.
+- **Per-light DMX patch** — assign any light its own DMX start channel and universe number, independent of the global start address and the other lights. Custom-patched channels are highlighted in the UI.
+- **Multi-universe support** — lights patched to different universes all receive correctly in a single listener session. Prism joins the right sACN multicast groups automatically.
+- **Smooth fade following** — every bridge command includes a transition time that exactly covers the gap to the next update (300 ms), so the bridge interpolates between values instead of snapping. Blackout commands cut instantly; landing ticks after an active fade pin the final value cleanly.
+- **Velocity extrapolation** — while a channel is fading Prism projects the natural endpoint and sends one command covering the full remaining fade duration, keeping the bridge perfectly in sync with the console without flooding it with redundant commands.
+- **Per-light command rate limiting** — each light is governed by its own independent 500 ms minimum gap, preventing any light from starving others. Keeps the total command rate comfortably below the Hue bridge's ~10 cmd/sec budget.
+- **Light management from the app** — scan for new Hue bulbs (opens a 40-second Zigbee inclusion window), rename lights, and delete lights from the bridge, all without leaving Prism.
 - **Control tab with presets** — manually set light colors and brightness, save named presets, and recall them instantly.
 - **Bitfocus Companion support** — trigger presets from a Stream Deck or any Companion-supported controller.
+- **Menu bar / tray app** — lives in the macOS menu bar (or system tray on Windows/Linux). The main window can be closed without stopping the listener. Supports **Launch at Login** for unattended operation.
 - **Live Monitor** — per-channel level meters show incoming DMX values in real time with signal status.
-- **sACN diagnostics** — if packets arrive on the wrong universe the app tells you exactly what universe it's seeing so you can match your console.
+- **sACN diagnostics** — if packets arrive on the wrong universe the app tells you exactly what universe it's seeing, and lists all universes currently being watched, so you can match your console.
 - **Cross-platform** — macOS, Windows, and Linux.
 
 ---
@@ -77,10 +83,19 @@ npm run build:linux  # → dist/Prism-*.AppImage  +  .deb
 ### 2. Configure DMX Channels
 
 1. Go to the **Lights** tab and click **↻ Refresh**.
-2. Drag lights into the order you want. The first light gets the DMX start address, the next gets start+3, etc.
+2. Drag lights into the order you want. By default the first light gets the DMX start address, the next gets start+3, and so on.
 3. Use the toggle on each row to enable or disable a light from the DMX mapping.
+4. To assign a custom start channel or a different universe to a specific light, click the **⚙** options button on that light's row and enter the channel and/or universe number. Patched fields turn purple so you can see at a glance which lights have overrides.
 
-### 3. Configure the Listener
+### 3. Manage Hue Lights
+
+From the **Lights** tab you can also:
+
+- **Find new lights** — click **Find New Lights** to open a 40-second Zigbee inclusion window on the bridge. Any bulbs found appear in the list with an option to rename them before adding.
+- **Rename a light** — open the ⚙ options panel and edit the name field, then press ✓. The name updates on the bridge immediately.
+- **Delete a light** — open the ⚙ options panel and click **Delete from bridge**. A second click confirms the deletion. The light is removed from the bridge and all Prism mappings.
+
+### 4. Configure the Listener
 
 Use the **listener bar** at the top of the app (always visible):
 
@@ -96,7 +111,7 @@ Click **▶ Start** — the badge in the title bar turns green when packets are 
 
 Additional options (bind interface, DMX start address, transition time) are in the **Settings** tab.
 
-### 4. Configure your Console / Software
+### 5. Configure your Console / Software
 
 Point your DMX console or software at the machine running Prism:
 
@@ -110,7 +125,9 @@ Point your DMX console or software at the machine running Prism:
 - Universe: must match the **sACN Univ.** setting in the app (default: 1)
 - Port: 5568 (standard sACN port)
 
-### 5. DMX Channel Layout
+> **Multi-universe setups:** If you have lights patched to different universes (set in the ⚙ options panel), your console should output all of those universes. Prism joins the correct multicast groups automatically — no extra configuration needed.
+
+### 6. DMX Channel Layout
 
 Each light uses **3 channels** (RGB):
 
@@ -120,12 +137,25 @@ Each light uses **3 channels** (RGB):
 | +1 | Green | 0–255 |
 | +2 | Blue | 0–255 |
 
-### 6. Monitor Incoming DMX
+With the default sequential patch, if your start address is **1**:
+- Light 1 → ch 1 (R), 2 (G), 3 (B)
+- Light 2 → ch 4 (R), 5 (G), 6 (B)
+- Light N → ch (N−1)×3+1 …
+
+Use per-light address overrides (step 2 above) to map any light to any channel on any universe.
+
+### 7. Monitor Incoming DMX
 
 Switch to the **Monitor** tab to see live level meters for every mapped light. The signal bar at the top shows:
 - Green pulsing dot — packets are arriving
 - Universe and protocol in use
-- sACN diagnostic banner if there's a universe mismatch between the console and the app
+- sACN diagnostic banner if there's a universe mismatch between the console and the app, including the list of universes Prism is currently watching
+
+### 8. Menu Bar Operation (macOS) / System Tray
+
+Prism runs as a menu bar app. Closing the main window does **not** stop the listener — the app keeps running in the background and can be reopened by clicking the tray icon. To stop it completely, use **Quit** in the tray menu.
+
+Enable **Launch at Login** in the tray menu to start Prism automatically at boot, hidden in the menu bar with the listener ready to go.
 
 ---
 
@@ -169,16 +199,24 @@ Prism runs a local HTTP API on port **38765** that Bitfocus Companion can connec
 **Lights not responding to DMX**
 - Confirm the listener is running (green dot in the title bar).
 - Check the Monitor tab — if bars are moving, DMX is arriving. If not, check console output IP and universe.
-- Make sure your console universe matches the app's universe setting.
+- Make sure your console universe matches the app's universe setting (or the per-light universe override if one is set).
+
+**Lights go unreachable after DMX starts**
+- Each light is rate-limited to 2 commands/sec to stay within the Hue bridge's capacity. This is intentional — do not disable it unless diagnosing.
+- If a light still goes unreachable, check the console output for `[bridge]` error lines, which show HTTP errors and Hue API errors that would otherwise be invisible.
 
 **sACN not receiving**
-- Check the Monitor tab for the sACN diagnostic banner — it will tell you what universe is actually arriving.
+- Check the Monitor tab for the sACN diagnostic banner — it will tell you what universe is actually arriving and which universes Prism is watching.
 - If universe numbers match but still nothing, try switching **sACN Multicast** off (Settings) to use unicast instead.
 - Make sure port 5568 UDP is not blocked by a firewall.
 
 **Colors look wrong**
 - Hue bulbs use HSB colour space. Prism converts RGB → HSB automatically. Very low values may appear off — try values above 20.
 - Some Hue bulbs don't support full RGB (e.g. white-only bulbs). They will respond to brightness via the Blue channel.
+
+**Fades look jumpy instead of smooth**
+- Prism sends each command with a 300 ms transition time so the bridge interpolates between updates. If fades still look stepped, confirm you are running the latest version.
+- Very fast fades (sub-frame) will always have some quantization — Hue bulbs have a finite update rate regardless of transition time.
 
 ---
 

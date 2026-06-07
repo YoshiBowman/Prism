@@ -94,6 +94,8 @@ function sendToAll(channel, ...args) {
 // Runs every 30 s. Sends a lightweight GET to the bridge to confirm it's still
 // reachable (also keeps the TCP socket alive between DMX bursts) and silently
 // reconnects if the bridge has restarted or moved since the app launched.
+// Also refreshes light states so syncUnreachableFromCache() can detect bulbs
+// that went offline mid-session without needing active DMX traffic to notice.
 setInterval(async () => {
   if (!config.bridge || !config.user) return;
   try {
@@ -107,6 +109,8 @@ setInterval(async () => {
       req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
       req.end();
     });
+    // Bridge is up — refresh light states to catch any bulbs that went unreachable
+    fetchLights().catch(() => {});
   } catch {
     // Bridge didn't respond — silently re-establish the session
     await connectToSavedBridge().catch(() => {});
@@ -895,10 +899,41 @@ async function fetchLights() {
       name: l.name,
       state: l.state,
     }));
+    syncUnreachableFromCache();
     return lightsCache;
   } catch (err) {
     console.error('[fetchLights] ERROR:', err);
     return lightsCache;
+  }
+}
+
+// Compare lightsCache against unreachableLights and fire events for transitions.
+// Called after every fetchLights() so any bulb that went offline mid-session
+// is picked up within one health-check cycle (30 s) even with no DMX activity.
+function syncUnreachableFromCache() {
+  for (const light of lightsCache) {
+    const sid = String(light.id);
+    const offline = light.state && light.state.reachable === false;
+    if (offline) {
+      if (!unreachableLights.has(sid)) {
+        // Newly unreachable — start recovery
+        unreachableLights.add(sid);
+        console.warn(`[recovery] Bulb ${sid} went unreachable (detected via poll) — queued for recovery`);
+        if (mainWindow && !mainWindow.isDestroyed())
+          mainWindow.webContents.send('bulb-unreachable', { id: sid });
+        // Accelerated first attempt
+        setTimeout(() => sendRecoveryProbe(sid), 2000);
+      }
+    } else {
+      if (unreachableLights.has(sid)) {
+        // Was unreachable, now showing online in the full fetch
+        unreachableLights.delete(sid);
+        delete lightLastKey[sid];
+        console.log(`[recovery] Bulb ${sid} recovered (detected via poll) — resuming DMX control`);
+        if (mainWindow && !mainWindow.isDestroyed())
+          mainWindow.webContents.send('bulb-recovered', { id: sid });
+      }
+    }
   }
 }
 

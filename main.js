@@ -421,27 +421,53 @@ function sendRecoveryProbe(lightId) {
     headers:  { 'Content-Type': 'application/json', 'Content-Length': probe.length },
     agent:    keepAliveAgent,
   }, res => {
-    let data = '';
-    res.on('data', c => { data += c; });
-    res.on('end', () => {
-      const sid = String(lightId);
-      if (data.includes('"error"')) {
-        console.log(`[recovery] Bulb ${sid} still unreachable`);
-        // Leave in unreachableLights — next tickRecovery() will retry
-      } else {
-        // Probe succeeded — bulb responded to Zigbee
-        unreachableLights.delete(sid);
-        delete lightLastKey[sid]; // clear dedup so next DMX tick sends a full resync
-        console.log(`[recovery] Bulb ${sid} recovered — resuming DMX control`);
-        if (mainWindow && !mainWindow.isDestroyed())
-          mainWindow.webContents.send('bulb-recovered', { id: sid });
-      }
-    });
+    res.resume(); // drain the PUT response — we don't trust it to confirm reachability
+    // The bridge silently returns success for unreachable bulbs (it queues the command
+    // internally rather than returning an error), so a clean PUT body does NOT mean the
+    // bulb actually responded over Zigbee. Follow up with a GET on the light's state to
+    // read the authoritative reachable flag, then decide whether to declare recovery.
+    res.on('end', () => confirmReachability(String(lightId)));
   });
   req.on('error', err => console.warn(`[recovery] PUT light ${lightId} error: ${err.message}`));
   req.write(probe);
   req.end();
   return true;
+}
+
+// GET /lights/{id} and check state.reachable — the only reliable way to know
+// whether a bulb actually responded to the Zigbee probe.
+function confirmReachability(sid) {
+  if (!config.bridge || !config.user) return;
+  const req = http.request({
+    hostname: config.bridge,
+    port:     80,
+    path:     `/api/${config.user}/lights/${sid}`,
+    method:   'GET',
+    agent:    keepAliveAgent,
+  }, res => {
+    let data = '';
+    res.on('data', c => { data += c; });
+    res.on('end', () => {
+      try {
+        const body = JSON.parse(data);
+        if (body && body.state && body.state.reachable === true) {
+          // Bridge confirms the bulb is back on the Zigbee mesh
+          unreachableLights.delete(sid);
+          delete lightLastKey[sid]; // clear dedup so next DMX tick sends a full resync
+          console.log(`[recovery] Bulb ${sid} recovered — resuming DMX control`);
+          if (mainWindow && !mainWindow.isDestroyed())
+            mainWindow.webContents.send('bulb-recovered', { id: sid });
+        } else {
+          console.log(`[recovery] Bulb ${sid} still unreachable`);
+          // Leave in unreachableLights — next tickRecovery() will retry
+        }
+      } catch {
+        console.warn(`[recovery] Bad JSON from GET /lights/${sid}`);
+      }
+    });
+  });
+  req.on('error', err => console.warn(`[recovery] GET light ${sid} error: ${err.message}`));
+  req.end();
 }
 
 // Keep-alive HTTP agent — reuses TCP connections to the bridge.
@@ -501,14 +527,11 @@ function sendDirectState(lightId, payload) {
         }
         return;
       }
-      // Success — if this light was marked unreachable, it has recovered via normal DMX
+      // Apparent success — but the bridge silently returns success for unreachable
+      // bulbs too (it queues the command). Confirm via GET before declaring recovery.
       const sid = String(lightId);
       if (unreachableLights.has(sid)) {
-        unreachableLights.delete(sid);
-        delete lightLastKey[sid]; // force full state resync on next DMX tick
-        console.log(`[recovery] Bulb ${sid} recovered (normal DMX) — resuming DMX control`);
-        if (mainWindow && !mainWindow.isDestroyed())
-          mainWindow.webContents.send('bulb-recovered', { id: sid });
+        confirmReachability(sid);
       }
     });
   });

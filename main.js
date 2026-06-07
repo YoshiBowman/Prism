@@ -151,7 +151,18 @@ async function connectToSavedBridge() {
     // state on the next tick after a reconnect.
     for (const k of Object.keys(lightLastKey))   delete lightLastKey[k];
     for (const k of Object.keys(lightLastSendMs)) delete lightLastSendMs[k];
-    fetchLights().catch(() => {});
+    await fetchLights().catch(() => {});
+    // Seed unreachable lights from the initial fetch
+    let seedCount = 0;
+    for (const light of lightsCache) {
+      if (light.state && light.state.reachable === false) {
+        unreachableLights.add(String(light.id));
+        seedCount++;
+      }
+    }
+    if (seedCount > 0)
+      console.log(`[recovery] ${seedCount} unreachable bulb(s) at startup — recovery poller active`);
+    startRecoveryPoller();
     return true;
   } catch (err) {
     console.warn('[bridge] reconnect failed:', err.message);
@@ -225,6 +236,15 @@ const lightLastKey = {};
 //       elapsed) and never sent commands.  Per-light timers let every light send
 //       independently without starving each other.
 const lightLastSendMs = {};
+
+// ── Per-bulb recovery ─────────────────────────────────────────────────────────
+// Set of light IDs (strings) the bridge has marked unreachable.
+// Populated from: fetchLights() seed on startup, sendDirectState() error type 7.
+// Cleared per-light when a recovery probe (or a normal DMX PUT) gets a success.
+const unreachableLights = new Set();
+// setInterval handle for the recovery poller — null means not running.
+// DOUBLE-START GUARD: startRecoveryPoller() is a no-op when this is non-null.
+let recoveryInterval    = null;
 
 // ── 5-second rolling command-rate diagnostic ──────────────────────────────────
 // Logs to stdout so you can confirm the actual rate hitting the bridge.
@@ -343,6 +363,83 @@ function stopBridgeTicker() {
   for (const k of Object.keys(lightLastSendMs)) delete lightLastSendMs[k];
 }
 
+// ── Per-bulb recovery poller ─────────────────────────────────────────────────
+// Runs every 8 s and sends a lightweight probe to every bulb in unreachableLights.
+// Forcing the bridge to communicate with the bulb makes it attempt Zigbee contact.
+// When the bulb responds, the response contains no error objects — that's how we
+// detect recovery.  Normal DMX control resumes automatically on the next tick.
+//
+// DOUBLE-START GUARD: startRecoveryPoller() is a no-op if recoveryInterval !== null.
+
+function startRecoveryPoller() {
+  if (recoveryInterval !== null) return; // already running
+  recoveryInterval = setInterval(tickRecovery, 8000);
+}
+
+function stopRecoveryPoller() {
+  if (recoveryInterval !== null) {
+    clearInterval(recoveryInterval);
+    recoveryInterval = null;
+  }
+  unreachableLights.clear();
+}
+
+function tickRecovery() {
+  if (!hueApi || !config.bridge || !config.user) return;
+  if (unreachableLights.size === 0) return;
+  for (const lightId of unreachableLights) {
+    sendRecoveryProbe(lightId);
+  }
+}
+
+// Send a single lightweight PUT to force the bridge to retry Zigbee contact.
+// Uses the same per-light rate-limit bucket as tickBridge so recovery probes
+// and normal DMX commands share the same budget per light.
+// Returns true if the probe was dispatched, false if rate-limited (skip this cycle).
+function sendRecoveryProbe(lightId) {
+  if (!config.bridge || !config.user) return false;
+
+  // Honour the same per-light rate limit used by tryDirectSend
+  const minGap = config.noLimit ? 0 : 500;
+  const lastMs = lightLastSendMs[lightId] || 0;
+  if (minGap > 0 && Date.now() - lastMs < minGap) return false; // too soon — retry next cycle
+
+  lightLastSendMs[lightId] = Date.now();
+
+  const probe = Buffer.from(JSON.stringify({ on: true, bri: 1, transitiontime: 0 }));
+  console.log(`[recovery] Attempting bulb ${lightId}…`);
+
+  const req = http.request({
+    hostname: config.bridge,
+    port:     80,
+    path:     `/api/${config.user}/lights/${lightId}/state`,
+    method:   'PUT',
+    headers:  { 'Content-Type': 'application/json', 'Content-Length': probe.length },
+    agent:    keepAliveAgent,
+  }, res => {
+    let data = '';
+    res.on('data', c => { data += c; });
+    res.on('end', () => {
+      const sid = String(lightId);
+      if (data.includes('"error"')) {
+        console.log(`[recovery] Bulb ${sid} still unreachable`);
+        // Leave in unreachableLights — next tickRecovery() will retry
+      } else {
+        // Probe succeeded — bulb responded to Zigbee
+        unreachableLights.delete(sid);
+        delete lightLastKey[sid]; // clear dedup so next DMX tick sends a full resync
+        console.log(`[recovery] Bulb ${sid} recovered — resuming DMX control`);
+        if (mainWindow && !mainWindow.isDestroyed())
+          mainWindow.webContents.send('bulb-recovered', { id: sid });
+      }
+    });
+  });
+  req.on('error', err => console.warn(`[recovery] PUT light ${lightId} error: ${err.message}`));
+  req.write(probe);
+  req.end();
+  return true;
+}
+
 // Keep-alive HTTP agent — reuses TCP connections to the bridge.
 // Free-socket timeout of 20 s ensures idle sockets are destroyed before the
 // Hue bridge closes them (~30 s), preventing silent ECONNRESET failures after
@@ -381,8 +478,33 @@ function sendDirectState(lightId, payload) {
     res.on('end', () => {
       if (res.statusCode >= 400) {
         console.warn(`[bridge] PUT light ${lightId} → HTTP ${res.statusCode}: ${data.slice(0, 200)}`);
-      } else if (data.includes('"error"')) {
+        return;
+      }
+      if (data.includes('"error"')) {
         console.warn(`[bridge] PUT light ${lightId} → API error: ${data.slice(0, 200)}`);
+        // Hue error type 7 = bulb unreachable (Zigbee contact lost)
+        if (data.includes('"type":7')) {
+          const sid  = String(lightId);
+          const isNew = !unreachableLights.has(sid);
+          unreachableLights.add(sid);
+          if (isNew) {
+            console.warn(`[recovery] Bulb ${sid} went unreachable — queued for recovery`);
+            if (mainWindow && !mainWindow.isDestroyed())
+              mainWindow.webContents.send('bulb-unreachable', { id: sid });
+            // Accelerated first attempt — probe after 2 s before the 8 s poller kicks in
+            setTimeout(() => sendRecoveryProbe(sid), 2000);
+          }
+        }
+        return;
+      }
+      // Success — if this light was marked unreachable, it has recovered via normal DMX
+      const sid = String(lightId);
+      if (unreachableLights.has(sid)) {
+        unreachableLights.delete(sid);
+        delete lightLastKey[sid]; // force full state resync on next DMX tick
+        console.log(`[recovery] Bulb ${sid} recovered (normal DMX) — resuming DMX control`);
+        if (mainWindow && !mainWindow.isDestroyed())
+          mainWindow.webContents.send('bulb-recovered', { id: sid });
       }
     });
   });
@@ -1234,6 +1356,7 @@ ipcMain.handle('bridge:verify', async (event, ip) => {
       config.bridge = ip;
       saveConfig();
       fetchLights().catch(() => {});
+      startRecoveryPoller();
       return { success: true, name: ip, bridgeid: null, autoConnected: true };
     } catch {}
   }
@@ -1259,6 +1382,7 @@ ipcMain.handle('bridge:disconnect', async () => {
   config.user = null;
   saveConfig();
   stopArtnet();
+  stopRecoveryPoller();
   lightsCache = [];
   return { success: true };
 });
@@ -1830,6 +1954,7 @@ ipcMain.handle('tray:quit', () => {
   stopArtnet();
   stopSACN();
   stopBridgeTicker();
+  stopRecoveryPoller();
   app.quit();
 });
 
@@ -1920,6 +2045,7 @@ app.on('window-all-closed', () => {
     stopArtnet();
     stopSACN();
     stopBridgeTicker();
+    stopRecoveryPoller();
     app.quit();
   }
 });

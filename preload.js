@@ -71,6 +71,8 @@ contextBridge.exposeInMainWorld('hue', {
       'sacn:diag',
       'dmx:takeover-change',
       'companion:preset-applied',
+      'bulb-unreachable',
+      'bulb-recovered',
       'update:available',
       'update:progress',
       'update:downloaded',

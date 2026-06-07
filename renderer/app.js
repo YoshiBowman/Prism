@@ -370,6 +370,30 @@ window.hue.on('bridge:reachable', () => {
   toast('Bridge connection restored', 'success');
 });
 
+// ── Per-bulb reachability events ──────────────────────────────────────────────
+
+window.hue.on('bulb-unreachable', ({ id }) => {
+  const row = lightsList && lightsList.querySelector(`.light-row[data-id="${id}"]`);
+  if (!row) return;
+  const meta = row.querySelector('.light-meta');
+  if (meta) meta.innerHTML = meta.innerHTML.replace(/\b(Reachable|Unreachable)\b/, 'Unreachable');
+});
+
+window.hue.on('bulb-recovered', ({ id }) => {
+  const row = lightsList && lightsList.querySelector(`.light-row[data-id="${id}"]`);
+  if (!row) return;
+  const meta = row.querySelector('.light-meta');
+  if (!meta) return;
+  meta.innerHTML = meta.innerHTML.replace(/\b(Reachable|Unreachable)\b/, 'Reachable');
+  // Brief green flash so the operator notices the recovery
+  meta.style.transition = 'color 0ms';
+  meta.style.color = '#4ade80';
+  setTimeout(() => {
+    meta.style.transition = 'color 200ms';
+    meta.style.color = '';
+  }, 200);
+});
+
 // ── Lights panel ──────────────────────────────────────────────────────────────
 
 const lightsList = document.getElementById('lights-list');

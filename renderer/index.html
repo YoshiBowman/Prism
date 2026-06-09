@@ -57,6 +57,12 @@
   <button id="btn-update-dismiss"  class="btn btn-secondary btn-sm">✕</button>
 </div>
 
+<!-- Bridge-offline banner (shown app-wide while a reboot is in progress) -->
+<div id="offline-banner" style="display:none">
+  <div class="dot"></div>
+  <span>Bridge offline — restarting. DMX control is interrupted until it reconnects.</span>
+</div>
+
 <!-- Tabs -->
 <div id="tabs">
   <div class="tab active" data-tab="bridge">Bridge</div>
@@ -132,6 +138,29 @@
         </div>
       </div>
 
+      <!-- Maintenance / advanced -->
+      <div class="card maintenance-card">
+        <h2>Maintenance</h2>
+        <p class="hint" style="margin-bottom:10px">
+          Last-resort recovery. Restarting reboots the physical Hue Bridge and
+          interrupts all control for up to a minute.
+        </p>
+        <button id="btn-reboot-bridge" class="btn btn-ghost-warn btn-sm" disabled>Restart Bridge</button>
+      </div>
+
+    </div>
+
+    <!-- Reboot status panel (replaces the connection layout during a reboot) -->
+    <div id="reboot-status-panel" class="card" style="display:none">
+      <div class="reboot-status-head">
+        <div class="reboot-pulse-dot"></div>
+        <h2 id="reboot-status-title">Restarting bridge…</h2>
+      </div>
+      <div id="reboot-status-msg" class="hint" style="margin-top:8px">Sending restart command…</div>
+      <div class="reboot-status-actions" style="margin-top:16px">
+        <button id="btn-reboot-manual" class="btn btn-primary btn-sm" style="display:none">Reconnect now</button>
+        <a id="reboot-cancel-link" href="#" class="reboot-cancel-link">Cancel</a>
+      </div>
     </div>
 
     <!-- Pairing dialog -->
@@ -350,6 +379,25 @@
 
 <!-- DMX channel bar (bottom) -->
 <div id="dmx-bar-wrap"></div>
+
+<!-- Restart-bridge confirmation modal -->
+<div id="reboot-modal-overlay" class="modal-overlay" style="display:none">
+  <div class="modal-box">
+    <h2>Restart Hue Bridge?</h2>
+    <p class="modal-body">
+      This will take the bridge offline for up to 60 seconds. All lights will
+      disconnect temporarily and DMX control will be interrupted. The bridge will
+      reconnect automatically.
+    </p>
+    <p id="reboot-modal-dmx-warn" class="modal-warn" style="display:none">
+      ⚠ DMX is currently active. Control will be interrupted.
+    </p>
+    <div class="modal-actions">
+      <button id="btn-reboot-cancel" class="btn btn-secondary btn-sm">Cancel</button>
+      <button id="btn-reboot-confirm" class="btn btn-warn-filled btn-sm">Restart Bridge</button>
+    </div>
+  </div>
+</div>
 
 <script src="app.js"></script>
 </body>

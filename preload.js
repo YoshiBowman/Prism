@@ -19,6 +19,8 @@ contextBridge.exposeInMainWorld('hue', {
   connectSaved:     ()   => ipcRenderer.invoke('bridge:connect-saved'),
   disconnect:       ()   => ipcRenderer.invoke('bridge:disconnect'),
   bridgeStatus:     ()   => ipcRenderer.invoke('bridge:status'),
+  rebootBridge:     ()   => ipcRenderer.invoke('bridge:reboot'),
+  cancelReboot:     ()   => ipcRenderer.invoke('bridge:reboot-cancel'),
 
   // Lights
   getLights:       ()             => ipcRenderer.invoke('lights:get'),
@@ -70,6 +72,10 @@ contextBridge.exposeInMainWorld('hue', {
       'bridge:scan-progress',
       'bridge:unreachable',
       'bridge:reachable',
+      'bridge:reboot-started',
+      'bridge:reboot-reconnecting',
+      'bridge:reboot-complete',
+      'bridge:reboot-timeout',
       'artnet:dmx-update',
       'artnet:status',
       'sacn:diag',

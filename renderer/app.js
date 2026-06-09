@@ -9,6 +9,7 @@ const state = {
   lights: [],
   settings: {},
   pairing: false,
+  rebooting: false,
 };
 
 // Per-universe DMX frame cache — keyed by universe number, updated on artnet:dmx-update
@@ -95,7 +96,7 @@ async function listenerBarStop() {
 
 function setListenerRunning(running, error) {
   state.artnetRunning = running;
-  lbStart.disabled = running;
+  lbStart.disabled = running || state.rebooting; // stay locked while the bridge is restarting
   lbStop.disabled  = !running;
   lbStatus.className = error ? 'error' : running ? 'running' : '';
 
@@ -147,6 +148,9 @@ function setBridgeStatus(connected, bridge, connecting) {
     : connected ? `Connected to ${bridge}` : 'Not connected';
   document.getElementById('btn-disconnect').style.display = connected ? '' : 'none';
   document.getElementById('btn-scan').disabled = connecting;
+  // Restart Bridge is only meaningful with a live connection and never during a reboot
+  const rebootBtn = document.getElementById('btn-reboot-bridge');
+  if (rebootBtn) rebootBtn.disabled = !connected || state.rebooting;
 }
 
 const scanProgressWrap  = document.getElementById('scan-progress-wrap');
@@ -344,6 +348,167 @@ document.getElementById('btn-disconnect').addEventListener('click', async () => 
   setBridgeStatus(false, null, false);
   document.getElementById('lights-list').innerHTML = '';
   toast('Disconnected from bridge', 'info');
+});
+
+// ── Bridge restart (reboot) flow ───────────────────────────────────────────────
+
+const bridgeLayout      = document.querySelector('#panel-bridge .bridge-layout');
+const rebootPanel       = document.getElementById('reboot-status-panel');
+const rebootTitle       = document.getElementById('reboot-status-title');
+const rebootMsg         = document.getElementById('reboot-status-msg');
+const rebootManualBtn   = document.getElementById('btn-reboot-manual');
+const rebootCancelLink  = document.getElementById('reboot-cancel-link');
+const offlineBanner     = document.getElementById('offline-banner');
+const rebootModal       = document.getElementById('reboot-modal-overlay');
+const rebootDmxWarn     = document.getElementById('reboot-modal-dmx-warn');
+
+let rebootElapsedTimer = null;   // local ticker that drives the elapsed-time message
+let rebootStartedAt    = 0;
+
+// Show the normal Bridge connection layout (default state)
+function showBridgeConnectionUI() {
+  if (bridgeLayout) bridgeLayout.style.display = '';
+  if (rebootPanel)  rebootPanel.style.display = 'none';
+}
+
+// Swap the connection layout for the reboot status panel
+function showRebootStatusUI() {
+  if (bridgeLayout) bridgeLayout.style.display = 'none';
+  if (rebootPanel)  rebootPanel.style.display = '';
+  rebootManualBtn.style.display = 'none';
+  rebootCancelLink.style.display = '';
+}
+
+// Lock/unlock the listener-bar Start button during the offline period
+function setListenerBarRebootLock(locked) {
+  if (locked) {
+    lbStart.disabled = true;
+    lbStart.title = 'Bridge restarting';
+  } else {
+    lbStart.title = '';
+    lbStart.disabled = state.artnetRunning; // restore normal rule
+  }
+}
+
+function stopRebootElapsedTicker() {
+  if (rebootElapsedTimer) { clearInterval(rebootElapsedTimer); rebootElapsedTimer = null; }
+}
+
+// End the reboot UI and return to a normal Bridge tab in the given connection state
+function exitRebootUI() {
+  state.rebooting = false;
+  stopRebootElapsedTicker();
+  offlineBanner.style.display = 'none';
+  setListenerBarRebootLock(false);
+  showBridgeConnectionUI();
+}
+
+// Open the confirmation modal (populating the DMX-active warning if needed)
+document.getElementById('btn-reboot-bridge').addEventListener('click', async () => {
+  let dmxActive = false;
+  try { dmxActive = await window.hue.dmxIsActive(); } catch {}
+  rebootDmxWarn.style.display = dmxActive ? '' : 'none';
+  rebootModal.style.display = 'flex';
+});
+
+// Cancel the modal — no state changes
+document.getElementById('btn-reboot-cancel').addEventListener('click', () => {
+  rebootModal.style.display = 'none';
+});
+
+// Confirm — send the reboot command
+document.getElementById('btn-reboot-confirm').addEventListener('click', async () => {
+  rebootModal.style.display = 'none';
+  const res = await window.hue.rebootBridge();
+  if (!res || !res.success) {
+    toast(`Restart failed: ${(res && res.error) || 'unknown error'}`, 'error');
+    return;
+  }
+  // Success path is driven by the bridge:reboot-* events below.
+});
+
+// Cancel link in the status panel — abort the reconnect loop
+rebootCancelLink.addEventListener('click', async (e) => {
+  e.preventDefault();
+  await window.hue.cancelReboot().catch(() => {});
+  exitRebootUI();
+  setBridgeStatus(false, state.bridge, false);
+  toast('Bridge restart cancelled', 'info');
+});
+
+// Manual reconnect (shown after a timeout)
+rebootManualBtn.addEventListener('click', async () => {
+  rebootMsg.textContent = 'Reconnecting…';
+  rebootManualBtn.disabled = true;
+  const res = await window.hue.connectSaved().catch(() => ({ success: false }));
+  rebootManualBtn.disabled = false;
+  if (res && res.success) {
+    exitRebootUI();
+    setBridgeStatus(true, res.bridge || state.bridge, false);
+    if (state.connected) refreshLights();
+    toast('Bridge back online', 'success');
+  } else {
+    rebootMsg.textContent = 'Bridge not found at saved address. Try scanning for it in the Bridge tab.';
+  }
+});
+
+window.hue.on('bridge:reboot-started', ({ estimatedSeconds }) => {
+  state.rebooting = true;
+  rebootStartedAt = Date.now();
+  showRebootStatusUI();
+  offlineBanner.style.display = 'flex';
+  setListenerBarRebootLock(true);
+  document.getElementById('btn-reboot-bridge').disabled = true;
+  rebootTitle.textContent = 'Restarting bridge…';
+  rebootMsg.textContent   = 'Sending restart command — bridge is going offline.';
+  toast('Bridge restarting — reconnecting automatically', 'warn');
+
+  // Drive the elapsed-time phases locally so the message keeps moving between
+  // the (less frequent) reconnect events from main.
+  stopRebootElapsedTicker();
+  rebootElapsedTimer = setInterval(() => {
+    const s = Math.round((Date.now() - rebootStartedAt) / 1000);
+    if (s < 15) {
+      rebootTitle.textContent = 'Restarting bridge…';
+      rebootMsg.textContent   = `Waiting for the bridge to go offline… (${s}s)`;
+    } else {
+      rebootTitle.textContent = 'Waiting for bridge…';
+      rebootMsg.textContent   = `Waiting for bridge to come back online… (${s}s)`;
+    }
+  }, 1000);
+});
+
+window.hue.on('bridge:reboot-reconnecting', ({ attempt, elapsed }) => {
+  rebootTitle.textContent = 'Waiting for bridge…';
+  rebootMsg.textContent   = `Reconnecting… attempt ${attempt} (${elapsed}s)`;
+});
+
+window.hue.on('bridge:reboot-complete', ({ elapsed }) => {
+  stopRebootElapsedTicker();
+  rebootTitle.textContent = 'Bridge reconnected.';
+  rebootMsg.textContent   = `Reconnected after ${elapsed}s.`;
+  rebootCancelLink.style.display = 'none';
+  offlineBanner.style.display = 'none';
+  setListenerBarRebootLock(false);
+  toast('Bridge back online', 'success');
+  setBridgeStatus(true, state.bridge, false);
+  // Hold the success message briefly, then return to the normal Bridge UI
+  setTimeout(() => {
+    state.rebooting = false;
+    showBridgeConnectionUI();
+    if (state.connected) refreshLights();
+  }, 3000);
+});
+
+window.hue.on('bridge:reboot-timeout', () => {
+  stopRebootElapsedTicker();
+  state.rebooting = false; // loop has stopped; allow manual action
+  rebootTitle.textContent = 'Reconnect timed out.';
+  rebootMsg.textContent   = 'Bridge not found at saved address. Try scanning for it in the Bridge tab.';
+  rebootManualBtn.style.display = '';
+  offlineBanner.style.display = 'none';
+  setListenerBarRebootLock(false);
+  toast('Bridge reconnect timed out — try connecting manually', 'error');
 });
 
 window.hue.on('bridge:auto-connect', async ({ connected, bridge }) => {

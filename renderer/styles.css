@@ -1362,6 +1362,7 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
 .toast.success { border-left: 3px solid var(--green); }
 .toast.error   { border-left: 3px solid var(--red); }
 .toast.info    { border-left: 3px solid var(--blue); }
+.toast.warn    { border-left: 3px solid var(--yellow); }
 
 @keyframes slideIn { from { transform: translateX(20px); opacity: 0; } to { transform: none; opacity: 1; } }
 
@@ -1401,3 +1402,98 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
   max-height: 24px;
   opacity: 0.75;
 }
+
+/* ── Bridge reboot feature ───────────────────────────────────────────────────── */
+
+/* App-wide offline banner (amber) shown while a reboot is in progress */
+#offline-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  background: rgba(251,191,36,0.10);
+  border-bottom: 1px solid rgba(251,191,36,0.28);
+  font-size: 11px;
+  color: var(--text2);
+  flex-shrink: 0;
+}
+#offline-banner .dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--yellow);
+  box-shadow: 0 0 6px var(--yellow);
+  animation: pulse 1.2s infinite;
+}
+
+/* Maintenance card — subtly set apart from the main connection controls */
+.maintenance-card { border-color: rgba(251,191,36,0.18); }
+
+/* Ghost / outlined amber button — significant action, not a primary one */
+.btn-ghost-warn {
+  background: transparent;
+  border: 1px solid rgba(251,191,36,0.45);
+  color: var(--yellow);
+}
+.btn-ghost-warn:not(:disabled):hover  { background: rgba(251,191,36,0.12); border-color: rgba(251,191,36,0.7); }
+.btn-ghost-warn:not(:disabled):active { transform: scale(0.97); opacity: 0.85; }
+.btn-ghost-warn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Amber filled button — the confirm action inside the modal */
+.btn-warn-filled {
+  background: linear-gradient(135deg, #f59e0b, #d97706);
+  color: #1a1205;
+  border: none;
+  font-weight: 600;
+}
+.btn-warn-filled:not(:disabled):hover  { background: linear-gradient(135deg, #fbbf24, #f59e0b); }
+.btn-warn-filled:not(:disabled):active { transform: scale(0.97); opacity: 0.9; }
+
+/* Reboot status panel */
+.reboot-status-head { display: flex; align-items: center; gap: 10px; }
+.reboot-pulse-dot {
+  width: 12px; height: 12px; border-radius: 50%;
+  background: var(--yellow);
+  box-shadow: 0 0 10px var(--yellow);
+  animation: pulse 1.1s infinite;
+  flex-shrink: 0;
+}
+.reboot-status-actions { display: flex; align-items: center; gap: 14px; }
+.reboot-cancel-link {
+  color: var(--text3);
+  font-size: 12px;
+  text-decoration: none;
+}
+.reboot-cancel-link:hover { color: var(--text2); text-decoration: underline; }
+
+/* Modal overlay + box (used by the restart confirmation dialog) */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.55);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+.modal-box {
+  width: 420px;
+  max-width: calc(100vw - 48px);
+  background: var(--glass2);
+  border: 1px solid var(--border2);
+  border-radius: 14px;
+  padding: 22px 24px;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+}
+.modal-box h2 { margin: 0 0 10px; font-size: 16px; }
+.modal-body { color: var(--text2); font-size: 13px; line-height: 1.5; margin: 0 0 12px; }
+.modal-warn {
+  color: var(--yellow);
+  font-size: 12px;
+  background: rgba(251,191,36,0.10);
+  border: 1px solid rgba(251,191,36,0.25);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin: 0 0 12px;
+}
+.modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }

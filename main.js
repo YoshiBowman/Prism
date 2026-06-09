@@ -87,6 +87,18 @@ let popoverWin  = null;
 let connectedPromise = null;   // resolves when initial bridge connect attempt finishes
 let startupRetryTimer = null;  // setInterval handle for the login-time reconnect loop
 
+// ── Bridge reboot flow state ───────────────────────────────────────────────────
+// isRebooting is true from the moment a reboot command succeeds until the bridge
+// reconnects, times out, or the user cancels. While true, the normal health-check
+// reconnect is suppressed so the two reconnect paths can't race each other.
+let isRebooting   = false;
+let rebootTimer   = null;  // setTimeout handle for the next reconnect attempt
+let rebootStartMs = 0;
+let rebootAttempt = 0;
+const REBOOT_INITIAL_WAIT_MS = 15000;  // bridge needs time to go offline
+const REBOOT_RETRY_MS        = 8000;   // between reconnect attempts
+const REBOOT_TIMEOUT_MS      = 120000; // give up after 2 minutes
+
 // ── DMX priority takeover tracking ────────────────────────────────────────────
 
 let lastDmxTakeoverMs  = 0;
@@ -131,9 +143,12 @@ function sendToAll(channel, ...args) {
 // isHealthChecking ensures a new tick is skipped while the previous one is still
 // in flight, so checks can never stack up. Handle is captured for quit cleanup.
 let isHealthChecking = false;
-let healthCheckTimer = setInterval(async () => {
+let healthCheckTimer = null;
+
+async function healthCheckTick() {
   if (!config.bridge || !config.user) return;
-  if (isHealthChecking) return; // previous check still running — skip this tick
+  if (isRebooting) return;       // reboot flow owns reconnection — don't race it
+  if (isHealthChecking) return;  // previous check still running — skip this tick
   isHealthChecking = true;
   try {
     await new Promise((resolve, reject) => {
@@ -152,13 +167,24 @@ let healthCheckTimer = setInterval(async () => {
     // Bridge didn't respond — drop the stale session and force a clean reconnect.
     // Null the API handle so no PUT/GET races against a dead connection, and clear
     // the dedup cache so the reconnect re-sends every light's full current state.
+    if (isRebooting) return; // a reboot may have started while the GET was in flight
     hueApi = null;
     for (const k of Object.keys(lightLastKey)) delete lightLastKey[k];
     await connectToSavedBridge().catch(() => {});
   } finally {
     isHealthChecking = false;
   }
-}, 30000);
+}
+
+function startHealthCheck() {
+  if (!healthCheckTimer) healthCheckTimer = setInterval(healthCheckTick, 30000);
+}
+
+function stopHealthCheck() {
+  if (healthCheckTimer) { clearInterval(healthCheckTimer); healthCheckTimer = null; }
+}
+
+startHealthCheck();
 
 // Build a node-hue-api Api object over HTTPS without cert validation or cert-pinning.
 // Used when the bridge rejects HTTP (port 80 closed on newer firmware).
@@ -235,6 +261,126 @@ async function connectToSavedBridge() {
     isConnecting    = false;
     connectInFlight = null;
   }
+}
+
+// ── Bridge reboot ──────────────────────────────────────────────────────────────
+// Last-resort recovery: ask the bridge to reboot, then ride out the offline
+// period and reconnect automatically. Only ever invoked from the UI confirmation
+// flow (never Companion or any external trigger).
+
+// Send PUT /config { reboot: true }. Resolves { ok, error } — never rejects.
+function sendRebootCommand() {
+  return new Promise(resolve => {
+    const body = Buffer.from(JSON.stringify({ reboot: true }));
+    const req = http.request({
+      hostname: config.bridge, port: 80,
+      path: `/api/${config.user}/config`, method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': body.length },
+      agent: keepAliveAgent, timeout: 5000,
+    }, res => {
+      let data = '';
+      res.on('data', c => { data += c; });
+      res.on('end', () => {
+        // Hue returns [{"success":{"/config/reboot":true}}] on success,
+        // or [{"error":{...}}] / HTTP >=400 on failure.
+        if (res.statusCode >= 400) { resolve({ ok: false, error: `HTTP ${res.statusCode}` }); return; }
+        if (data.includes('"error"')) {
+          const m = data.match(/"description"\s*:\s*"([^"]+)"/);
+          resolve({ ok: false, error: m ? m[1] : 'Bridge rejected reboot' });
+          return;
+        }
+        resolve({ ok: true });
+      });
+    });
+    req.on('error',   err => resolve({ ok: false, error: err.message }));
+    req.on('timeout', ()  => { req.destroy(); resolve({ ok: false, error: 'timeout' }); });
+    req.write(body);
+    req.end();
+  });
+}
+
+async function rebootBridge() {
+  if (!hueApi || !config.bridge || !config.user) {
+    return { success: false, error: 'Bridge not connected' };
+  }
+  if (isRebooting) return { success: false, error: 'Reboot already in progress' };
+
+  // Stop all outbound traffic BEFORE sending the reboot so no PUT fires while the
+  // bridge is on its way down.
+  stopBridgeTicker();
+  stopRecoveryPoller();
+
+  const result = await sendRebootCommand();
+  if (!result.ok) {
+    // Bridge is presumably still up — resume normal operation so the user can retry.
+    return { success: false, error: result.error };
+  }
+
+  console.log('[bridge] Reboot command sent — bridge going offline');
+  beginRebootOfflineFlow();
+  return { success: true };
+}
+
+// Tear down the live session and start the post-reboot reconnect loop.
+function beginRebootOfflineFlow() {
+  hueApi = null;
+  for (const k of Object.keys(lightLastKey)) delete lightLastKey[k];
+  stopBridgeTicker();
+  stopRecoveryPoller();
+  stopHealthCheck();          // reboot loop owns reconnection now
+
+  isRebooting   = true;
+  rebootStartMs = Date.now();
+  rebootAttempt = 0;
+
+  sendToAll('bridge:reboot-started', { estimatedSeconds: 60 });
+
+  // Wait before the first attempt — the bridge needs a moment to actually drop.
+  rebootTimer = setTimeout(rebootReconnectAttempt, REBOOT_INITIAL_WAIT_MS);
+}
+
+async function rebootReconnectAttempt() {
+  if (!isRebooting) return;     // cancelled
+  rebootAttempt++;
+  const elapsed = Math.round((Date.now() - rebootStartMs) / 1000);
+
+  const ok = await connectToSavedBridge().catch(() => false);
+  if (!isRebooting) return;     // cancelled while the connect was in flight
+
+  if (ok) {
+    isRebooting = false;
+    if (rebootTimer) { clearTimeout(rebootTimer); rebootTimer = null; }
+    startHealthCheck();         // resume normal background monitoring
+    fetchLights().catch(() => {});
+    console.log(`[bridge] Reboot complete — reconnected after ${elapsed}s`);
+    sendToAll('bridge:reboot-complete', { elapsed });
+    sendBridgeStatus();
+    return;
+  }
+
+  // Not back yet — report progress and decide whether to keep trying.
+  sendToAll('bridge:reboot-reconnecting', { attempt: rebootAttempt, elapsed });
+
+  if (Date.now() - rebootStartMs >= REBOOT_TIMEOUT_MS) {
+    isRebooting = false;
+    if (rebootTimer) { clearTimeout(rebootTimer); rebootTimer = null; }
+    startHealthCheck();         // keep quietly retrying in the background; UI offers manual reconnect
+    console.warn(`[bridge] Reboot reconnect timed out after ${elapsed}s`);
+    sendToAll('bridge:reboot-timeout', { elapsed });
+    return;
+  }
+
+  rebootTimer = setTimeout(rebootReconnectAttempt, REBOOT_RETRY_MS);
+}
+
+// User cancelled the reboot wait — stop the loop and return to normal disconnected
+// behaviour (health check resumes so the app can still recover on its own).
+function cancelReboot() {
+  if (!isRebooting) return { success: false, error: 'Not rebooting' };
+  isRebooting = false;
+  if (rebootTimer) { clearTimeout(rebootTimer); rebootTimer = null; }
+  startHealthCheck();
+  return { success: true };
 }
 
 // ── Network interfaces ────────────────────────────────────────────────────────
@@ -1506,8 +1652,16 @@ ipcMain.handle('bridge:status', () => {
   return {
     connected: hueApi !== null,
     bridge: config.bridge,
+    rebooting: isRebooting,
   };
 });
+
+// Reboot the Hue bridge. UI-only — guarded so it can't fire without a live
+// connection, and it stops the ticker/recovery poller before issuing the command.
+ipcMain.handle('bridge:reboot', async () => rebootBridge());
+
+// Cancel an in-progress post-reboot reconnect loop.
+ipcMain.handle('bridge:reboot-cancel', () => cancelReboot());
 
 ipcMain.handle('lights:get', async () => {
   const lights         = await fetchLights();
@@ -2160,9 +2314,11 @@ function cleanupAll() {
   stopSACN();
   stopBridgeTicker();
   stopRecoveryPoller();
+  stopHealthCheck();
+  isRebooting = false;
   if (takeoverBroadcastTimer) { clearInterval(takeoverBroadcastTimer); takeoverBroadcastTimer = null; }
-  if (healthCheckTimer)       { clearInterval(healthCheckTimer);       healthCheckTimer = null; }
   if (startupRetryTimer)      { clearInterval(startupRetryTimer);      startupRetryTimer = null; }
+  if (rebootTimer)            { clearTimeout(rebootTimer);             rebootTimer = null; }
   if (companionServer) { try { companionServer.close(); } catch {} companionServer = null; }
 }
 

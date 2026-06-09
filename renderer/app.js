@@ -1172,10 +1172,15 @@ async function sendLightState(lightId, s) {
 
 // DMX takeover — dim tiles while DMX is active
 window.hue.on('dmx:takeover-change', ({ active }) => {
+  const wasActive = state.dmxActive;
   state.dmxActive = active; // persist so buildControlCards can re-apply on tab re-entry
   dmxOverrideBanner.style.display = active ? 'flex' : 'none';
   controlGrid.querySelectorAll('.ctrl-tile').forEach(c => c.classList.toggle('dmx-active', active));
   dmxOverrideInfo.textContent = '';
+  // When DMX stops, the tiles are showing the last DMX values rather than the
+  // real bulb state. Pull fresh state from the bridge so the control tab reflects
+  // reality once the override clears. (refreshControlSwatches no-ops if DMX active.)
+  if (wasActive && !active) refreshControlSwatches();
 });
 
 // ── Scenes ────────────────────────────────────────────────────────────────────

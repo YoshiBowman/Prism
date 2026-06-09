@@ -42,6 +42,34 @@ function loadConfig() {
   } catch {
     config = { ...DEFAULT_CONFIG };
   }
+  validateConfig();
+}
+
+// Coerce config values to the types the rest of the app expects.
+// A config written by an older version, hand-edited, or partially migrated
+// can contain strings where numbers are expected (e.g. "22" for a universe),
+// or missing container objects. Fixing them here means no downstream code has
+// to defensively re-parse. Runs on every load.
+function validateConfig() {
+  const toInt = (v, fallback) => {
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) ? n : fallback;
+  };
+  config.dmxAddress   = toInt(config.dmxAddress,   DEFAULT_CONFIG.dmxAddress);
+  config.universe     = toInt(config.universe,     DEFAULT_CONFIG.universe);
+  config.sacnUniverse = toInt(config.sacnUniverse, DEFAULT_CONFIG.sacnUniverse);
+  // transition may legitimately be the string 'channel'; only coerce numerics
+  if (config.transition !== 'channel') config.transition = toInt(config.transition, DEFAULT_CONFIG.transition);
+  config.sacnMulticast = !!config.sacnMulticast;
+  config.noLimit       = !!config.noLimit;
+  if (typeof config.protocol !== 'string') config.protocol = DEFAULT_CONFIG.protocol;
+  if (typeof config.host !== 'string')     config.host     = DEFAULT_CONFIG.host;
+  // Ensure container objects/arrays exist so callers never hit undefined
+  if (!config.disabledLights || typeof config.disabledLights !== 'object') config.disabledLights = {};
+  if (!config.lightAddresses || typeof config.lightAddresses !== 'object') config.lightAddresses = {};
+  if (!config.scenes         || typeof config.scenes         !== 'object') config.scenes = {};
+  if (!config.lightStates    || typeof config.lightStates    !== 'object') config.lightStates = {};
+  if (!Array.isArray(config.lightsOrder)) config.lightsOrder = [];
 }
 
 function saveConfig() {
@@ -57,6 +85,7 @@ let mainWindow  = null;
 let tray        = null;
 let popoverWin  = null;
 let connectedPromise = null;   // resolves when initial bridge connect attempt finishes
+let startupRetryTimer = null;  // setInterval handle for the login-time reconnect loop
 
 // ── DMX priority takeover tracking ────────────────────────────────────────────
 
@@ -71,8 +100,9 @@ function isDmxActive() {
   return Date.now() - lastDmxTakeoverMs < 2000;
 }
 
-// Broadcast takeover state changes to renderer every 500 ms
-setInterval(() => {
+// Broadcast takeover state changes to renderer every 500 ms.
+// Handle is captured so it can be cleared on quit (see cleanupAll()).
+let takeoverBroadcastTimer = setInterval(() => {
   const nowActive = isDmxActive();
   if (nowActive !== dmxTakeoverActive) {
     dmxTakeoverActive = nowActive;
@@ -96,8 +126,15 @@ function sendToAll(channel, ...args) {
 // reconnects if the bridge has restarted or moved since the app launched.
 // Also refreshes light states so syncUnreachableFromCache() can detect bulbs
 // that went offline mid-session without needing active DMX traffic to notice.
-setInterval(async () => {
+//
+// REENTRANCY GUARD: a slow bridge could make a check outlast the 30 s interval.
+// isHealthChecking ensures a new tick is skipped while the previous one is still
+// in flight, so checks can never stack up. Handle is captured for quit cleanup.
+let isHealthChecking = false;
+let healthCheckTimer = setInterval(async () => {
   if (!config.bridge || !config.user) return;
+  if (isHealthChecking) return; // previous check still running — skip this tick
+  isHealthChecking = true;
   try {
     await new Promise((resolve, reject) => {
       const req = http.request(
@@ -112,8 +149,14 @@ setInterval(async () => {
     // Bridge is up — refresh light states to catch any bulbs that went unreachable
     fetchLights().catch(() => {});
   } catch {
-    // Bridge didn't respond — silently re-establish the session
+    // Bridge didn't respond — drop the stale session and force a clean reconnect.
+    // Null the API handle so no PUT/GET races against a dead connection, and clear
+    // the dedup cache so the reconnect re-sends every light's full current state.
+    hueApi = null;
+    for (const k of Object.keys(lightLastKey)) delete lightLastKey[k];
     await connectToSavedBridge().catch(() => {});
+  } finally {
+    isHealthChecking = false;
   }
 }, 30000);
 
@@ -147,8 +190,20 @@ async function localConnect(ip, username) {
   }
 }
 
+// Guards against overlapping connects. connectToSavedBridge() is reachable from
+// three independent callers (startup retry loop, 30 s health check, and the
+// bridge:connect-saved IPC), any of which can fire while another is mid-connect.
+// Two simultaneous localConnect() calls would race to assign hueApi and could
+// leave a half-initialised Api object live. While a connect is in flight, later
+// callers return the same in-flight promise instead of starting a second one.
+let isConnecting       = false;
+let connectInFlight    = null;
+
 async function connectToSavedBridge() {
   if (!config.bridge || !config.user) return false;
+  if (isConnecting && connectInFlight) return connectInFlight; // coalesce concurrent calls
+  isConnecting    = true;
+  connectInFlight = (async () => {
   try {
     hueApi = await localConnect(config.bridge, config.user);
     // Clear rate-limit and dedup caches so every light re-sends its current
@@ -172,6 +227,13 @@ async function connectToSavedBridge() {
     console.warn('[bridge] reconnect failed:', err.message);
     hueApi = null;
     return false;
+  }
+  })();
+  try {
+    return await connectInFlight;
+  } finally {
+    isConnecting    = false;
+    connectInFlight = null;
   }
 }
 
@@ -249,12 +311,6 @@ const unreachableLights = new Set();
 // setInterval handle for the recovery poller — null means not running.
 // DOUBLE-START GUARD: startRecoveryPoller() is a no-op when this is non-null.
 let recoveryInterval    = null;
-
-// ── 5-second rolling command-rate diagnostic ──────────────────────────────────
-// Logs to stdout so you can confirm the actual rate hitting the bridge.
-// Leave enabled until the unreachability issue is confirmed resolved.
-let _diagSendCount   = 0;
-let _diagWindowStart = Date.now();
 
 let bridgeTicker = null;
 
@@ -485,17 +541,6 @@ keepAliveAgent.on('free', socket => socket.setTimeout(20000, () => socket.destro
 // Fast direct PUT to the Hue local REST API bypassing node-hue-api overhead
 function sendDirectState(lightId, payload) {
   if (!config.bridge || !config.user) return;
-
-  // ── 5-second rolling rate diagnostic ─────────────────────────────────────
-  _diagSendCount++;
-  const _now = Date.now();
-  if (_now - _diagWindowStart >= 5000) {
-    const elapsed = (_now - _diagWindowStart) / 1000;
-    console.log(`[bridge] ${_diagSendCount} commands in last ${elapsed.toFixed(1)}s (${(_diagSendCount / elapsed).toFixed(1)}/sec avg)`);
-    _diagSendCount   = 0;
-    _diagWindowStart = _now;
-  }
-
   const body = Buffer.from(JSON.stringify(payload));
   const req  = http.request({
     hostname: config.bridge,
@@ -667,43 +712,49 @@ function invalidateWatchedUniverses() {
 function processArtnet(data, packetUniverse, defaultUniverse) {
   if (!hueApi) return;
 
-  // Cache the raw frame so the renderer can read per-universe live data
-  dmxBuffers[packetUniverse] = Buffer.from(data);
+  // A single malformed frame must never crash the listener. Any unexpected
+  // shape (short buffer, bad offset, etc.) is logged once and the frame dropped.
+  try {
+    // Cache the raw frame so the renderer can read per-universe live data
+    dmxBuffers[packetUniverse] = Buffer.from(data);
 
-  const channelsPerLight = 3;
-  const baseOffset       = (config.dmxAddress - 1) + (config.transition === 'channel' ? 1 : 0);
-  const lightAddresses   = config.lightAddresses || {};
-  const orderedLights    = getOrderedLights();
+    const channelsPerLight = 3;
+    const baseOffset       = (config.dmxAddress - 1) + (config.transition === 'channel' ? 1 : 0);
+    const lightAddresses   = config.lightAddresses || {};
+    const orderedLights    = getOrderedLights();
 
-  for (let i = 0; i < orderedLights.length; i++) {
-    const light = orderedLights[i];
-    if (config.disabledLights[light.id]) continue;
+    for (let i = 0; i < orderedLights.length; i++) {
+      const light = orderedLights[i];
+      if (config.disabledLights[light.id]) continue;
 
-    const raw = lightAddresses[light.id];
-    // Backward compat: plain number stored → treat as { channel: n }
-    const patch = (raw != null && typeof raw === 'number') ? { channel: raw } : raw;
+      const raw = lightAddresses[light.id];
+      // Backward compat: plain number stored → treat as { channel: n }
+      const patch = (raw != null && typeof raw === 'number') ? { channel: raw } : raw;
 
-    // Determine which universe this light is patched to
-    const lightUniverse = patch?.universe ?? defaultUniverse;
-    // Skip lights that belong to a different universe in this packet
-    if (lightUniverse !== packetUniverse) continue;
+      // Determine which universe this light is patched to
+      const lightUniverse = patch?.universe ?? defaultUniverse;
+      // Skip lights that belong to a different universe in this packet
+      if (lightUniverse !== packetUniverse) continue;
 
-    // Determine the 0-based offset within this universe's buffer
-    const offset = patch?.channel != null
-      ? (patch.channel - 1)
-      : baseOffset + i * channelsPerLight;
+      // Determine the 0-based offset within this universe's buffer
+      const offset = patch?.channel != null
+        ? (patch.channel - 1)
+        : baseOffset + i * channelsPerLight;
 
-    if (offset + 2 >= data.length) continue;
+      if (offset < 0 || offset + 2 >= data.length) continue;
 
-    updateCurrent(light.id, data[offset], data[offset + 1], data[offset + 2], null);
-  }
+      updateCurrent(light.id, data[offset], data[offset + 1], data[offset + 2], null);
+    }
 
-  startBridgeTicker();
+    startBridgeTicker();
 
-  // Send the frame + universe number to the renderer for live display
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    const snapshot = Array.from(data.slice(0, Math.min(data.length, 512)));
-    mainWindow.webContents.send('artnet:dmx-update', snapshot, packetUniverse);
+    // Send the frame + universe number to the renderer for live display
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      const snapshot = Array.from(data.slice(0, Math.min(data.length, 512)));
+      mainWindow.webContents.send('artnet:dmx-update', snapshot, packetUniverse);
+    }
+  } catch (err) {
+    console.warn(`[dmx] dropped malformed frame on universe ${packetUniverse}: ${err.message}`);
   }
 }
 
@@ -2048,11 +2099,12 @@ app.whenReady().then(() => {
   connectedPromise = connectToSavedBridge().then(ok => {
     if (ok || !config.bridge) return ok;
     let attempts = 0;
-    const startupRetry = setInterval(async () => {
-      if (hueApi || ++attempts >= 15) { clearInterval(startupRetry); return; }
+    startupRetryTimer = setInterval(async () => {
+      if (hueApi || ++attempts >= 15) { clearInterval(startupRetryTimer); startupRetryTimer = null; return; }
       const connected = await connectToSavedBridge().catch(() => false);
       if (connected) {
-        clearInterval(startupRetry);
+        clearInterval(startupRetryTimer);
+        startupRetryTimer = null;
         sendBridgeStatus();   // notify main window if it's open
       }
     }, 8000); // every 8 s  →  15 attempts  →  2 minutes
@@ -2101,15 +2153,31 @@ app.whenReady().then(() => {
   app.on('activate', () => openMainWindow());
 });
 
+// Tear down every timer, socket, and server. Idempotent — safe to call more
+// than once (close() / clearInterval() on already-stopped handles are no-ops).
+function cleanupAll() {
+  stopArtnet();
+  stopSACN();
+  stopBridgeTicker();
+  stopRecoveryPoller();
+  if (takeoverBroadcastTimer) { clearInterval(takeoverBroadcastTimer); takeoverBroadcastTimer = null; }
+  if (healthCheckTimer)       { clearInterval(healthCheckTimer);       healthCheckTimer = null; }
+  if (startupRetryTimer)      { clearInterval(startupRetryTimer);      startupRetryTimer = null; }
+  if (companionServer) { try { companionServer.close(); } catch {} companionServer = null; }
+}
+
+// before-quit fires for an actual app quit on every platform (incl. the tray
+// "Quit" item and macOS Cmd-Q), unlike window-all-closed which we deliberately
+// ignore on macOS to keep running in the menu bar. This is the single guaranteed
+// teardown point, so all intervals/sockets/servers are released here.
+app.on('before-quit', cleanupAll);
+
 app.on('window-all-closed', () => {
   if (process.platform === 'darwin') {
     // Keep running in the menu bar — listener stays active, Dock stays hidden
     if (app.dock) app.dock.hide();
   } else {
-    stopArtnet();
-    stopSACN();
-    stopBridgeTicker();
-    stopRecoveryPoller();
+    cleanupAll();
     app.quit();
   }
 });

@@ -2,6 +2,10 @@
 
 const { contextBridge, ipcRenderer } = require('electron');
 
+// Maps each (channel → caller fn → wrapper) so off() can remove the exact
+// wrapper that on() registered. Lives in the preload scope, not exposed.
+const _listenerWrappers = new Map();
+
 contextBridge.exposeInMainWorld('hue', {
   // Network
   getNetworkInterfaces: () => ipcRenderer.invoke('network:get-interfaces'),
@@ -78,7 +82,22 @@ contextBridge.exposeInMainWorld('hue', {
       'update:downloaded',
       'update:error',
     ];
-    if (allowed.includes(channel)) ipcRenderer.on(channel, (_, ...args) => fn(...args));
+    if (!allowed.includes(channel)) return;
+    // on() wraps fn in a new closure, so a later off(channel, fn) could never
+    // match the registered listener. Track the wrapper keyed by the caller's fn
+    // so off() can look it up and actually remove it — otherwise listeners
+    // accumulate across re-registrations and leak.
+    const wrapper = (_, ...args) => fn(...args);
+    if (!_listenerWrappers.has(channel)) _listenerWrappers.set(channel, new Map());
+    _listenerWrappers.get(channel).set(fn, wrapper);
+    ipcRenderer.on(channel, wrapper);
   },
-  off: (channel, fn) => ipcRenderer.removeListener(channel, fn),
+  off: (channel, fn) => {
+    const forChannel = _listenerWrappers.get(channel);
+    const wrapper = forChannel && forChannel.get(fn);
+    if (wrapper) {
+      ipcRenderer.removeListener(channel, wrapper);
+      forChannel.delete(fn);
+    }
+  },
 });

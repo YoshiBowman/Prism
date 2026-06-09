@@ -5690,6 +5690,8 @@ var PrismInstance = class extends InstanceBase {
     this.host = config.host || "localhost";
     this.port = parseInt(config.port) || 38765;
     this.updateStatus(InstanceStatus.Connecting);
+    this._defined = false;
+    this._defineAll();
     this._startPolling();
   }
   async destroy() {
@@ -5795,15 +5797,24 @@ var PrismInstance = class extends InstanceBase {
       const changed = JSON.stringify(incoming) !== JSON.stringify(this.presets);
       this.presets = incoming;
       this.activePreset = status.activePreset || null;
-      if (changed) {
-        this._updateActions();
-        this._updateFeedbacks();
-        this._updatePresets();
+      // Always (re)define on the first successful poll, then only when the preset
+      // list actually changes. Without the !_defined clause, a Prism instance with
+      // zero scenes (incoming === [] === this.presets) would never register the
+      // apply_preset/all_off actions or the preset_active feedback.
+      if (changed || !this._defined) {
+        this._defineAll();
       }
       this.checkFeedbacks("preset_active");
     } catch {
       this.updateStatus(InstanceStatus.ConnectionFailure, "Cannot reach Prism");
     }
+  }
+  // Register all action, feedback, and preset definitions in one place.
+  _defineAll() {
+    this._updateActions();
+    this._updateFeedbacks();
+    this._updatePresets();
+    this._defined = true;
   }
   // ── Actions ───────────────────────────────────────────────────────────────
   _updateActions() {

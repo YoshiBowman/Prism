@@ -452,6 +452,16 @@ rebootManualBtn.addEventListener('click', async () => {
   }
 });
 
+// The current phase label is set by events; a local 1 s ticker appends the
+// elapsed-seconds counter so the message keeps moving between events.
+let rebootPhaseTitle = 'Restarting bridge…';
+let rebootPhaseMsg   = 'Sending restart command…';
+function paintRebootStatus() {
+  const s = Math.round((Date.now() - rebootStartedAt) / 1000);
+  rebootTitle.textContent = rebootPhaseTitle;
+  rebootMsg.textContent   = `${rebootPhaseMsg} (${s}s)`;
+}
+
 window.hue.on('bridge:reboot-started', ({ estimatedSeconds }) => {
   state.rebooting = true;
   rebootStartedAt = Date.now();
@@ -459,52 +469,67 @@ window.hue.on('bridge:reboot-started', ({ estimatedSeconds }) => {
   offlineBanner.style.display = 'flex';
   setListenerBarRebootLock(true);
   document.getElementById('btn-reboot-bridge').disabled = true;
-  rebootTitle.textContent = 'Restarting bridge…';
-  rebootMsg.textContent   = 'Sending restart command — bridge is going offline.';
+  rebootPhaseTitle = 'Restarting bridge…';
+  rebootPhaseMsg   = 'Sending restart command — waiting for the bridge to go offline';
+  paintRebootStatus();
   toast('Bridge restarting — reconnecting automatically', 'warn');
 
-  // Drive the elapsed-time phases locally so the message keeps moving between
-  // the (less frequent) reconnect events from main.
   stopRebootElapsedTicker();
-  rebootElapsedTimer = setInterval(() => {
-    const s = Math.round((Date.now() - rebootStartedAt) / 1000);
-    if (s < 15) {
-      rebootTitle.textContent = 'Restarting bridge…';
-      rebootMsg.textContent   = `Waiting for the bridge to go offline… (${s}s)`;
-    } else {
-      rebootTitle.textContent = 'Waiting for bridge…';
-      rebootMsg.textContent   = `Waiting for bridge to come back online… (${s}s)`;
-    }
-  }, 1000);
+  rebootElapsedTimer = setInterval(paintRebootStatus, 1000);
 });
 
-window.hue.on('bridge:reboot-reconnecting', ({ attempt, elapsed }) => {
-  rebootTitle.textContent = 'Waiting for bridge…';
-  rebootMsg.textContent   = `Reconnecting… attempt ${attempt} (${elapsed}s)`;
+window.hue.on('bridge:reboot-reconnecting', ({ attempt, phase }) => {
+  switch (phase) {
+    case 'going-offline':
+      rebootPhaseTitle = 'Restarting bridge…';
+      rebootPhaseMsg   = 'Waiting for the bridge to go offline';
+      break;
+    case 'offline-confirmed':
+      rebootPhaseTitle = 'Bridge went offline ✓';
+      rebootPhaseMsg   = 'Waiting for it to come back online';
+      break;
+    case 'reconnecting':
+      rebootPhaseTitle = 'Reconnecting…';
+      rebootPhaseMsg   = `Bridge is back — reconnecting (attempt ${attempt})`;
+      break;
+    case 'waiting-online':
+    default:
+      rebootPhaseTitle = 'Waiting for bridge…';
+      rebootPhaseMsg   = 'Waiting for it to come back online';
+  }
+  paintRebootStatus();
 });
 
-window.hue.on('bridge:reboot-complete', ({ elapsed }) => {
+window.hue.on('bridge:reboot-complete', ({ elapsed, didReboot, connected }) => {
   stopRebootElapsedTicker();
-  rebootTitle.textContent = 'Bridge reconnected.';
-  rebootMsg.textContent   = `Reconnected after ${elapsed}s.`;
   rebootCancelLink.style.display = 'none';
   offlineBanner.style.display = 'none';
   setListenerBarRebootLock(false);
-  toast('Bridge back online', 'success');
-  setBridgeStatus(true, state.bridge, false);
-  // Hold the success message briefly, then return to the normal Bridge UI
+
+  if (didReboot) {
+    rebootTitle.textContent = 'Bridge reconnected.';
+    rebootMsg.textContent   = `Bridge restarted and reconnected after ${elapsed}s.`;
+    toast('Bridge back online', 'success');
+  } else {
+    // Command was accepted but the bridge never actually dropped.
+    rebootTitle.textContent = 'Bridge did not restart.';
+    rebootMsg.textContent   = 'The bridge never went offline — this firmware may not support remote restart. Still connected; try power-cycling the bridge manually.';
+    toast('Bridge did not appear to restart', 'warn');
+  }
+  setBridgeStatus(!!connected, state.bridge, false);
+  // Hold the message a little longer when it's a warning so it can be read.
   setTimeout(() => {
     state.rebooting = false;
     showBridgeConnectionUI();
     if (state.connected) refreshLights();
-  }, 3000);
+  }, didReboot ? 3000 : 6000);
 });
 
 window.hue.on('bridge:reboot-timeout', () => {
   stopRebootElapsedTicker();
   state.rebooting = false; // loop has stopped; allow manual action
   rebootTitle.textContent = 'Reconnect timed out.';
-  rebootMsg.textContent   = 'Bridge not found at saved address. Try scanning for it in the Bridge tab.';
+  rebootMsg.textContent   = 'Bridge did not come back at its saved address. Try scanning for it in the Bridge tab.';
   rebootManualBtn.style.display = '';
   offlineBanner.style.display = 'none';
   setListenerBarRebootLock(false);

@@ -91,13 +91,14 @@ let startupRetryTimer = null;  // setInterval handle for the login-time reconnec
 // isRebooting is true from the moment a reboot command succeeds until the bridge
 // reconnects, times out, or the user cancels. While true, the normal health-check
 // reconnect is suppressed so the two reconnect paths can't race each other.
-let isRebooting   = false;
-let rebootTimer   = null;  // setTimeout handle for the next reconnect attempt
-let rebootStartMs = 0;
-let rebootAttempt = 0;
-const REBOOT_INITIAL_WAIT_MS = 15000;  // bridge needs time to go offline
-const REBOOT_RETRY_MS        = 8000;   // between reconnect attempts
-const REBOOT_TIMEOUT_MS      = 120000; // give up after 2 minutes
+let isRebooting     = false;
+let rebootTimer     = null;  // setTimeout handle for the next poll
+let rebootStartMs   = 0;
+let rebootAttempt   = 0;
+let rebootSawOffline = false; // have we confirmed the bridge actually went down?
+const REBOOT_POLL_MS         = 2500;   // how often to poll the bridge API
+const REBOOT_OFFLINE_WAIT_MS = 30000;  // max time to wait to SEE the bridge drop
+const REBOOT_TIMEOUT_MS      = 150000; // overall give-up window (2.5 min)
 
 // ── DMX priority takeover tracking ────────────────────────────────────────────
 
@@ -321,56 +322,109 @@ async function rebootBridge() {
   return { success: true };
 }
 
-// Tear down the live session and start the post-reboot reconnect loop.
+// Lightweight reachability probe — GET /config, resolves true/false, never rejects.
+// Used by the reboot flow to detect the offline period and the return.
+function bridgeApiReachable() {
+  return new Promise(resolve => {
+    const req = http.request({
+      hostname: config.bridge, port: 80,
+      path: `/api/${config.user}/config`, method: 'GET',
+      agent: keepAliveAgent, timeout: 3000,
+    }, res => { res.resume(); resolve(true); });
+    req.on('error',   () => resolve(false));
+    req.on('timeout', () => { req.destroy(); resolve(false); });
+    req.end();
+  });
+}
+
+// Tear down the live session and start the two-phase reboot watch:
+//   Phase 1 — confirm the bridge actually goes OFFLINE (proves the reboot took).
+//   Phase 2 — wait for it to come back, then reconnect.
 function beginRebootOfflineFlow() {
   hueApi = null;
   for (const k of Object.keys(lightLastKey)) delete lightLastKey[k];
   stopBridgeTicker();
   stopRecoveryPoller();
-  stopHealthCheck();          // reboot loop owns reconnection now
+  stopHealthCheck();          // reboot watch owns reconnection now
 
-  isRebooting   = true;
-  rebootStartMs = Date.now();
-  rebootAttempt = 0;
+  isRebooting    = true;
+  rebootStartMs  = Date.now();
+  rebootAttempt  = 0;
+  rebootSawOffline = false;
 
   sendToAll('bridge:reboot-started', { estimatedSeconds: 60 });
 
-  // Wait before the first attempt — the bridge needs a moment to actually drop.
-  rebootTimer = setTimeout(rebootReconnectAttempt, REBOOT_INITIAL_WAIT_MS);
+  // Start polling almost immediately — the bridge usually drops within a few
+  // seconds, and we want to SEE that drop rather than assume it.
+  rebootTimer = setTimeout(rebootPoll, REBOOT_POLL_MS);
 }
 
-async function rebootReconnectAttempt() {
-  if (!isRebooting) return;     // cancelled
-  rebootAttempt++;
+async function rebootPoll() {
+  if (!isRebooting) return;
   const elapsed = Math.round((Date.now() - rebootStartMs) / 1000);
+  const up = await bridgeApiReachable();
+  if (!isRebooting) return;     // cancelled while the probe was in flight
 
-  const ok = await connectToSavedBridge().catch(() => false);
-  if (!isRebooting) return;     // cancelled while the connect was in flight
-
-  if (ok) {
-    isRebooting = false;
-    if (rebootTimer) { clearTimeout(rebootTimer); rebootTimer = null; }
-    startHealthCheck();         // resume normal background monitoring
-    fetchLights().catch(() => {});
-    console.log(`[bridge] Reboot complete — reconnected after ${elapsed}s`);
-    sendToAll('bridge:reboot-complete', { elapsed });
-    sendBridgeStatus();
+  // ── Phase 1: waiting to confirm the bridge has gone offline ──────────────────
+  if (!rebootSawOffline) {
+    if (!up) {
+      // Confirmed — the reboot took effect.
+      rebootSawOffline = true;
+      console.log(`[bridge] Confirmed offline after ${elapsed}s — waiting for it to come back`);
+      sendToAll('bridge:reboot-reconnecting', { attempt: 0, elapsed, phase: 'offline-confirmed' });
+    } else if (Date.now() - rebootStartMs >= REBOOT_OFFLINE_WAIT_MS) {
+      // The bridge never dropped within the window — the command was accepted
+      // but did not actually restart the hardware. Reconnect and tell the user.
+      const ok = await connectToSavedBridge().catch(() => false);
+      finishReboot(ok, elapsed, 'no-offline');
+      return;
+    } else {
+      sendToAll('bridge:reboot-reconnecting', { attempt: 0, elapsed, phase: 'going-offline' });
+    }
+    rebootTimer = setTimeout(rebootPoll, REBOOT_POLL_MS);
     return;
   }
 
-  // Not back yet — report progress and decide whether to keep trying.
-  sendToAll('bridge:reboot-reconnecting', { attempt: rebootAttempt, elapsed });
+  // ── Phase 2: bridge dropped; wait for it to return, then reconnect ───────────
+  if (up) {
+    rebootAttempt++;
+    const ok = await connectToSavedBridge().catch(() => false);
+    if (!isRebooting) return;
+    if (ok) { finishReboot(true, Math.round((Date.now() - rebootStartMs) / 1000), 'rebooted'); return; }
+    sendToAll('bridge:reboot-reconnecting', { attempt: rebootAttempt, elapsed, phase: 'reconnecting' });
+  } else {
+    sendToAll('bridge:reboot-reconnecting', { attempt: rebootAttempt, elapsed, phase: 'waiting-online' });
+  }
 
   if (Date.now() - rebootStartMs >= REBOOT_TIMEOUT_MS) {
     isRebooting = false;
     if (rebootTimer) { clearTimeout(rebootTimer); rebootTimer = null; }
-    startHealthCheck();         // keep quietly retrying in the background; UI offers manual reconnect
+    startHealthCheck();         // keep quietly retrying in the background
     console.warn(`[bridge] Reboot reconnect timed out after ${elapsed}s`);
-    sendToAll('bridge:reboot-timeout', { elapsed });
+    sendToAll('bridge:reboot-timeout', { elapsed, reason: 'timeout' });
     return;
   }
 
-  rebootTimer = setTimeout(rebootReconnectAttempt, REBOOT_RETRY_MS);
+  rebootTimer = setTimeout(rebootPoll, REBOOT_POLL_MS);
+}
+
+// Resolve the reboot flow.
+//   outcome 'rebooted'   — saw it drop and come back (true success)
+//   outcome 'no-offline' — never dropped; reconnected anyway (likely unsupported)
+function finishReboot(connected, elapsed, outcome) {
+  isRebooting = false;
+  if (rebootTimer) { clearTimeout(rebootTimer); rebootTimer = null; }
+  startHealthCheck();
+  if (connected) {
+    fetchLights().catch(() => {});
+    sendBridgeStatus();
+  }
+  if (outcome === 'no-offline') {
+    console.warn(`[bridge] Bridge never went offline after ${elapsed}s — restart likely unsupported on this firmware`);
+  } else {
+    console.log(`[bridge] Reboot complete — reconnected after ${elapsed}s`);
+  }
+  sendToAll('bridge:reboot-complete', { elapsed, didReboot: outcome === 'rebooted', connected });
 }
 
 // User cancelled the reboot wait — stop the loop and return to normal disconnected
@@ -378,6 +432,7 @@ async function rebootReconnectAttempt() {
 function cancelReboot() {
   if (!isRebooting) return { success: false, error: 'Not rebooting' };
   isRebooting = false;
+  rebootSawOffline = false;
   if (rebootTimer) { clearTimeout(rebootTimer); rebootTimer = null; }
   startHealthCheck();
   return { success: true };

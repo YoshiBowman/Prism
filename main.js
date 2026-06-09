@@ -170,7 +170,7 @@ async function healthCheckTick() {
     // the dedup cache so the reconnect re-sends every light's full current state.
     if (isRebooting) return; // a reboot may have started while the GET was in flight
     hueApi = null;
-    for (const k of Object.keys(lightLastKey)) delete lightLastKey[k];
+    for (const k of Object.keys(lightLastSent)) delete lightLastSent[k];
     await connectToSavedBridge().catch(() => {});
   } finally {
     isHealthChecking = false;
@@ -235,7 +235,7 @@ async function connectToSavedBridge() {
     hueApi = await localConnect(config.bridge, config.user);
     // Clear rate-limit and dedup caches so every light re-sends its current
     // state on the next tick after a reconnect.
-    for (const k of Object.keys(lightLastKey))   delete lightLastKey[k];
+    for (const k of Object.keys(lightLastSent))   delete lightLastSent[k];
     for (const k of Object.keys(lightLastSendMs)) delete lightLastSendMs[k];
     await fetchLights().catch(() => {});
     // Seed unreachable lights from the initial fetch
@@ -342,7 +342,7 @@ function bridgeApiReachable() {
 //   Phase 2 — wait for it to come back, then reconnect.
 function beginRebootOfflineFlow() {
   hueApi = null;
-  for (const k of Object.keys(lightLastKey)) delete lightLastKey[k];
+  for (const k of Object.keys(lightLastSent)) delete lightLastSent[k];
   stopBridgeTicker();
   stopRecoveryPoller();
   stopHealthCheck();          // reboot watch owns reconnection now
@@ -474,7 +474,7 @@ const dmxBuffers = {};   // { universeNum: Buffer } — latest received DMX fram
 // can't blindly forward every DMX frame (40+/sec). Instead:
 //   • Each DMX frame updates a per-light "current value" table — no API calls.
 //   • A 250 ms tick sends each light's current value, deduped (skip if unchanged)
-//     and rate-limited per light (tryDirectSend → 2 cmd/sec/light).
+//     and rate-limited per light (1 cmd/sec/light).
 //   • Each command carries a 300 ms transition so the bridge interpolates between
 //     ticks and tracks moving values smoothly.
 // Simple and predictable: the value the operator sets is the value that is sent.
@@ -484,8 +484,8 @@ const FOLLOW_TT  = Math.round((TICKER_MS + 50) / 100); // 3 deciseconds = 300 ms
 
 // { lightId: { r, g, b, extra } }  — latest value from DMX frames
 const lightCurrent = {};
-// { lightId: string }              — last sent value key (dedup)
-const lightLastKey = {};
+// { lightId: { r, g, b } }         — the value we last actually SENT to each light
+const lightLastSent = {};
 // { lightId: number }              — timestamp of last actual send per light (PER-LIGHT rate limit)
 // NOTE: This intentionally replaces the old single global _lastDirectSendMs.
 //       A global timer had a critical flaw: light 1 always reset the timer in
@@ -493,6 +493,16 @@ const lightLastKey = {};
 //       elapsed) and never sent commands.  Per-light timers let every light send
 //       independently without starving each other.
 const lightLastSendMs = {};
+
+// Per-light command budget. The Hue bridge sustains ~10 cmd/sec total, and each
+// bulb's Zigbee link reliably handles only ~1 cmd/sec — exceeding it makes the
+// bridge mark bulbs unreachable, which then flap as commands keep arriving.
+//   SEND_GAP_MS — minimum spacing between commands to ONE light (1 cmd/sec).
+//   JITTER      — ignore value changes smaller than this. DMX sources dither by
+//                 ±1-2 units even while "holding"; without this, that jitter
+//                 alone would stream a command every cycle and flood the bridge.
+const SEND_GAP_MS = 1000;
+const JITTER      = 3;
 
 // ── Per-bulb recovery ─────────────────────────────────────────────────────────
 // Set of light IDs (strings) the bridge has marked unreachable.
@@ -511,50 +521,39 @@ function updateCurrent(lightId, r, g, b, extra) {
 
 function clampByte(v) { return v < 0 ? 0 : v > 255 ? 255 : Math.round(v); }
 
-// Send a direct state update, respecting both the dedup cache and the
-// PER-LIGHT rate limit.
-//
-// Returns true if the command was dispatched.  Returns false — WITHOUT updating
-// lightLastKey — if the key is unchanged (dedup) or this light's cooldown has
-// not elapsed yet.  The next tick will retry automatically.
-//
-// The per-light minimum gap (default 500 ms = 2 cmd/sec per light) means:
-//  • Every light gets fair access — no light can starve another.
-//  • With 2 lights both sending at 2/sec, the total rate is 4 cmd/sec,
-//    well below the bridge's ~10 cmd/sec budget.
-//  • "Disable Rate Limiting" in Settings raises the limit to 0 (no floor).
-function tryDirectSend(lightId, key, payload) {
-  // Dedup — same endpoint already sent; nothing to do
-  if (lightLastKey[lightId] === key) return false;
-  // Per-light rate limit: minimum gap between consecutive sends TO THIS LIGHT
-  const minGap = config.noLimit ? 0 : 500; // 500 ms → 2 cmd/sec per light
-  const lastMs = lightLastSendMs[lightId] || 0;
-  if (minGap > 0 && Date.now() - lastMs < minGap) return false;
-  lightLastKey[lightId]   = key;
-  lightLastSendMs[lightId] = Date.now();
-  sendDirectState(lightId, payload);
-  return true;
-}
-
-// Each tick, send each light's CURRENT value (deduped + rate-limited) and let the
-// bridge interpolate over the follow-transition. This is deliberately simple and
-// predictable:
-//   • Unchanged value  → dedup skip (no command).
-//   • Changed value    → one command to the REAL value with a 300 ms transition.
-//   • Blackout (0,0,0) → instant off (tt 0).
-// The per-light rate limit in tryDirectSend() bounds this to 2 cmd/sec/light, so
-// even a continuous fade can't flood the bridge. We do NOT extrapolate toward the
-// rail any more — that optimisation predated the dedup + per-light limiter and
-// caused discrete commands to overshoot to full/black and, worse, get stuck on a
-// rail endpoint (ignoring further commands) when the source kept changing.
+// Each tick, send each light's CURRENT value and let the bridge interpolate over
+// the follow-transition. Deliberately simple and predictable — the value the
+// operator sets is the value that is sent — with two guards that keep the command
+// rate within what the bridge/Zigbee can actually sustain:
+//   • JITTER tolerance — skip changes smaller than a few units (source dither),
+//     so a "held" level doesn't stream commands forever.
+//   • SEND_GAP_MS rate cap — at most 1 command/sec to any one light.
+//   • Blackout (0,0,0) → off with tt 0 (and crossing the on/off boundary always
+//     sends, even if the numeric delta is tiny).
+// No velocity, no rail extrapolation — that optimisation caused discrete commands
+// to overshoot and, worse, get stuck on a rail endpoint and ignore later commands.
 function tickBridge() {
   if (!hueApi || !config.bridge || !config.user) return;
+  const now = Date.now();
   for (const [lightId, cur] of Object.entries(lightCurrent)) {
     if (config.disabledLights[lightId]) continue;
     const isBlackout = cur.r === 0 && cur.g === 0 && cur.b === 0;
-    const key = `${cur.r},${cur.g},${cur.b}`;
-    const tt  = isBlackout ? 0 : FOLLOW_TT;
-    tryDirectSend(lightId, key, buildDirectPayload(cur.r, cur.g, cur.b, { tt }));
+
+    const last = lightLastSent[lightId];
+    if (last) {
+      const diff = Math.max(Math.abs(cur.r - last.r), Math.abs(cur.g - last.g), Math.abs(cur.b - last.b));
+      if (diff === 0) continue;                                   // already at this value
+      const wasBlackout = last.r === 0 && last.g === 0 && last.b === 0;
+      // Ignore sub-JITTER source noise, but always act on an on/off transition.
+      if (diff < JITTER && isBlackout === wasBlackout) continue;
+    }
+
+    // Per-light rate cap — protects the bulb's Zigbee link.
+    if (!config.noLimit && now - (lightLastSendMs[lightId] || 0) < SEND_GAP_MS) continue;
+
+    lightLastSent[lightId]   = { r: cur.r, g: cur.g, b: cur.b };
+    lightLastSendMs[lightId] = now;
+    sendDirectState(lightId, buildDirectPayload(cur.r, cur.g, cur.b, { tt: isBlackout ? 0 : FOLLOW_TT }));
   }
 }
 
@@ -565,7 +564,7 @@ function startBridgeTicker() {
 function stopBridgeTicker() {
   if (bridgeTicker) { clearInterval(bridgeTicker); bridgeTicker = null; }
   for (const k of Object.keys(lightCurrent))    delete lightCurrent[k];
-  for (const k of Object.keys(lightLastKey))    delete lightLastKey[k];
+  for (const k of Object.keys(lightLastSent))    delete lightLastSent[k];
   for (const k of Object.keys(lightLastSendMs)) delete lightLastSendMs[k];
 }
 
@@ -605,7 +604,7 @@ function tickRecovery() {
 function sendRecoveryProbe(lightId) {
   if (!config.bridge || !config.user) return false;
 
-  // Honour the same per-light rate limit used by tryDirectSend
+  // Honour the same per-light rate limit used by the DMX ticker
   const minGap = config.noLimit ? 0 : 500;
   const lastMs = lightLastSendMs[lightId] || 0;
   if (minGap > 0 && Date.now() - lastMs < minGap) return false; // too soon — retry next cycle
@@ -660,7 +659,7 @@ function confirmReachability(sid) {
         if (body && body.state && body.state.reachable === true) {
           // Bridge confirms the bulb is back on the Zigbee mesh
           unreachableLights.delete(sid);
-          delete lightLastKey[sid]; // clear dedup so next DMX tick sends a full resync
+          delete lightLastSent[sid]; // clear dedup so next DMX tick sends a full resync
           console.log(`[recovery] Bulb ${sid} recovered — resuming DMX control`);
           if (mainWindow && !mainWindow.isDestroyed())
             mainWindow.webContents.send('bulb-recovered', { id: sid });
@@ -1154,7 +1153,7 @@ function syncUnreachableFromCache() {
       if (unreachableLights.has(sid)) {
         // Was unreachable, now showing online in the full fetch
         unreachableLights.delete(sid);
-        delete lightLastKey[sid];
+        delete lightLastSent[sid];
         console.log(`[recovery] Bulb ${sid} recovered (detected via poll) — resuming DMX control`);
         if (mainWindow && !mainWindow.isDestroyed())
           mainWindow.webContents.send('bulb-recovered', { id: sid });

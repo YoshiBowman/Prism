@@ -503,6 +503,12 @@ const lightLastKey = {};
 //       elapsed) and never sent commands.  Per-light timers let every light send
 //       independently without starving each other.
 const lightLastSendMs = {};
+// { lightId: number }              — consecutive ticks this light has been changing.
+// Velocity extrapolation projects toward the rail (0/255), which is correct for a
+// SUSTAINED fade but wrong for a one-shot step — a single jump would briefly
+// overshoot to full/black before correcting. We therefore only extrapolate once
+// motion has persisted for 2+ ticks; an isolated step is sent at its real value.
+const lightFadeStreak = {};
 
 // ── Per-bulb recovery ─────────────────────────────────────────────────────────
 // Set of light IDs (strings) the bridge has marked unreachable.
@@ -569,6 +575,7 @@ function tickBridge() {
 
     if (maxDelta < 2) {
       // Static — dedup prevents redundant calls
+      lightFadeStreak[lightId] = 0; // motion stopped — reset the fade detector
       const key = `s:${cur.r},${cur.g},${cur.b}`;
       const isBlackout  = cur.r === 0 && cur.g === 0 && cur.b === 0;
       const wasFading   = (lightLastKey[lightId] || '').startsWith('f:');
@@ -577,7 +584,21 @@ function tickBridge() {
       continue;
     }
 
-    // ── Fading: extrapolate to natural endpoint ────────────────────────────
+    // Something changed this tick. Only treat it as a fade once motion has
+    // persisted for 2+ consecutive ticks — a single isolated jump is a discrete
+    // step (or the leading edge of a fade) and must be sent at its REAL value, not
+    // extrapolated toward the rail (which would overshoot to full/black, then
+    // correct, producing the sluggish "hunting" the operator sees).
+    const streak = (lightFadeStreak[lightId] || 0) + 1;
+    lightFadeStreak[lightId] = streak;
+    if (streak < 2) {
+      const key = `s:${cur.r},${cur.g},${cur.b}`;
+      const tt0 = (cur.r === 0 && cur.g === 0 && cur.b === 0) ? 0 : FOLLOW_TT;
+      tryDirectSend(lightId, key, buildDirectPayload(cur.r, cur.g, cur.b, { tt: tt0 }));
+      continue;
+    }
+
+    // ── Sustained fade: extrapolate to natural endpoint ────────────────────────
     // velocity in units/ms over the last tick window
     const vr = dr / TICKER_MS;
     const vg = dg / TICKER_MS;
@@ -618,10 +639,11 @@ function startBridgeTicker() {
 
 function stopBridgeTicker() {
   if (bridgeTicker) { clearInterval(bridgeTicker); bridgeTicker = null; }
-  for (const k of Object.keys(lightCurrent))   delete lightCurrent[k];
-  for (const k of Object.keys(lightPrev))      delete lightPrev[k];
-  for (const k of Object.keys(lightLastKey))   delete lightLastKey[k];
+  for (const k of Object.keys(lightCurrent))    delete lightCurrent[k];
+  for (const k of Object.keys(lightPrev))       delete lightPrev[k];
+  for (const k of Object.keys(lightLastKey))    delete lightLastKey[k];
   for (const k of Object.keys(lightLastSendMs)) delete lightLastSendMs[k];
+  for (const k of Object.keys(lightFadeStreak)) delete lightFadeStreak[k];
 }
 
 // ── Per-bulb recovery poller ─────────────────────────────────────────────────

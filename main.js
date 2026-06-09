@@ -424,9 +424,14 @@ function sendRecoveryProbe(lightId) {
     res.resume(); // drain the PUT response — we don't trust it to confirm reachability
     // The bridge silently returns success for unreachable bulbs (it queues the command
     // internally rather than returning an error), so a clean PUT body does NOT mean the
-    // bulb actually responded over Zigbee. Follow up with a GET on the light's state to
-    // read the authoritative reachable flag, then decide whether to declare recovery.
-    res.on('end', () => confirmReachability(String(lightId)));
+    // bulb actually responded over Zigbee.
+    //
+    // After sending the probe the bridge begins a Zigbee round-trip and briefly sets
+    // reachable:true optimistically while that attempt is in flight — reading back
+    // immediately would catch that transient value and produce false recoveries.
+    // Wait 4 s to let the Zigbee exchange complete and the bridge settle on the real
+    // outcome before reading state.reachable.
+    res.on('end', () => setTimeout(() => confirmReachability(String(lightId)), 4000));
   });
   req.on('error', err => console.warn(`[recovery] PUT light ${lightId} error: ${err.message}`));
   req.write(probe);
@@ -528,10 +533,11 @@ function sendDirectState(lightId, payload) {
         return;
       }
       // Apparent success — but the bridge silently returns success for unreachable
-      // bulbs too (it queues the command). Confirm via GET before declaring recovery.
+      // bulbs too (it queues the command). Delay the GET so the bridge has time to
+      // complete the Zigbee round-trip and settle on the real reachable value.
       const sid = String(lightId);
       if (unreachableLights.has(sid)) {
-        confirmReachability(sid);
+        setTimeout(() => confirmReachability(sid), 4000);
       }
     });
   });

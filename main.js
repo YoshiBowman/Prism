@@ -1,6 +1,20 @@
 'use strict';
 
 const { app, BrowserWindow, ipcMain, Tray, nativeImage, screen } = require('electron');
+
+// ── Single-instance guard ─────────────────────────────────────────────────────
+// Two Prism instances (e.g. a Launch-at-Login packaged build hidden in the tray
+// plus a dev `npm start`) BOTH receive every DMX frame — the sACN/Art-Net sockets
+// bind with reuseAddr — and both send commands to the same bulbs. The doubled,
+// version-skewed traffic saturates the bridge's Zigbee radio and makes bulbs
+// flap unreachable no matter how well-behaved each instance is individually.
+// The lock is keyed on the shared userData dir, so it also dedupes across the
+// packaged app and the dev tree. Second instance exits immediately; the first
+// gets a `second-instance` event and raises its window.
+if (!app.requestSingleInstanceLock()) {
+  app.exit(0);
+}
+app.on('second-instance', () => { try { openMainWindow(); } catch {} });
 const path = require('path');
 const fs = require('fs');
 const os = require('os');

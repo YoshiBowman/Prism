@@ -91,13 +91,27 @@ jobs:
           merge-multiple: true
 
       - name: Bundle Companion module
-        # npm pack produces the package/-rooted tarball layout Companion's
-        # "Import module package" expects. A hand-rolled tar with any other
-        # root directory name imports silently as nothing — the module never
-        # appears in the connection search.
+        # Companion 4.x St() strips the leading directory prefix only when
+        # the FIRST tar entry is type "directory". npm pack never emits that
+        # entry, so package/companion/manifest.json never matches. The fix is
+        # to put companion/manifest.json at the root with no prefix — then the
+        # direct path comparison succeeds.
         run: |
-          cd companion-module
-          npm pack --pack-destination $GITHUB_WORKSPACE/dist/
+          VERSION=${GITHUB_REF_NAME#v}
+          python3 -c "
+import tarfile, os
+base = 'companion-module'
+out  = 'dist/companion-module-prism-${VERSION}.tgz'
+entries = [
+    ('main.js',                os.path.join(base, 'main.js')),
+    ('companion/manifest.json', os.path.join(base, 'companion/manifest.json')),
+    ('package.json',            os.path.join(base, 'package.json')),
+]
+with tarfile.open(out, 'w:gz') as tar:
+    for arcname, filepath in entries:
+        tar.add(filepath, arcname=arcname)
+print('Bundled:', out)
+"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

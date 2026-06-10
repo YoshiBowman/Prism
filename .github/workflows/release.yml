@@ -91,27 +91,37 @@ jobs:
           merge-multiple: true
 
       - name: Bundle Companion module
-        # Companion 4.x St() strips the leading directory prefix only when
-        # the FIRST tar entry is type "directory". npm pack never emits that
-        # entry, so package/companion/manifest.json never matches. The fix is
-        # to put companion/manifest.json at the root with no prefix — then the
-        # direct path comparison succeeds.
+        # Companion 4.x module import has two steps:
+        #   St()   - finds companion/manifest.json by stripping the first
+        #            directory prefix (set when the FIRST tar entry has
+        #            type="directory").
+        #   #Cc()  - extracts the tar with strip:1, removing that same prefix.
+        # Both steps require a package/ directory entry as the first entry.
+        # npm pack never emits that entry, so we build the tgz manually.
         run: |
           VERSION=${GITHUB_REF_NAME#v}
-          python3 -c "
-import tarfile, os
+          python3 - <<'PYEOF'
+import tarfile, os, sys
+
+version = os.environ.get('GITHUB_REF_NAME', 'v0').lstrip('v')
 base = 'companion-module'
-out  = 'dist/companion-module-prism-${VERSION}.tgz'
-entries = [
-    ('main.js',                os.path.join(base, 'main.js')),
-    ('companion/manifest.json', os.path.join(base, 'companion/manifest.json')),
-    ('package.json',            os.path.join(base, 'package.json')),
-]
+out  = f'dist/companion-module-prism-{version}.tgz'
+
 with tarfile.open(out, 'w:gz') as tar:
-    for arcname, filepath in entries:
+    # Explicit package/ directory entry MUST come first
+    di = tarfile.TarInfo(name='package/')
+    di.type = tarfile.DIRTYPE
+    di.mode = 0o755
+    tar.addfile(di)
+    for arcname, filepath in [
+        ('package/main.js',                os.path.join(base, 'main.js')),
+        ('package/companion/manifest.json', os.path.join(base, 'companion/manifest.json')),
+        ('package/package.json',            os.path.join(base, 'package.json')),
+    ]:
         tar.add(filepath, arcname=arcname)
+
 print('Bundled:', out)
-"
+PYEOF
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

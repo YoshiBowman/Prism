@@ -1,8 +1,8 @@
 {
 	"name": "companion-module-prism",
 	"version": "2.2.0",
-	"description": "Prism — Philips Hue DMX bridge module for Bitfocus Companion",
-	"main": "dist/index.js",
+	"description": "Prism \u2014 Philips Hue DMX bridge module for Bitfocus Companion",
+	"main": "main.js",
 	"license": "MIT",
 	"author": "YoshiBowman",
 	"homepage": "https://github.com/YoshiBowman/Prism",
@@ -18,5 +18,9 @@
 	},
 	"devDependencies": {
 		"esbuild": "^0.28.0"
-	}
+	},
+	"files": [
+		"main.js",
+		"companion/"
+	]
 }

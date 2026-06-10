@@ -91,12 +91,13 @@ jobs:
           merge-multiple: true
 
       - name: Bundle Companion module
+        # npm pack produces the package/-rooted tarball layout Companion's
+        # "Import module package" expects. A hand-rolled tar with any other
+        # root directory name imports silently as nothing — the module never
+        # appears in the connection search.
         run: |
-          VERSION=$(node -p "require('./companion-module/package.json').version")
-          cp -r companion-module /tmp/companion-module-prism
-          cd /tmp
-          tar -czf companion-module-prism-${VERSION}.tgz companion-module-prism/
-          mv companion-module-prism-${VERSION}.tgz $GITHUB_WORKSPACE/dist/
+          cd companion-module
+          npm pack --pack-destination $GITHUB_WORKSPACE/dist/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

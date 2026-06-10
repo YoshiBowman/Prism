@@ -493,21 +493,40 @@ const lightLastSent = {};
 //       elapsed) and never sent commands.  Per-light timers let every light send
 //       independently without starving each other.
 const lightLastSendMs = {};
+// { lightId: { r, g, b } }  — value seen on the PREVIOUS tick (movement detection only;
+//                             no velocity math, no extrapolation)
+const lightTickPrev = {};
+// { lightId: bool }         — was the value moving on the previous tick too?
+const lightMovingPrev = {};
 
 // Per-light command budget. The Hue bridge sustains ~10 cmd/sec total, and each
 // bulb's Zigbee link reliably handles only ~1 cmd/sec — exceeding it makes the
 // bridge mark bulbs unreachable, which then flap as commands keep arriving.
 //   SEND_GAP_MS — minimum spacing between commands to ONE light (1 cmd/sec).
+//   ONOFF_GAP_MS — reduced floor for on/off boundary crossings, so blackouts and
+//                 lights-up cues land fast (≤500 ms) but a 0↔full strobe still
+//                 can't exceed 2 cmd/sec/light.
 //   JITTER      — ignore value changes smaller than this. DMX sources dither by
 //                 ±1-2 units even while "holding"; without this, that jitter
 //                 alone would stream a command every cycle and flood the bridge.
-const SEND_GAP_MS = 1000;
-const JITTER      = 3;
+//   FADE_TT     — transition used while a value is actively moving: long enough
+//                 to cover the gap to the next send (1 s cadence + tick), so a
+//                 fade renders as one continuous glide instead of step-and-hold.
+const SEND_GAP_MS  = 1000;
+const ONOFF_GAP_MS = 500;
+const JITTER       = 3;
+const FADE_TT      = Math.round((SEND_GAP_MS + TICKER_MS) / 100); // 13 ds = 1.3 s
 
 // ── Per-bulb recovery ─────────────────────────────────────────────────────────
 // Set of light IDs (strings) the bridge has marked unreachable.
-// Populated from: fetchLights() seed on startup, sendDirectState() error type 7.
-// Cleared per-light when a recovery probe (or a normal DMX PUT) gets a success.
+// Populated from: fetchLights() seed on startup, sendDirectState() error responses,
+// and the 30 s health-check reachability sync (syncUnreachableFromCache).
+// Cleared per-light when confirmReachability() or the sync sees reachable:true.
+// CRITICAL INVARIANT: bulbs in this set receive NO DMX traffic (tickBridge skips
+// them) and NO probe traffic while DMX is active — commands to dead bulbs make
+// the bridge retry Zigbee delivery for seconds each, saturating the radio and
+// knocking LIVE bulbs unreachable. Breaking this invariant re-creates the
+// "bulbs keep dropping during shows" cascade.
 const unreachableLights = new Set();
 // setInterval handle for the recovery poller — null means not running.
 // DOUBLE-START GUARD: startRecoveryPoller() is a no-op when this is non-null.
@@ -521,39 +540,69 @@ function updateCurrent(lightId, r, g, b, extra) {
 
 function clampByte(v) { return v < 0 ? 0 : v > 255 ? 255 : Math.round(v); }
 
-// Each tick, send each light's CURRENT value and let the bridge interpolate over
-// the follow-transition. Deliberately simple and predictable — the value the
-// operator sets is the value that is sent — with two guards that keep the command
-// rate within what the bridge/Zigbee can actually sustain:
+// Each tick, send each light's CURRENT value and let the bridge interpolate.
+// Deliberately simple and predictable — the value the operator sets is the value
+// that is sent — with guards that keep the command rate within what the bridge
+// and each bulb's Zigbee link can actually sustain:
+//   • UNREACHABLE SKIP — bulbs the bridge has marked unreachable get ZERO DMX
+//     traffic. Every command to a dead bulb makes the bridge retry Zigbee
+//     delivery for seconds, eating the airtime live bulbs need; with even one
+//     dead bulb patched, that cascade knocks healthy bulbs unreachable too.
+//     The recovery system owns unreachable bulbs until they return.
 //   • JITTER tolerance — skip changes smaller than a few units (source dither),
 //     so a "held" level doesn't stream commands forever.
-//   • SEND_GAP_MS rate cap — at most 1 command/sec to any one light.
-//   • Blackout (0,0,0) → off with tt 0 (and crossing the on/off boundary always
-//     sends, even if the numeric delta is tiny).
-// No velocity, no rail extrapolation — that optimisation caused discrete commands
-// to overshoot and, worse, get stuck on a rail endpoint and ignore later commands.
+//   • SEND_GAP_MS rate cap — at most 1 command/sec to any one light
+//     (ONOFF_GAP_MS floor for on/off cues so blackouts land fast).
+//   • Adaptive transition, no velocity math: a SETTLED value sends with a quick
+//     300 ms ramp (snappy discrete cues); a value MOVING for 2+ ticks is a fade
+//     and sends with FADE_TT so consecutive 1/sec commands chain into one
+//     continuous glide. A value on its FIRST moving tick waits one tick (250 ms)
+//     to learn which it is. Blackout is always immediate with tt 0.
 function tickBridge() {
   if (!hueApi || !config.bridge || !config.user) return;
   const now = Date.now();
   for (const [lightId, cur] of Object.entries(lightCurrent)) {
     if (config.disabledLights[lightId]) continue;
-    const isBlackout = cur.r === 0 && cur.g === 0 && cur.b === 0;
 
+    // Movement detection — stamped every tick, even for skipped bulbs, so the
+    // state is current the moment a bulb recovers.
+    const tickPrev   = lightTickPrev[lightId];
+    const moving     = !!tickPrev && Math.max(
+      Math.abs(cur.r - tickPrev.r), Math.abs(cur.g - tickPrev.g), Math.abs(cur.b - tickPrev.b)) >= JITTER;
+    const movingPrev = !!lightMovingPrev[lightId];
+    lightTickPrev[lightId]   = { r: cur.r, g: cur.g, b: cur.b };
+    lightMovingPrev[lightId] = moving;
+
+    // Dead bulbs get no DMX traffic — the recovery system owns them.
+    if (unreachableLights.has(String(lightId))) continue;
+
+    const isBlackout = cur.r === 0 && cur.g === 0 && cur.b === 0;
     const last = lightLastSent[lightId];
+    const wasBlackout   = last ? (last.r === 0 && last.g === 0 && last.b === 0) : null;
+    const onOffBoundary = last != null && isBlackout !== wasBlackout;
+
     if (last) {
       const diff = Math.max(Math.abs(cur.r - last.r), Math.abs(cur.g - last.g), Math.abs(cur.b - last.b));
-      if (diff === 0) continue;                                   // already at this value
-      const wasBlackout = last.r === 0 && last.g === 0 && last.b === 0;
-      // Ignore sub-JITTER source noise, but always act on an on/off transition.
-      if (diff < JITTER && isBlackout === wasBlackout) continue;
+      if (diff === 0) continue;                                  // already at this value
+      if (diff < JITTER && !onOffBoundary) continue;             // source dither — ignore
     }
 
-    // Per-light rate cap — protects the bulb's Zigbee link.
-    if (!config.noLimit && now - (lightLastSendMs[lightId] || 0) < SEND_GAP_MS) continue;
+    // Per-light rate cap — protects the bulb's Zigbee link. On/off cues use the
+    // reduced floor so a blackout never waits a full second.
+    const gap = config.noLimit ? 0 : (onOffBoundary ? ONOFF_GAP_MS : SEND_GAP_MS);
+    if (gap > 0 && now - (lightLastSendMs[lightId] || 0) < gap) continue;
+
+    // Pick the transition that matches what the value is doing.
+    let tt;
+    if (isBlackout)          tt = 0;          // blackout: instant
+    else if (onOffBoundary)  tt = FOLLOW_TT;  // lights-up cue: act now, quick ramp
+    else if (!moving)        tt = FOLLOW_TT;  // settled target: snappy 300 ms
+    else if (movingPrev)     tt = FADE_TT;    // sustained fade: glide across the send gap
+    else continue;                            // first moving tick: wait one tick to classify
 
     lightLastSent[lightId]   = { r: cur.r, g: cur.g, b: cur.b };
     lightLastSendMs[lightId] = now;
-    sendDirectState(lightId, buildDirectPayload(cur.r, cur.g, cur.b, { tt: isBlackout ? 0 : FOLLOW_TT }));
+    sendDirectState(lightId, buildDirectPayload(cur.r, cur.g, cur.b, { tt }));
   }
 }
 
@@ -563,16 +612,25 @@ function startBridgeTicker() {
 
 function stopBridgeTicker() {
   if (bridgeTicker) { clearInterval(bridgeTicker); bridgeTicker = null; }
-  for (const k of Object.keys(lightCurrent))    delete lightCurrent[k];
+  for (const k of Object.keys(lightCurrent))     delete lightCurrent[k];
   for (const k of Object.keys(lightLastSent))    delete lightLastSent[k];
-  for (const k of Object.keys(lightLastSendMs)) delete lightLastSendMs[k];
+  for (const k of Object.keys(lightLastSendMs))  delete lightLastSendMs[k];
+  for (const k of Object.keys(lightTickPrev))    delete lightTickPrev[k];
+  for (const k of Object.keys(lightMovingPrev))  delete lightMovingPrev[k];
 }
 
 // ── Per-bulb recovery poller ─────────────────────────────────────────────────
-// Runs every 8 s and sends a lightweight probe to every bulb in unreachableLights.
-// Forcing the bridge to communicate with the bulb makes it attempt Zigbee contact.
-// When the bulb responds, the response contains no error objects — that's how we
-// detect recovery.  Normal DMX control resumes automatically on the next tick.
+// While IDLE (no DMX): every 8 s, send a non-destructive probe PUT to each bulb
+// in unreachableLights. The PUT forces the bridge to attempt Zigbee contact;
+// confirmReachability() then reads back state.reachable 4 s later.
+//
+// While DMX IS ACTIVE: send NO probe traffic at all. Probes to dead bulbs make
+// the bridge retry Zigbee delivery for seconds per attempt, eating the airtime
+// live bulbs need mid-show — probing during a show is how one dead bulb cascades
+// into "everything keeps going unreachable". In-show recovery instead rides on
+// the 30 s health-check reachability sync (GET-only, zero Zigbee cost): when a
+// bulb is re-powered it announces itself to the bridge on its own, the sync sees
+// reachable:true, and the ticker resumes sending to it automatically.
 //
 // DOUBLE-START GUARD: startRecoveryPoller() is a no-op if recoveryInterval !== null.
 
@@ -592,26 +650,31 @@ function stopRecoveryPoller() {
 function tickRecovery() {
   if (!hueApi || !config.bridge || !config.user) return;
   if (unreachableLights.size === 0) return;
+  if (isDmxActive()) return; // never add Zigbee load mid-show — see block comment
   for (const lightId of unreachableLights) {
     sendRecoveryProbe(lightId);
   }
 }
 
-// Send a single lightweight PUT to force the bridge to retry Zigbee contact.
-// Uses the same per-light rate-limit bucket as tickBridge so recovery probes
-// and normal DMX commands share the same budget per light.
-// Returns true if the probe was dispatched, false if rate-limited (skip this cycle).
+// Send a single non-destructive PUT to force the bridge to retry Zigbee contact.
+// The payload re-asserts the bulb's last known on/off state, so a successful
+// probe changes nothing visible (the old {on:true, bri:1} probe snapped
+// recovering bulbs to minimum brightness and fought with DMX).
+// Uses the same per-light rate-limit bucket as tickBridge.
+// Returns true if the probe was dispatched, false if skipped this cycle.
 function sendRecoveryProbe(lightId) {
   if (!config.bridge || !config.user) return false;
+  if (isDmxActive()) return false; // in-show recovery is handled by the 30 s sync
 
   // Honour the same per-light rate limit used by the DMX ticker
-  const minGap = config.noLimit ? 0 : 500;
   const lastMs = lightLastSendMs[lightId] || 0;
-  if (minGap > 0 && Date.now() - lastMs < minGap) return false; // too soon — retry next cycle
+  if (!config.noLimit && Date.now() - lastMs < SEND_GAP_MS) return false; // too soon — retry next cycle
 
   lightLastSendMs[lightId] = Date.now();
 
-  const probe = Buffer.from(JSON.stringify({ on: true, bri: 1, transitiontime: 0 }));
+  const cached = lightsCache.find(l => String(l.id) === String(lightId));
+  const lastOn = cached && cached.state ? !!cached.state.on : true;
+  const probe  = Buffer.from(JSON.stringify({ on: lastOn, transitiontime: 0 }));
   console.log(`[recovery] Attempting bulb ${lightId}…`);
 
   const req = http.request({

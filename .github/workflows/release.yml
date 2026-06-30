@@ -91,37 +91,22 @@ jobs:
           merge-multiple: true
 
       - name: Bundle Companion module
-        # Companion 4.x module import has two steps:
-        #   St()   - finds companion/manifest.json by stripping the first
-        #            directory prefix (set when the FIRST tar entry has
-        #            type="directory").
-        #   #Cc()  - extracts the tar with strip:1, removing that same prefix.
-        # Both steps require a package/ directory entry as the first entry.
-        # npm pack never emits that entry, so we build the tgz manually.
+        # Companion 4.x import needs the tarball rooted at a package/ directory:
+        # its St() finds companion/manifest.json by stripping the leading dir
+        # entry, and #Cc() extracts with strip:1. Staging the files under
+        # package/ and taring the directory yields exactly that layout — tar
+        # emits the package/ directory entry first — which npm pack does not.
         run: |
           VERSION=${GITHUB_REF_NAME#v}
-          python3 - <<'PYEOF'
-import tarfile, os, sys
-
-version = os.environ.get('GITHUB_REF_NAME', 'v0').lstrip('v')
-base = 'companion-module'
-out  = f'dist/companion-module-prism-{version}.tgz'
-
-with tarfile.open(out, 'w:gz') as tar:
-    # Explicit package/ directory entry MUST come first
-    di = tarfile.TarInfo(name='package/')
-    di.type = tarfile.DIRTYPE
-    di.mode = 0o755
-    tar.addfile(di)
-    for arcname, filepath in [
-        ('package/main.js',                os.path.join(base, 'main.js')),
-        ('package/companion/manifest.json', os.path.join(base, 'companion/manifest.json')),
-        ('package/package.json',            os.path.join(base, 'package.json')),
-    ]:
-        tar.add(filepath, arcname=arcname)
-
-print('Bundled:', out)
-PYEOF
+          rm -rf package
+          mkdir -p package/companion
+          cp companion-module/main.js                 package/main.js
+          cp companion-module/companion/manifest.json package/companion/manifest.json
+          cp companion-module/package.json            package/package.json
+          tar -czf "dist/companion-module-prism-${VERSION}.tgz" package
+          rm -rf package
+          echo "Bundled dist/companion-module-prism-${VERSION}.tgz:"
+          tar -tzf "dist/companion-module-prism-${VERSION}.tgz"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

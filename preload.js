@@ -31,6 +31,7 @@ contextBridge.exposeInMainWorld('hue', {
   searchNewLights: ()             => ipcRenderer.invoke('lights:search-new'),
   getNewLights:    ()             => ipcRenderer.invoke('lights:get-new'),
   renameLight:     (id, name)     => ipcRenderer.invoke('lights:rename', id, name),
+  addLight:        (id)           => ipcRenderer.invoke('lights:add', id),
   deleteLight:     (id)           => ipcRenderer.invoke('lights:delete', id),
 
   // Scenes

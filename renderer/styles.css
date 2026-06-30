@@ -871,6 +871,16 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
   font-size: 13px;
   width: 160px;
 }
+.discovery-add-btn { flex-shrink: 0; }
+.discovery-added-tag {
+  flex-shrink: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: #4ade80;
+  padding: 0 6px;
+  white-space: nowrap;
+}
+.discovery-found-row.discovery-added { opacity: 0.65; }
 
 /* ── Settings panel ─────────────────────────────────────────────────────────── */
 

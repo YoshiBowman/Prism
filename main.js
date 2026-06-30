@@ -552,6 +552,26 @@ function updateCurrent(lightId, r, g, b, extra) {
   lightCurrent[lightId] = { r, g, b, extra };
 }
 
+// Purge every piece of per-light runtime state keyed by this id. A Hue bridge
+// assigns the lowest free integer id to a newly paired bulb, so a freshly added
+// fixture very often REUSES the id of a previously deleted one. Without this
+// wipe the new bulb inherits the old fixture's cached colour (lightLastSent),
+// its dedup/movement baseline, and — most damagingly — a leftover entry in
+// unreachableLights, which makes tickBridge quarantine the brand-new bulb and
+// skip it on every DMX tick. That is the "newly added light is stuck and
+// uncontrollable" failure. Call this the moment a bulb is (re)added so it
+// starts from a clean slate. Object keys are strings, so the numeric and
+// string forms of the id address the same slot; we clear both defensively.
+function resetLightRuntimeState(lightId) {
+  const sid = String(lightId);
+  delete lightCurrent[sid];
+  delete lightLastSent[sid];
+  delete lightLastSendMs[sid];
+  delete lightTickPrev[sid];
+  delete lightMovingPrev[sid];
+  unreachableLights.delete(sid);
+}
+
 function clampByte(v) { return v < 0 ? 0 : v > 255 ? 255 : Math.round(v); }
 
 // Each tick, send each light's CURRENT value and let the bridge interpolate.
@@ -1846,6 +1866,46 @@ ipcMain.handle('lights:rename', async (event, lightId, name) => {
   } catch (err) {
     return { success: false, error: err.message };
   }
+});
+
+// Explicitly add a freshly discovered bulb to the working light list.
+// The bulb was already paired onto the bridge by the inclusion scan, so there
+// is nothing to pair here. "Adding" means giving the operator one clear action
+// that registers the fixture cleanly:
+//   1. wipe any stale per-id runtime state a reused bridge id may carry,
+//   2. make sure it is ENABLED and addresses sequentially (drop any leftover
+//      disable flag, custom DMX patch, or persisted control state from a prior
+//      fixture that held this id),
+//   3. give it a stable position at the end of the order,
+//   4. re-read the bridge so it lands in lightsCache with its REAL current
+//      state instead of anything cached.
+// This is what makes a newly added light controllable and DMX-responsive
+// immediately, with no restart.
+ipcMain.handle('lights:add', async (event, lightId) => {
+  if (!config.bridge || !config.user) return { success: false, error: 'Not connected' };
+  const sid   = String(lightId);
+  const numId = Number(lightId);
+  const id    = Number.isNaN(numId) ? lightId : numId;
+
+  // 1) Clean slate — drop cached colour, dedup baseline, quarantine flag, etc.
+  resetLightRuntimeState(sid);
+
+  // 2) Enable + clear leftover patch / persisted control state for this id
+  let patchCleared = false;
+  if (config.disabledLights[sid]) delete config.disabledLights[sid];
+  if (config.lightAddresses[sid] != null) { delete config.lightAddresses[sid]; patchCleared = true; }
+  if (config.lightStates[sid]    != null) delete config.lightStates[sid];
+
+  // 3) Stable ordering — append if not already tracked (numeric id to match
+  //    getOrderedLights()'s strict comparison against bridge ids)
+  if (!config.lightsOrder.some(o => String(o) === sid)) config.lightsOrder.push(id);
+
+  if (patchCleared) invalidateWatchedUniverses();
+  saveConfig();
+
+  // 4) Re-read so lightsCache + reachability reflect the bulb as it is right now
+  await fetchLights().catch(() => {});
+  return { success: true, id };
 });
 
 // Delete a light from the bridge and remove it from local state.

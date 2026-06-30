@@ -1751,21 +1751,32 @@ async function startDiscovery() {
         <input class="input discovery-rename-input" type="text" value="${found.name.replace(/"/g,'&quot;')}" style="display:none">
         <span class="hint">ID: ${found.id}</span>
       </div>
-      <button class="btn btn-secondary btn-sm discovery-rename-btn"     title="Rename">✎</button>
-      <button class="btn btn-primary   btn-sm discovery-rename-confirm" style="display:none" title="Confirm">✓</button>
+      <button class="btn btn-secondary btn-sm discovery-rename-btn"     title="Rename (optional)">✎</button>
+      <button class="btn btn-primary   btn-sm discovery-rename-confirm" style="display:none" title="Save name">✓</button>
+      <button class="btn btn-primary   btn-sm discovery-add-btn">+ Add</button>
+      <span class="discovery-added-tag" style="display:none">✓ Added</span>
     `;
 
     const nameSpan   = item.querySelector('.discovery-found-name');
     const nameInput  = item.querySelector('.discovery-rename-input');
     const renameBtn  = item.querySelector('.discovery-rename-btn');
     const confirmBtn = item.querySelector('.discovery-rename-confirm');
+    const addBtn     = item.querySelector('.discovery-add-btn');
+    const addedTag   = item.querySelector('.discovery-added-tag');
 
+    // ── Rename — optional and fully independent of adding ─────────────────────
     function enterEdit() {
       nameSpan.style.display   = 'none';
       nameInput.style.display  = '';
       renameBtn.style.display  = 'none';
       confirmBtn.style.display = '';
       nameInput.focus(); nameInput.select();
+    }
+    function exitEdit() {
+      nameSpan.style.display   = '';
+      nameInput.style.display  = 'none';
+      renameBtn.style.display  = '';
+      confirmBtn.style.display = 'none';
     }
     async function doRename() {
       const newName = nameInput.value.trim();
@@ -1779,19 +1790,42 @@ async function startDiscovery() {
           toast(`Rename failed: ${r.error || ''}`, 'error');
         }
       }
-      nameSpan.style.display   = '';
-      nameInput.style.display  = 'none';
-      renameBtn.style.display  = '';
-      confirmBtn.style.display = 'none';
+      exitEdit();
     }
-
     renameBtn.addEventListener('click',  enterEdit);
     confirmBtn.addEventListener('click', doRename);
     nameInput.addEventListener('keydown', e => {
       if (e.key === 'Enter')  doRename();
-      if (e.key === 'Escape') {
-        nameSpan.style.display = ''; nameInput.style.display = 'none';
-        renameBtn.style.display = ''; confirmBtn.style.display = 'none';
+      if (e.key === 'Escape') exitEdit();
+    });
+
+    // ── Add — the explicit, primary action ────────────────────────────────────
+    addBtn.addEventListener('click', async () => {
+      addBtn.disabled = true;
+      addBtn.textContent = 'Adding…';
+      // A reused bridge id may carry a previous fixture's control-tile state in
+      // the renderer; drop it from both the live map and the cached settings
+      // copy that buildControlCards re-seeds from, so the tile re-initialises
+      // from the real bulb instead of inheriting the old colour.
+      delete controlState[found.id];
+      delete controlState[String(found.id)];
+      if (state.settings && state.settings.lightStates) {
+        delete state.settings.lightStates[found.id];
+        delete state.settings.lightStates[String(found.id)];
+      }
+      const r = await window.hue.addLight(found.id);
+      if (r && r.success) {
+        renameBtn.style.display  = 'none';
+        confirmBtn.style.display = 'none';
+        addBtn.style.display     = 'none';
+        addedTag.style.display   = '';
+        item.classList.add('discovery-added');
+        toast(`Added "${found.name}"`, 'success');
+        await refreshLights(); // register in lights / control / monitor right away
+      } else {
+        addBtn.disabled = false;
+        addBtn.textContent = '+ Add';
+        toast(`Add failed: ${(r && r.error) || ''}`, 'error');
       }
     });
 
@@ -1817,7 +1851,7 @@ async function startDiscovery() {
       discoveryTimer = null;
       spinnerEl.style.display = 'none';
       statusEl.textContent = seenIds.size > 0
-        ? `Found ${seenIds.size} new light${seenIds.size !== 1 ? 's' : ''}. Click Done to add them to your list.`
+        ? `Found ${seenIds.size} new light${seenIds.size !== 1 ? 's' : ''}. Click + Add on each one you want, then Done.`
         : 'Scan complete — no new lights found. Make sure the bulb is powered on and close to the bridge.';
     }
   }

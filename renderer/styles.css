@@ -958,29 +958,175 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
   50%       { border-color: rgba(251,191,36,0.6); }
 }
 
-#control-toolbar {
+/* ── All Lights master row ──────────────────────────────────────────────────── */
+
+#master-row {
   display: flex;
   align-items: center;
-  gap: 8px;    /* was 12px */
+  gap: 16px;
+  background: var(--glass);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 16px;
   margin-bottom: 16px;
   flex-wrap: wrap;
 }
-.control-scenes-row {
+.master-label-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 76px;
+}
+.master-label  { font-size: 14px; font-weight: 600; white-space: nowrap; }
+.master-status { font-size: 11px; color: var(--text3); white-space: nowrap; }
+.master-bri-wrap {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-left: auto;
+  flex: 1;
+  min-width: 150px;
 }
-#scene-name-row {
+.master-btns { display: flex; align-items: center; gap: 8px; }
+
+/* ── Color palette (shared: master row, group bar, tiles) ───────────────────── */
+
+.palette {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+.palette-dot {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 1px solid rgba(255,255,255,0.25);
+  cursor: pointer;
+  padding: 0;
+  flex-shrink: 0;
+  position: relative;
+  transition: transform 120ms ease, box-shadow 120ms ease;
+}
+.palette-dot:hover  { transform: scale(1.15); }
+.palette-dot.active { box-shadow: 0 0 0 2px #0a0f1c, 0 0 0 3.5px var(--accent2); }
+.palette-custom {
+  background: conic-gradient(#f87171, #fbbf24, #34d399, #60a5fa, #a78bfa, #f87171);
+  display: inline-block;
+}
+.palette-custom input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+  width: 100%;
+  height: 100%;
+}
+
+/* ── Scenes toolbar ─────────────────────────────────────────────────────────── */
+
+#control-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+.ct-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--text3);
+  flex-shrink: 0;
+}
+#scene-chips {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 16px;  /* was 14px */
+  flex-wrap: wrap;
+  flex: 1;
+  min-width: 0;
 }
+.scene-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--glass2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 5px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  transition: border-color 150ms ease, background 150ms ease, color 150ms ease;
+}
+.scene-chip:hover { border-color: var(--border2); background: var(--glass3); }
+.scene-chip.applied { border-color: var(--green); color: var(--green); }
+.scene-chip-x {
+  border: none;
+  background: none;
+  color: var(--text3);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 0 0 2px;
+}
+.scene-chip-x:hover { color: var(--red); }
+.scene-chip.confirm-delete { border-color: var(--red); }
+.scene-chip.confirm-delete .scene-chip-x { color: var(--red); }
+.scene-chip-add {
+  border-style: dashed;
+  background: transparent;
+  color: var(--text2);
+}
+.scene-chip-add:hover { color: var(--text); }
+.scene-chip-input {
+  background: none;
+  border: none;
+  outline: none;
+  color: var(--text);
+  font-size: 12px;
+  width: 120px;
+}
+
+/* ── Group actions bar (select mode) ────────────────────────────────────────── */
+
+#group-actions {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  background: rgba(167,139,250,0.08);
+  border: 1px solid rgba(167,139,250,0.3);
+  border-radius: var(--radius-sm);
+  padding: 8px 16px;
+  margin-bottom: 16px;
+}
+#group-count {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent2);
+  min-width: 76px;
+  white-space: nowrap;
+}
+.btn-link-sm {
+  background: none;
+  border: none;
+  color: var(--accent2);
+  font-size: 11px;
+  cursor: pointer;
+  text-decoration: underline;
+  padding: 0;
+  flex-shrink: 0;
+}
+.btn-link-sm:hover { color: var(--text); }
 
 #control-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
   gap: 16px;   /* was 12px */
 }
 
@@ -992,19 +1138,16 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
   -webkit-backdrop-filter: var(--blur);
   border: 1px solid var(--border);
   border-radius: 18px;
-  padding: 16px;    /* was 14px 14px 12px */
+  padding: 14px 16px;
   overflow: hidden;
   display: flex;
   flex-direction: column;
-  gap: 8px;    /* was 10px */
-  min-height: 232px;
-  /* specific properties — no transition:all */
+  gap: 12px;
   transition: border-color 150ms ease, opacity 300ms ease;
 }
 .ctrl-tile.active {
   border-color: var(--border2);
 }
-.ctrl-tile.dmx-active { opacity: 0.4; pointer-events: none; }
 
 /* Unreachable bulb — dim the tile and stamp a badge so it can't be mistaken for off */
 .ctrl-tile.tile-unreachable { opacity: .45; }
@@ -1033,7 +1176,7 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
 .ctrl-tile-glow {
   position: absolute;
   inset: 0;
-  background: radial-gradient(circle at 50% 25%, var(--tile-color, white) 0%, transparent 65%);
+  background: radial-gradient(circle at 20% 20%, var(--tile-color, white) 0%, transparent 60%);
   opacity: 0;
   transition: opacity 400ms ease;
   pointer-events: none;
@@ -1042,64 +1185,37 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
 .ctrl-tile.active .ctrl-tile-glow { opacity: 0.12; }
 
 /* All tile content above the glow */
-.ctrl-tile-top,
-.ctrl-tile-mid,
-.ctrl-picker-strips,
-.ctrl-tile-bot { position: relative; z-index: 1; }
+.ctrl-head,
+.ctrl-bri-row,
+.ctrl-palette { position: relative; z-index: 1; }
 
-/* Top row: select dot + power button */
-.ctrl-tile-top {
+/* Header: swatch + name/status + toggle */
+.ctrl-head {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 10px;
 }
-.ctrl-sel-dot {
-  width: 14px; height: 14px;
-  border-radius: 50%;
-  border: 2px solid var(--border2);
-  background: transparent;
-  cursor: pointer;
-  padding: 0;
-  flex-shrink: 0;
-  transition: background 150ms ease, border-color 150ms ease;
-}
-.ctrl-sel-dot:hover { border-color: var(--accent2); }
-.ctrl-tile.selected .ctrl-sel-dot {
-  background: var(--accent2);
-  border-color: var(--accent2);
-}
-.ctrl-power-btn {
-  width: 32px; height: 32px;   /* was 34px — on 8px grid */
-  border-radius: 50%;
-  border: 1px solid var(--border2);
-  background: rgba(255,255,255,0.05);
-  font-size: 15px;
-  line-height: 1;
-  cursor: pointer;
+.ctrl-name-wrap {
+  flex: 1;
+  min-width: 0;
   display: flex;
-  align-items: center;
-  justify-content: center;
+  flex-direction: column;
+  gap: 1px;
+}
+.ctrl-tile-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ctrl-tile-sub {
+  font-size: 11px;
   color: var(--text3);
-  /* was transition:all .2s — specific properties only */
-  transition: background 150ms ease, border-color 150ms ease, color 150ms ease, box-shadow 150ms ease;
-}
-.ctrl-power-btn:active { transform: scale(0.93); }
-.ctrl-tile.active .ctrl-power-btn {
-  background: var(--tile-color, rgba(255,255,255,0.15));
-  border-color: transparent;
-  color: #fff;
-  box-shadow: 0 0 14px color-mix(in srgb, var(--tile-color) 50%, transparent);
-}
-
-/* Color swatch + strip pickers */
-.ctrl-tile-mid {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 4px 0 2px;
 }
 .ctrl-color-swatch {
-  width: 72px; height: 72px;
+  width: 34px; height: 34px;
   border-radius: 50%;
   background: rgba(255,255,255,0.08);
   border: 1px solid var(--border);
@@ -1107,49 +1223,57 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
   transition: box-shadow 400ms ease, background 120ms ease;
 }
 .ctrl-tile.active .ctrl-color-swatch {
-  box-shadow: 0 0 32px color-mix(in srgb, var(--tile-color) 65%, transparent);
+  box-shadow: 0 0 18px color-mix(in srgb, var(--tile-color) 65%, transparent);
 }
 
-/* Native OS color picker */
-.ctrl-picker-strips {
-  padding: 0 0 4px;
-}
-
-.ctrl-color-input {
-  -webkit-appearance: none;
-  appearance: none;
-  width: 100%;
-  height: 32px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  padding: 3px;
-  background: none;
-  transition: border-color 150ms ease;
-}
-.ctrl-color-input:hover { border-color: var(--border2); }
-.ctrl-color-input::-webkit-color-swatch-wrapper { padding: 0; border-radius: 5px; }
-.ctrl-color-input::-webkit-color-swatch { border: none; border-radius: 5px; }
-
-/* Bottom: name + brightness */
-.ctrl-tile-bot {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;   /* was 6px */
-}
-.ctrl-tile-name {
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--text2);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
 .ctrl-bri-row {
   display: flex;
   align-items: center;
-  gap: 8px;   /* was 6px */
+  gap: 8px;
 }
+
+/* Selection check bubble (visible in select mode only) */
+.sel-check {
+  position: absolute;
+  top: 12px; right: 12px;
+  width: 18px; height: 18px;
+  border-radius: 50%;
+  border: 2px solid var(--border2);
+  background: rgba(0,0,0,0.3);
+  display: none;
+  z-index: 3;
+}
+#control-grid.selecting .sel-check { display: block; }
+.ctrl-tile.selected .sel-check {
+  background: var(--accent2);
+  border-color: var(--accent2);
+}
+.ctrl-tile.selected .sel-check::after {
+  content: '';
+  position: absolute;
+  left: 4px; top: 1px;
+  width: 4px; height: 8px;
+  border: solid #fff;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+
+/* Select mode: cards become tap targets; their controls go inert */
+#control-grid.selecting .ctrl-tile { cursor: pointer; }
+#control-grid.selecting .ctrl-toggle,
+#control-grid.selecting .ctrl-bri-row,
+#control-grid.selecting .ctrl-palette {
+  pointer-events: none;
+  opacity: .4;
+}
+
+/* DMX takeover: the whole control surface locks while DMX owns the rig.
+   Tiles stay slightly brighter than the chrome so the live DMX colors the
+   dmx-update handler paints remain readable. */
+#panel-control.dmx-live #master-row,
+#panel-control.dmx-live #control-toolbar,
+#panel-control.dmx-live #group-actions { opacity: .45; pointer-events: none; }
+#panel-control.dmx-live .ctrl-tile     { opacity: .55; pointer-events: none; }
 
 /* Shared slider + value styles */
 .bri-slider {
@@ -1177,49 +1301,6 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
   width: 32px;
   text-align: right;
   flex-shrink: 0;
-}
-
-/* Group control bar */
-#group-bar {
-  display: flex;
-  align-items: center;
-  gap: 16px;    /* was 14px */
-  background: rgba(167,139,250,0.08);
-  border: 1px solid rgba(167,139,250,0.3);
-  border-radius: var(--radius-sm);
-  padding: 8px 16px;   /* was 10px 14px */
-  margin-bottom: 16px;  /* was 10px */
-  flex-wrap: wrap;
-}
-#group-bar-label {
-  font-size: 11px;
-  font-weight: 500;
-  color: var(--accent2);
-  white-space: nowrap;
-  min-width: 90px;
-}
-.group-bar-color {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex: 1;
-  min-width: 200px;
-}
-.group-bar-swatch {
-  width: 28px; height: 28px;
-  border-radius: 50%;
-  border: 1px solid var(--border2);
-  flex-shrink: 0;
-  background: #ffcc66;
-  transition: background 150ms ease;
-}
-/* color input inside group bar fills the available width */
-.group-bar-color .ctrl-picker-strips {
-  flex: 1;
-  padding: 0;
-}
-.group-bar-color .ctrl-color-input {
-  height: 28px;
 }
 
 /* ── Monitor panel ──────────────────────────────────────────────────────────── */

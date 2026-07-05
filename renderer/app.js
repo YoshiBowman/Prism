@@ -26,7 +26,14 @@ function showTab(name) {
   if (name === 'lights'   && state.connected) refreshLights();
   if (name === 'settings') refreshSettings();
   if (name === 'monitor'  && state.lights.length > 0) buildMonitorCards(state.lights);
-  if (name === 'control') { buildControlCards(state.lights); loadScenes(); refreshControlSwatches(); }
+  if (name === 'control') {
+    // Landing here before the Lights tab has ever loaded (e.g. restored last
+    // tab on launch) — fetch the lights so the grid isn't empty.
+    if (state.connected && state.lights.length === 0) refreshLights();
+    buildControlCards(state.lights);
+    loadScenes();
+    refreshControlSwatches();
+  }
 }
 
 tabs.forEach(t => t.addEventListener('click', () => {
@@ -1107,50 +1114,68 @@ document.getElementById('btn-update-dismiss').addEventListener('click', () => {
   updateBanner.style.display = 'none';
 });
 
-// ── Color picker helpers ──────────────────────────────────────────────────────
+// ── Color palette ─────────────────────────────────────────────────────────────
+// Preset swatches tuned for Hue bulbs — two whites first, then the hues —
+// plus a rainbow "custom" dot that opens the OS color picker.
 
-function hexToHsb(hex) {
-  const n = parseInt((hex || '#000000').replace('#', ''), 16);
-  const r = ((n >> 16) & 255) / 255, g = ((n >> 8) & 255) / 255, b = (n & 255) / 255;
-  const max = Math.max(r, g, b), d = max - Math.min(r, g, b);
-  const v = max, s = max === 0 ? 0 : d / max;
-  let h = 0;
-  if (d > 0) {
-    if      (max === r) h = (g - b) / d + (g < b ? 6 : 0);
-    else if (max === g) h = (b - r) / d + 2;
-    else                h = (r - g) / d + 4;
-    h /= 6;
-  }
-  return [h * 360, s, v]; // h: 0–360, s: 0–1, v: 0–1
-}
+const PALETTE = [
+  { hex: '#ffb46b', name: 'Warm white' },
+  { hex: '#ffe0b3', name: 'Soft white' },
+  { hex: '#ff4d3e', name: 'Red' },
+  { hex: '#ff9500', name: 'Orange' },
+  { hex: '#ffd60a', name: 'Yellow' },
+  { hex: '#30d158', name: 'Green' },
+  { hex: '#0a84ff', name: 'Blue' },
+  { hex: '#bf5af2', name: 'Purple' },
+];
 
-function hsbToHex(h, s, v) {
-  h = ((h % 360) + 360) % 360;
-  const i = Math.floor(h / 60) % 6, f = h / 60 - Math.floor(h / 60);
-  const p = v*(1-s), q = v*(1-f*s), t = v*(1-(1-f)*s);
-  const [r, g, b] = [[v,t,p],[q,v,p],[p,v,t],[p,q,v],[t,p,v],[v,p,q]][i];
-  return '#' + [r, g, b].map(x => Math.round(x*255).toString(16).padStart(2,'0')).join('');
-}
-
-// Build a pair of inline hue + saturation strip pickers.
-// onColor(hex) fires on every drag interaction; hex is always full-brightness.
-function buildColorStrips(initHex, onColor) {
+// Build a palette row: preset dots + custom picker.
+// onPick(hex) fires on any selection. el.setActive(hex) rings the matching
+// dot (or the custom dot when the color is off-palette).
+function buildPalette(onPick, opts = {}) {
   const el = document.createElement('div');
-  el.className = 'ctrl-picker-strips';
+  el.className = 'palette';
+  const dots = [];
+  for (const { hex, name } of PALETTE) {
+    const d = document.createElement('button');
+    d.className = 'palette-dot';
+    d.title = name;
+    d.style.background = hex;
+    d.dataset.hex = hex;
+    d.addEventListener('click', (e) => {
+      e.stopPropagation();
+      el.setActive(hex);
+      onPick(hex);
+    });
+    dots.push(d);
+    el.appendChild(d);
+  }
 
-  // Hidden native color input — opens the OS color picker on click
+  const custom = document.createElement('label');
+  custom.className = 'palette-dot palette-custom';
+  custom.title = 'Custom color…';
   const input = document.createElement('input');
   input.type = 'color';
-  input.value = initHex;
-  input.className = 'ctrl-color-input';
+  input.value = opts.initial || '#ffcc66';
+  const pickCustom = () => { el.setActive(input.value); onPick(input.value); };
+  input.addEventListener('input',  pickCustom);
+  input.addEventListener('change', pickCustom);
+  input.addEventListener('click', e => e.stopPropagation());
+  custom.addEventListener('click', e => e.stopPropagation());
+  custom.appendChild(input);
+  el.appendChild(custom);
 
-  input.addEventListener('input', () => onColor(input.value));
-  input.addEventListener('change', () => onColor(input.value));
-
-  el.appendChild(input);
-
-  // Allow external sync
-  el.setColor = hex => { input.value = hex; };
+  el.setActive = (hex) => {
+    let matched = false;
+    for (const d of dots) {
+      const on = !!hex && d.dataset.hex.toLowerCase() === String(hex).toLowerCase();
+      d.classList.toggle('active', on);
+      matched = matched || on;
+    }
+    custom.classList.toggle('active', !!hex && !matched);
+    if (hex && !matched) input.value = hex;   // keep the OS picker in sync
+  };
+  if (opts.initial) el.setActive(opts.initial);
   return el;
 }
 
@@ -1159,94 +1184,167 @@ function buildColorStrips(initHex, onColor) {
 const controlGrid       = document.getElementById('control-grid');
 const dmxOverrideBanner = document.getElementById('dmx-override-banner');
 const dmxOverrideInfo   = document.getElementById('dmx-override-info');
-const sceneSelect       = document.getElementById('scene-select');
-const sceneNameRow      = document.getElementById('scene-name-row');
+const panelControl      = document.getElementById('panel-control');
 
-// Group selection
+// ── All Lights master row ─────────────────────────────────────────────────────
+
+const masterBri    = document.getElementById('master-bri');
+const masterBriVal = document.getElementById('master-bri-val');
+const masterStatus = document.getElementById('master-status');
+
+// Iterate every light that can accept a command (skips unreachable bulbs so
+// group/master actions never stall the bridge in Zigbee retries).
+function eachControllableLight(fn) {
+  for (const light of state.lights) {
+    if (light.state && light.state.reachable === false) continue;
+    const s = controlState[light.id];
+    if (s) fn(light, s);
+  }
+}
+
+function repaintAllTiles() {
+  for (const light of state.lights) {
+    const tile = controlGrid.querySelector(`[data-light-id="${light.id}"]`);
+    const s    = controlState[light.id];
+    if (tile && s) paintTile(tile, s);
+  }
+  updateMasterStatus();
+}
+
+function updateMasterStatus() {
+  const total = state.lights.length;
+  if (total === 0) { masterStatus.textContent = ''; return; }
+  const on = state.lights.filter(l => controlState[l.id]?.on).length;
+  masterStatus.textContent = on === 0 ? 'All off' : on === total ? 'All on' : `${on} of ${total} on`;
+}
+
+document.getElementById('btn-all-on').addEventListener('click', () => {
+  eachControllableLight((light, s) => { s.on = true; sendLightState(light.id, s); });
+  repaintAllTiles();
+});
+document.getElementById('btn-all-off').addEventListener('click', () => {
+  eachControllableLight((light, s) => { s.on = false; sendLightState(light.id, s); });
+  repaintAllTiles();
+});
+
+// Master dimmer + color apply to the lights that are ON — All On/Off are the
+// explicit way to change power, so dragging the room fader can't blind-fire
+// fixtures that were deliberately dark.
+const sendMasterBri = debounce(() => {
+  const bri = parseInt(masterBri.value);
+  eachControllableLight((light, s) => {
+    if (!s.on) return;
+    s.bri = bri;
+    sendLightState(light.id, s);
+  });
+  repaintAllTiles();
+}, 120);
+masterBri.addEventListener('input', () => {
+  masterBriVal.textContent = `${masterBri.value}%`;
+  sendMasterBri();
+});
+
+const masterPalette = buildPalette(hex => {
+  eachControllableLight((light, s) => {
+    if (!s.on) return;
+    s.rgb = hex;
+    sendLightState(light.id, s);
+  });
+  repaintAllTiles();
+});
+document.getElementById('master-palette').replaceWith(masterPalette);
+masterPalette.id = 'master-palette';
+
+// ── Select mode (group control) ───────────────────────────────────────────────
+// Toolbar "Select" toggles a mode where tapping cards selects them; the group
+// actions bar then drives every selected light at once.
+
+let selectMode = false;
 const selectedLights = new Set();
-let groupHex = '#ffcc66'; // persists across group bar rebuilds
+const groupActions   = document.getElementById('group-actions');
+const btnSelectMode  = document.getElementById('btn-select-mode');
+const groupBriEl     = document.getElementById('group-bri');
 
-function getGroupBar() { return document.getElementById('group-bar'); }
-
-function updateGroupBar() {
-  let bar = getGroupBar();
-  if (selectedLights.size < 1) {
-    if (bar) bar.remove();
-    return;
-  }
-  if (!bar) {
-    bar = document.createElement('div');
-    bar.id = 'group-bar';
-    bar.innerHTML = `
-      <span id="group-bar-label"></span>
-      <div class="group-bar-color">
-        <div class="group-bar-swatch"></div>
-      </div>
-      <div style="display:flex;align-items:center;gap:8px">
-        <span style="font-size:11px;color:var(--text3)">Bri</span>
-        <input type="range" min="1" max="100" value="100" class="bri-slider" id="group-bri" style="width:110px">
-        <span id="group-bri-val" class="bri-val">100%</span>
-      </div>
-      <button class="btn btn-secondary btn-sm" id="group-clear">✕ Clear</button>`;
-    controlGrid.parentElement.insertBefore(bar, controlGrid);
-
-    const groupSwatch = bar.querySelector('.group-bar-swatch');
-    const groupBri    = bar.querySelector('#group-bri');
-    const groupBriVal = bar.querySelector('#group-bri-val');
-
-    const sendGroup = debounce(() => {
-      const rgb = groupHex;
-      const bri = parseInt(groupBri.value);
-      for (const id of selectedLights) {
-        controlState[id] = { ...controlState[id], rgb, bri, on: true };
-        sendLightState(id, controlState[id]);
-        const tile = controlGrid.querySelector(`[data-light-id="${id}"]`);
-        if (tile) {
-          applyTileVisual(tile, controlState[id]);
-          tile.querySelector('.ctrl-bri').value      = bri;
-          tile.querySelector('.bri-val').textContent = `${bri}%`;
-          // keep per-tile strips in sync
-          const tileStrips = tile.querySelector('.ctrl-picker-strips');
-          if (tileStrips && tileStrips.setColor) tileStrips.setColor(rgb);
-        }
-      }
-    }, 80);
-
-    // Build hue+sat strips for group bar
-    const groupStrips = buildColorStrips(groupHex, hex => {
-      groupHex = hex;
-      groupSwatch.style.background = hex;
-      sendGroup();
-    });
-    bar.querySelector('.group-bar-color').appendChild(groupStrips);
-    groupSwatch.style.background = groupHex;
-
-    groupBri.addEventListener('input', e => {
-      groupBriVal.textContent = `${e.target.value}%`;
-      sendGroup();
-    });
-    bar.querySelector('#group-clear').addEventListener('click', () => {
-      selectedLights.clear();
-      controlGrid.querySelectorAll('.ctrl-tile.selected')
-        .forEach(c => c.classList.remove('selected'));
-      updateGroupBar();
-    });
-  }
-  bar.querySelector('#group-bar-label').textContent =
-    `${selectedLights.size} light${selectedLights.size > 1 ? 's' : ''} selected`;
+function toggleTileSelected(id, tile) {
+  const key = String(id);
+  if (selectedLights.has(key)) { selectedLights.delete(key); tile.classList.remove('selected'); }
+  else                         { selectedLights.add(key);    tile.classList.add('selected'); }
+  updateGroupCount();
 }
 
-function toggleCardSelect(lightId, card) {
-  if (selectedLights.has(lightId)) {
-    selectedLights.delete(lightId);
-    card.classList.remove('selected');
-  } else {
-    selectedLights.add(lightId);
-    card.classList.add('selected');
-  }
-  updateGroupBar();
+function updateGroupCount() {
+  document.getElementById('group-count').textContent = `${selectedLights.size} selected`;
+  const none = selectedLights.size === 0;
+  document.getElementById('btn-group-on').disabled  = none;
+  document.getElementById('btn-group-off').disabled = none;
 }
-const sceneNameInput    = document.getElementById('scene-name-input');
+
+function enterSelectMode() {
+  selectMode = true;
+  controlGrid.classList.add('selecting');
+  groupActions.style.display = 'flex';
+  btnSelectMode.textContent = 'Done';
+  btnSelectMode.classList.replace('btn-secondary', 'btn-primary');
+  updateGroupCount();
+}
+
+function exitSelectMode() {
+  selectMode = false;
+  selectedLights.clear();
+  controlGrid.classList.remove('selecting');
+  controlGrid.querySelectorAll('.ctrl-tile.selected').forEach(t => t.classList.remove('selected'));
+  groupActions.style.display = 'none';
+  btnSelectMode.textContent = 'Select';
+  btnSelectMode.classList.replace('btn-primary', 'btn-secondary');
+}
+
+btnSelectMode.addEventListener('click', () => (selectMode ? exitSelectMode() : enterSelectMode()));
+
+document.getElementById('btn-group-all').addEventListener('click', () => {
+  controlGrid.querySelectorAll('.ctrl-tile').forEach(t => {
+    const id = String(t.dataset.lightId);
+    if (!selectedLights.has(id)) { selectedLights.add(id); t.classList.add('selected'); }
+  });
+  updateGroupCount();
+});
+
+function eachSelected(fn) {
+  for (const id of selectedLights) {
+    const light = state.lights.find(l => String(l.id) === id);
+    if (!light) continue;
+    if (light.state && light.state.reachable === false) continue;
+    const s = controlState[light.id];
+    if (s) fn(light, s);
+  }
+}
+
+document.getElementById('btn-group-on').addEventListener('click', () => {
+  eachSelected((l, s) => { s.on = true; sendLightState(l.id, s); });
+  repaintAllTiles();
+});
+document.getElementById('btn-group-off').addEventListener('click', () => {
+  eachSelected((l, s) => { s.on = false; sendLightState(l.id, s); });
+  repaintAllTiles();
+});
+
+// Group color/brightness turn the selection on — acting on a selection is an
+// explicit "light these up" intent, unlike the ambient master fader.
+const sendGroupBri = debounce(() => {
+  const bri = parseInt(groupBriEl.value);
+  eachSelected((l, s) => { s.bri = bri; s.on = true; sendLightState(l.id, s); });
+  repaintAllTiles();
+}, 120);
+groupBriEl.addEventListener('input', () => {
+  document.getElementById('group-bri-val').textContent = `${groupBriEl.value}%`;
+  sendGroupBri();
+});
+
+const groupPalette = buildPalette(hex => {
+  eachSelected((l, s) => { s.rgb = hex; s.on = true; sendLightState(l.id, s); });
+  repaintAllTiles();
+});
+document.getElementById('group-palette').replaceWith(groupPalette);
+groupPalette.id = 'group-palette';
 
 // Debounce helper
 function debounce(fn, ms) {
@@ -1262,19 +1360,30 @@ const persistControlState = debounce(() => {
   window.hue.saveSettings({ lightStates: { ...controlState } });
 }, 1500);
 
-// Apply color + on/off visuals to a tile element
-function applyTileVisual(tile, s) {
+// Paint every on/off + color visual on a tile from its control state.
+// Skips the brightness slider while the user is dragging it.
+function paintTile(tile, s) {
   tile.style.setProperty('--tile-color', s.rgb);
   tile.classList.toggle('active', !!s.on);
   const swatch = tile.querySelector('.ctrl-color-swatch');
-  if (swatch) swatch.style.background = s.on ? s.rgb : '';
+  if (swatch) swatch.style.background = s.on ? s.rgb : 'rgba(255,255,255,0.08)';
+  const sub = tile.querySelector('.ctrl-tile-sub');
+  if (sub) sub.textContent = s.on ? `On · ${s.bri}%` : 'Off';
+  const tog = tile.querySelector('.ctrl-toggle input');
+  if (tog) tog.checked = !!s.on;
+  const bri = tile.querySelector('.ctrl-bri');
+  if (bri && document.activeElement !== bri) bri.value = s.bri;
+  const briVal = tile.querySelector('.bri-val');
+  if (briVal) briVal.textContent = `${s.bri}%`;
+  const pal = tile.querySelector('.palette');
+  if (pal && pal.setActive) pal.setActive(s.rgb);
 }
 
 function buildControlCards(lights) {
-  selectedLights.clear();
-  updateGroupBar();
+  exitSelectMode(); // selections can't survive a rebuild
   if (!lights || lights.length === 0) {
     controlGrid.innerHTML = '<div class="empty-state"><p>Connect to a bridge and load lights first</p></div>';
+    updateMasterStatus();
     return;
   }
   controlGrid.innerHTML = '';
@@ -1293,66 +1402,76 @@ function buildControlCards(lights) {
     const s = controlState[light.id];
 
     const tile = document.createElement('div');
-    tile.className      = 'ctrl-tile' + (s.on ? ' active' : '')
+    tile.className = 'ctrl-tile'
       + (light.state && light.state.reachable === false ? ' tile-unreachable' : '');
     tile.dataset.lightId = light.id;
-    tile.style.setProperty('--tile-color', s.rgb);
     tile.innerHTML = `
       <div class="ctrl-tile-glow"></div>
-      <div class="ctrl-tile-top">
-        <button class="ctrl-sel-dot" title="Select for group control"></button>
-        <button class="ctrl-power-btn" title="Toggle on/off">⏻</button>
-      </div>
-      <div class="ctrl-tile-mid">
-        <div class="ctrl-color-swatch" style="background:${getLightColor(light)}"></div>
-      </div>
-      <div class="ctrl-tile-bot">
-        <span class="ctrl-tile-name">${light.name}</span>
-        <div class="ctrl-bri-row">
-          <input type="range" min="1" max="100" value="${s.bri}" class="bri-slider ctrl-bri">
-          <span class="bri-val">${s.bri}%</span>
+      <div class="sel-check"></div>
+      <div class="ctrl-head">
+        <div class="ctrl-color-swatch"></div>
+        <div class="ctrl-name-wrap">
+          <span class="ctrl-tile-name" title="${light.name.replace(/"/g, '&quot;')}">${light.name}</span>
+          <span class="ctrl-tile-sub">Off</span>
         </div>
+        <label class="toggle ctrl-toggle" title="On / Off">
+          <input type="checkbox">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <div class="ctrl-bri-row">
+        <input type="range" min="1" max="100" value="${s.bri}" class="bri-slider ctrl-bri">
+        <span class="bri-val">${s.bri}%</span>
       </div>`;
 
-    // Insert hue + sat strip picker between mid and bot
-    const sendColor = debounce(rgb => {
-      s.rgb = rgb;
-      applyTileVisual(tile, s);
+    // Color palette — picking a color turns the light on (what you'd expect
+    // from tapping a color in any smart-home app)
+    const pal = buildPalette(hex => {
+      s.rgb = hex;
+      s.on  = true;
+      paintTile(tile, s);
+      sendLightState(light.id, s);
+    }, { initial: s.rgb });
+    pal.classList.add('ctrl-palette');
+    tile.appendChild(pal);
+
+    // On/off toggle
+    tile.querySelector('.ctrl-toggle input').addEventListener('change', (e) => {
+      s.on = e.target.checked;
+      paintTile(tile, s);
+      sendLightState(light.id, s);
+    });
+    tile.querySelector('.ctrl-toggle').addEventListener('click', e => e.stopPropagation());
+
+    // Brightness — dragging while off turns the light on
+    const sendBri = debounce((bri) => {
+      s.bri = bri;
+      if (!s.on) { s.on = true; paintTile(tile, s); }
       sendLightState(light.id, s);
     }, 80);
-    const strips = buildColorStrips(s.rgb, sendColor);
-    tile.querySelector('.ctrl-tile-mid').after(strips);
-
-    tile.querySelector('.ctrl-sel-dot').addEventListener('click', (e) => {
-      e.stopPropagation();
-      toggleCardSelect(light.id, tile);
-    });
-
-    tile.querySelector('.ctrl-power-btn').addEventListener('click', () => {
-      s.on = !s.on;
-      applyTileVisual(tile, s);
-      sendLightState(light.id, s);
-    });
-
-    const sendBri = debounce((bri) => { s.bri = bri; sendLightState(light.id, s); }, 80);
     tile.querySelector('.ctrl-bri').addEventListener('input', (e) => {
       const bri = parseInt(e.target.value);
       tile.querySelector('.bri-val').textContent = `${bri}%`;
       sendBri(bri);
     });
 
-    controlGrid.appendChild(tile);
-  }
+    // In select mode, tapping anywhere on the card toggles selection
+    tile.addEventListener('click', () => {
+      if (selectMode) toggleTileSelected(light.id, tile);
+    });
 
-  // Re-apply DMX override dimming if it was active when the tab was re-entered
-  if (state.dmxActive) {
-    dmxOverrideBanner.style.display = 'flex';
-    controlGrid.querySelectorAll('.ctrl-tile').forEach(c => c.classList.add('dmx-active'));
+    controlGrid.appendChild(tile);
+    paintTile(tile, s);
   }
+  updateMasterStatus();
+
+  // Re-show the override banner if DMX was active when the tab was re-entered
+  if (state.dmxActive) dmxOverrideBanner.style.display = 'flex';
 }
 
-// Fetch fresh bridge states and update ctrl-tile swatches to reflect reality.
-// Skipped when DMX is active — the dmx-update handler keeps them live instead.
+// Pull fresh bridge state and make the tiles reflect reality: on/off, level,
+// reachability, and the real bulb color on the swatch/glow. Skipped while DMX
+// is active — the dmx-update handler keeps tiles live instead.
 async function refreshControlSwatches() {
   if (!state.connected || state.dmxActive) return;
   const res = await window.hue.getLights();
@@ -1360,16 +1479,28 @@ async function refreshControlSwatches() {
   for (const light of res.lights) {
     const tile = controlGrid.querySelector(`[data-light-id="${light.id}"]`);
     if (!tile) continue;
-    const color = getLightColor(light);
-    const swatch = tile.querySelector('.ctrl-color-swatch');
-    if (swatch) swatch.style.background = color;
-    tile.style.setProperty('--tile-color', color);
-    tile.classList.toggle('active', !!(light.state && light.state.on));
+    const s = controlState[light.id];
+    if (s && light.state) {
+      s.on = !!light.state.on;
+      if (light.state.bri != null) s.bri = Math.max(1, Math.round((light.state.bri / 254) * 100));
+      paintTile(tile, s);
+      if (s.on) {
+        // Show the bulb's actual color (hue/sat from the bridge), which can
+        // differ from the stored hex if something else changed the light.
+        const color = getLightColor(light);
+        const swatch = tile.querySelector('.ctrl-color-swatch');
+        if (swatch) swatch.style.background = color;
+        tile.style.setProperty('--tile-color', color);
+      }
+    }
+    tile.classList.toggle('tile-unreachable', !!(light.state && light.state.reachable === false));
   }
+  updateMasterStatus();
 }
 
 async function sendLightState(lightId, s) {
   persistControlState();
+  updateMasterStatus();
   if (!s.on) {
     await window.hue.setLightState(lightId, { on: false });
     return;
@@ -1377,81 +1508,112 @@ async function sendLightState(lightId, s) {
   await window.hue.setLightState(lightId, { on: true, rgb: s.rgb, bri: s.bri });
 }
 
-// DMX takeover — dim tiles while DMX is active
+// DMX takeover — lock the whole control surface while DMX owns the rig
 window.hue.on('dmx:takeover-change', ({ active }) => {
   const wasActive = state.dmxActive;
-  state.dmxActive = active; // persist so buildControlCards can re-apply on tab re-entry
+  state.dmxActive = active;
   dmxOverrideBanner.style.display = active ? 'flex' : 'none';
-  controlGrid.querySelectorAll('.ctrl-tile').forEach(c => c.classList.toggle('dmx-active', active));
+  panelControl.classList.toggle('dmx-live', active);
   dmxOverrideInfo.textContent = '';
-  // When DMX stops, the tiles are showing the last DMX values rather than the
-  // real bulb state. Pull fresh state from the bridge so the control tab reflects
-  // reality once the override clears. (refreshControlSwatches no-ops if DMX active.)
+  // When DMX stops, tiles show the last DMX values rather than the real bulb
+  // state — pull fresh state so the tab reflects reality again.
   if (wasActive && !active) refreshControlSwatches();
 });
 
-// ── Scenes ────────────────────────────────────────────────────────────────────
+// Companion applied a preset behind our back — re-sync tiles to the bridge
+window.hue.on('companion:preset-applied', () => { refreshControlSwatches(); });
+
+// ── Scenes (chips) ────────────────────────────────────────────────────────────
+// Every scene is a pill: click applies it, ✕ deletes (click twice to confirm),
+// and the dashed "+ Save Scene" chip snapshots the current look inline.
+
+let scenesCache = {}; // { name: [ { id, on, rgb, bri } ] } — for tile sync on apply
+
+// Reflect an applied scene in the tiles immediately (the bridge fade takes a
+// moment; the UI shouldn't wait for it).
+function syncTilesFromScene(name) {
+  for (const entry of scenesCache[name] || []) {
+    const s = controlState[entry.id];
+    if (!s) continue;
+    s.on = !!entry.on;
+    if (entry.rgb)        s.rgb = entry.rgb;
+    if (entry.bri != null) s.bri = entry.bri;
+  }
+  repaintAllTiles();
+  persistControlState();
+}
 
 async function loadScenes() {
-  const scenes = await window.hue.getScenes();
-  sceneSelect.innerHTML = '<option value="">— No scene —</option>';
-  for (const name of Object.keys(scenes)) {
-    const opt = document.createElement('option');
-    opt.value = opt.textContent = name;
-    sceneSelect.appendChild(opt);
+  scenesCache = await window.hue.getScenes() || {};
+  const sceneChips = document.getElementById('scene-chips');
+  sceneChips.innerHTML = '';
+
+  for (const name of Object.keys(scenesCache)) {
+    const chip = document.createElement('div');
+    chip.className = 'scene-chip';
+    chip.innerHTML = `<span class="scene-chip-name"></span><button class="scene-chip-x" title="Delete scene">✕</button>`;
+    chip.querySelector('.scene-chip-name').textContent = name;
+
+    chip.addEventListener('click', async (e) => {
+      if (e.target.closest('.scene-chip-x')) return;
+      const res = await window.hue.applyScene(name);
+      if (res.success) {
+        chip.classList.add('applied');
+        setTimeout(() => chip.classList.remove('applied'), 900);
+        syncTilesFromScene(name);
+      } else {
+        toast(`Scene failed: ${(res.errors || []).join(', ')}`, 'error');
+      }
+    });
+
+    const x = chip.querySelector('.scene-chip-x');
+    let confirmTimer = null;
+    x.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      if (chip.classList.contains('confirm-delete')) {
+        clearTimeout(confirmTimer);
+        await window.hue.deleteScene(name);
+        chip.remove();
+        toast(`Scene "${name}" deleted`, 'info');
+      } else {
+        chip.classList.add('confirm-delete');
+        confirmTimer = setTimeout(() => chip.classList.remove('confirm-delete'), 2500);
+      }
+    });
+
+    sceneChips.appendChild(chip);
   }
-  const hasSel = sceneSelect.value !== '';
-  document.getElementById('btn-apply-scene').disabled  = !hasSel;
-  document.getElementById('btn-delete-scene').disabled = !hasSel;
+
+  // "+ Save Scene" chip — transforms into an inline name input
+  const add = document.createElement('div');
+  add.className = 'scene-chip scene-chip-add';
+  add.textContent = '+ Save Scene';
+  add.title = 'Save the current look as a scene';
+  add.addEventListener('click', () => {
+    if (add.querySelector('input')) return;
+    add.textContent = '';
+    const inp = document.createElement('input');
+    inp.className   = 'scene-chip-input';
+    inp.placeholder = 'Scene name…';
+    add.appendChild(inp);
+    inp.focus();
+    const cancel = () => { if (add.isConnected) { add.textContent = '+ Save Scene'; } };
+    inp.addEventListener('keydown', async (e) => {
+      if (e.key === 'Escape') { cancel(); return; }
+      if (e.key !== 'Enter') return;
+      const name = inp.value.trim();
+      if (!name) { cancel(); return; }
+      const snapshot = state.lights
+        .filter(l => controlState[l.id])
+        .map(l => ({ id: l.id, ...controlState[l.id] }));
+      await window.hue.saveScene(name, snapshot);
+      toast(`Scene "${name}" saved`, 'success');
+      await loadScenes();
+    });
+    inp.addEventListener('blur', () => setTimeout(cancel, 100));
+  });
+  sceneChips.appendChild(add);
 }
-
-sceneSelect.addEventListener('change', () => {
-  const hasSel = sceneSelect.value !== '';
-  document.getElementById('btn-apply-scene').disabled  = !hasSel;
-  document.getElementById('btn-delete-scene').disabled = !hasSel;
-});
-
-document.getElementById('btn-apply-scene').addEventListener('click', async () => {
-  const name = sceneSelect.value;
-  if (!name) return;
-  const res = await window.hue.applyScene(name);
-  toast(res.success ? `Scene "${name}" applied` : `Failed: ${(res.errors || []).join(', ')}`,
-        res.success ? 'success' : 'error');
-});
-
-document.getElementById('btn-save-scene').addEventListener('click', () => {
-  sceneNameRow.style.display = 'flex';
-  sceneNameInput.value = '';
-  sceneNameInput.focus();
-});
-
-document.getElementById('btn-scene-name-confirm').addEventListener('click', saveCurrentScene);
-sceneNameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') saveCurrentScene(); });
-
-async function saveCurrentScene() {
-  const name = sceneNameInput.value.trim();
-  if (!name) return;
-  sceneNameRow.style.display = 'none';
-
-  const snapshot = Object.entries(controlState).map(([id, s]) => ({ id, ...s }));
-  await window.hue.saveScene(name, snapshot);
-  await loadScenes();
-  sceneSelect.value = name;
-  sceneSelect.dispatchEvent(new Event('change'));
-  toast(`Scene "${name}" saved`, 'success');
-}
-
-document.getElementById('btn-scene-name-cancel').addEventListener('click', () => {
-  sceneNameRow.style.display = 'none';
-});
-
-document.getElementById('btn-delete-scene').addEventListener('click', async () => {
-  const name = sceneSelect.value;
-  if (!name) return;
-  await window.hue.deleteScene(name);
-  await loadScenes();
-  toast(`Scene "${name}" deleted`, 'info');
-});
 
 // ── Monitor panel ─────────────────────────────────────────────────────────────
 

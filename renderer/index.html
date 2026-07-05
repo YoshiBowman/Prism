@@ -240,21 +240,43 @@
       <span class="hint" style="margin-left:auto">Native control resumes 2 s after last DMX packet</span>
     </div>
 
-    <!-- Toolbar: priority threshold + scenes -->
-    <div id="control-toolbar">
-      <div class="control-scenes-row">
-        <select id="scene-select" class="select select-sm"><option value="">— No scene —</option></select>
-        <button id="btn-apply-scene"  class="btn btn-primary btn-sm"   disabled>Apply</button>
-        <button id="btn-save-scene"   class="btn btn-secondary btn-sm">Save Scene</button>
-        <button id="btn-delete-scene" class="btn btn-secondary btn-sm" disabled>Delete</button>
+    <!-- All Lights master row -->
+    <div id="master-row">
+      <div class="master-label-wrap">
+        <span class="master-label">All Lights</span>
+        <span id="master-status" class="master-status"></span>
+      </div>
+      <div id="master-palette"></div>
+      <div class="master-bri-wrap">
+        <input type="range" min="1" max="100" value="100" class="bri-slider" id="master-bri">
+        <span id="master-bri-val" class="bri-val">100%</span>
+      </div>
+      <div class="master-btns">
+        <button id="btn-all-on"  class="btn btn-secondary btn-sm">All On</button>
+        <button id="btn-all-off" class="btn btn-secondary btn-sm">All Off</button>
       </div>
     </div>
 
-    <!-- Save scene name input (hidden until Save clicked) -->
-    <div id="scene-name-row" style="display:none">
-      <input id="scene-name-input" class="input" placeholder="Scene name…" style="max-width:240px">
-      <button id="btn-scene-name-confirm" class="btn btn-primary btn-sm">Save</button>
-      <button id="btn-scene-name-cancel"  class="btn btn-secondary btn-sm">Cancel</button>
+    <!-- Scenes + select mode -->
+    <div id="control-toolbar">
+      <span class="ct-label">Scenes</span>
+      <div id="scene-chips"></div>
+      <button id="btn-select-mode" class="btn btn-secondary btn-sm">Select</button>
+    </div>
+
+    <!-- Group actions bar (visible in select mode) -->
+    <div id="group-actions" style="display:none">
+      <span id="group-count">0 selected</span>
+      <button id="btn-group-all" class="btn-link-sm">Select all</button>
+      <div id="group-palette"></div>
+      <div class="master-bri-wrap">
+        <input type="range" min="1" max="100" value="100" class="bri-slider" id="group-bri">
+        <span id="group-bri-val" class="bri-val">100%</span>
+      </div>
+      <div class="master-btns">
+        <button id="btn-group-on"  class="btn btn-secondary btn-sm" disabled>On</button>
+        <button id="btn-group-off" class="btn btn-secondary btn-sm" disabled>Off</button>
+      </div>
     </div>
 
     <!-- Per-light control grid -->

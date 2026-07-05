@@ -200,7 +200,7 @@
     <div id="lights-toolbar">
       <button id="btn-refresh-lights" class="btn btn-secondary btn-sm">↻ Refresh</button>
       <button id="btn-find-lights"    class="btn btn-secondary btn-sm">+ Find New Lights</button>
-      <span class="hint">Drag to reorder · DMX column sets custom start address · Toggle enables/disables</span>
+      <span class="hint">Drag to reorder · Address column sets a custom start channel · Toggle enables/disables</span>
     </div>
 
     <!-- Bulb discovery section (hidden until "Find New Lights" clicked) -->
@@ -358,7 +358,7 @@
         <div class="checkbox-row">
           <div>
             <label for="s-nolimit">Disable Rate Limiting</label>
-            <div class="description">Remove the 100 ms cooldown between API calls (not recommended)</div>
+            <div class="description">Remove per-light command pacing to the bridge (not recommended — flooding the bridge makes bulbs drop offline)</div>
           </div>
           <label class="toggle">
             <input id="s-nolimit" type="checkbox">

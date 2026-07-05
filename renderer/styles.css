@@ -513,6 +513,11 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
 .light-row.drag-over    { border-color: var(--accent2); background: rgba(124,58,237,0.08); }
 .light-row.disabled-light { opacity: .45; }
 
+/* Unreachable bulb — red accent + dimmed swatch so dead fixtures read at a glance */
+.light-row.light-unreachable { border-left: 2px solid var(--red); }
+.light-row.light-unreachable .light-color-swatch { filter: grayscale(1) brightness(.55); }
+.light-row.light-unreachable .reach-label { color: var(--red); font-weight: 600; }
+
 .drag-handle { color: var(--text3); cursor: grab; font-size: 16px; padding: 2px 4px; line-height: 1; width: 20px; flex-shrink: 0; }
 .drag-handle:active { cursor: grabbing; }
 
@@ -1000,6 +1005,25 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
   border-color: var(--border2);
 }
 .ctrl-tile.dmx-active { opacity: 0.4; pointer-events: none; }
+
+/* Unreachable bulb — dim the tile and stamp a badge so it can't be mistaken for off */
+.ctrl-tile.tile-unreachable { opacity: .45; }
+.ctrl-tile.tile-unreachable::after {
+  content: 'UNREACHABLE';
+  position: absolute;
+  top: 8px; left: 50%;
+  transform: translateX(-50%);
+  font-size: 9px;
+  letter-spacing: .08em;
+  font-weight: 700;
+  color: var(--red);
+  background: rgba(248,113,113,0.12);
+  border: 1px solid rgba(248,113,113,0.4);
+  border-radius: 4px;
+  padding: 2px 6px;
+  pointer-events: none;
+  z-index: 2;
+}
 .ctrl-tile.selected {
   border-color: var(--accent2) !important;
   box-shadow: 0 0 0 1px rgba(167,139,250,0.35) !important;
@@ -1350,10 +1374,19 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
 .empty-state p     { font-size: 13px; color: var(--text2); }
 .empty-state small { font-size: 11px; }
 
-.toast {
+#toast-stack {
   position: fixed;
   bottom: 36px;
   right: 16px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  z-index: 200;
+  pointer-events: none;
+}
+
+.toast {
   background: rgba(15,20,35,0.92);
   backdrop-filter: var(--blur);
   -webkit-backdrop-filter: var(--blur);
@@ -1364,7 +1397,6 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
   display: flex;
   align-items: center;
   gap: 8px;
-  z-index: 200;   /* was 999 — defined stack: toasts at 200 */
   animation: slideIn .2s ease;
   max-width: 320px;
   box-shadow: 0 4px 16px rgba(0,0,0,0.4);  /* was 0 8px 24px — lighter */

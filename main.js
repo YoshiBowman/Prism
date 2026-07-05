@@ -482,6 +482,7 @@ const OPCODE_OUTPUT = 0x5000;
 let artnetSocket = null;
 let artnetRunning = false;
 const dmxBuffers = {};   // { universeNum: Buffer } — latest received DMX frame per universe
+const _dmxUpdateLastSent = {}; // { universeNum: ms } — throttle for renderer live-view IPC
 
 // ── Intermediary ───────────────────────────────────────────────────────────────
 // The Hue bridge only sustains ~10 commands/sec total across all lights, so we
@@ -530,6 +531,10 @@ const SEND_GAP_MS  = 1000;
 const ONOFF_GAP_MS = 500;
 const JITTER       = 3;
 const FADE_TT      = Math.round((SEND_GAP_MS + TICKER_MS) / 100); // 13 ds = 1.3 s
+// A single-tick jump this large cannot be one 250 ms step of a real fade (a
+// full-range 1 s fade moves ~64/tick) — it's a snap cue. Sending it immediately
+// instead of waiting one tick to classify shaves 250 ms off every discrete cue.
+const SNAP_DELTA   = 100;
 
 // ── Per-bulb recovery ─────────────────────────────────────────────────────────
 // Set of light IDs (strings) the bridge has marked unreachable.
@@ -615,8 +620,9 @@ function tickBridge() {
     const wasBlackout   = last ? (last.r === 0 && last.g === 0 && last.b === 0) : null;
     const onOffBoundary = last != null && isBlackout !== wasBlackout;
 
+    let diff = null;
     if (last) {
-      const diff = Math.max(Math.abs(cur.r - last.r), Math.abs(cur.g - last.g), Math.abs(cur.b - last.b));
+      diff = Math.max(Math.abs(cur.r - last.r), Math.abs(cur.g - last.g), Math.abs(cur.b - last.b));
       if (diff === 0) continue;                                  // already at this value
       if (diff < JITTER && !onOffBoundary) continue;             // source dither — ignore
     }
@@ -632,12 +638,36 @@ function tickBridge() {
     else if (onOffBoundary)  tt = FOLLOW_TT;  // lights-up cue: act now, quick ramp
     else if (!moving)        tt = FOLLOW_TT;  // settled target: snappy 300 ms
     else if (movingPrev)     tt = FADE_TT;    // sustained fade: glide across the send gap
-    else continue;                            // first moving tick: wait one tick to classify
+    else if (diff !== null && diff >= SNAP_DELTA) tt = FOLLOW_TT; // snap cue: too big to be a fade tick — fire now
+    else continue;                            // first moving tick of a fade: wait one tick to classify
 
     lightLastSent[lightId]   = { r: cur.r, g: cur.g, b: cur.b };
     lightLastSendMs[lightId] = now;
     sendDirectState(lightId, buildDirectPayload(cur.r, cur.g, cur.b, { tt }));
   }
+}
+
+// Fast path: on/off boundaries (blackout ↔ lights-up) fire the moment the DMX
+// frame arrives instead of waiting up to 250 ms for the next tick. Everything
+// else still flows through tickBridge, which owns movement classification —
+// this path deliberately never touches lightTickPrev/lightMovingPrev.
+// Safe at frame rate: after a send, lightLastSent matches the frame so
+// subsequent frames fall through, and ONOFF_GAP_MS still caps a 0↔full strobe
+// at 2 cmd/sec/light exactly as before.
+function maybeSendBoundaryNow(lightId) {
+  const sid = String(lightId);
+  if (config.disabledLights[lightId] || unreachableLights.has(sid)) return;
+  const cur  = lightCurrent[lightId];
+  const last = lightLastSent[lightId];
+  if (!cur || !last) return;                     // first-ever send stays with the ticker
+  const isBlackout  = cur.r === 0 && cur.g === 0 && cur.b === 0;
+  const wasBlackout = last.r === 0 && last.g === 0 && last.b === 0;
+  if (isBlackout === wasBlackout) return;        // not an on/off boundary
+  const gap = config.noLimit ? 0 : ONOFF_GAP_MS;
+  if (gap > 0 && Date.now() - (lightLastSendMs[lightId] || 0) < gap) return;
+  lightLastSent[lightId]   = { r: cur.r, g: cur.g, b: cur.b };
+  lightLastSendMs[lightId] = Date.now();
+  sendDirectState(lightId, buildDirectPayload(cur.r, cur.g, cur.b, { tt: isBlackout ? 0 : FOLLOW_TT }));
 }
 
 function startBridgeTicker() {
@@ -681,12 +711,20 @@ function stopRecoveryPoller() {
   unreachableLights.clear();
 }
 
+// Round-robin queue so each 8 s tick probes exactly ONE dead bulb. Every probe
+// to a dead bulb costs the bridge seconds of Zigbee retries; probing the whole
+// set at once multiplies that by the body count and can stall live traffic
+// (Companion / control tab) even while DMX is idle.
+let recoveryRotation = [];
+
 function tickRecovery() {
   if (!hueApi || !config.bridge || !config.user) return;
   if (unreachableLights.size === 0) return;
   if (isDmxActive()) return; // never add Zigbee load mid-show — see block comment
-  for (const lightId of unreachableLights) {
-    sendRecoveryProbe(lightId);
+  if (recoveryRotation.length === 0) recoveryRotation = [...unreachableLights];
+  let sid;
+  while ((sid = recoveryRotation.shift()) !== undefined) {
+    if (unreachableLights.has(sid)) { sendRecoveryProbe(sid); break; } // skip ids that recovered meanwhile
   }
 }
 
@@ -770,6 +808,7 @@ function confirmReachability(sid) {
     });
   });
   req.on('error', err => console.warn(`[recovery] GET light ${sid} error: ${err.message}`));
+  req.setTimeout(5000, () => req.destroy(new Error('timeout')));
   req.end();
 }
 
@@ -777,7 +816,11 @@ function confirmReachability(sid) {
 // Free-socket timeout of 20 s ensures idle sockets are destroyed before the
 // Hue bridge closes them (~30 s), preventing silent ECONNRESET failures after
 // the app has been left running overnight with no DMX activity.
-const keepAliveAgent = new http.Agent({ keepAlive: true, maxSockets: Infinity });
+// maxSockets is bounded: the bridge is a small embedded server that degrades
+// under many parallel TCP connections. Per-light pacing keeps in-flight
+// requests ≈ light count, so 8 concurrent sockets never queues in practice
+// while capping the damage of any burst.
+const keepAliveAgent = new http.Agent({ keepAlive: true, maxSockets: 8, maxFreeSockets: 4 });
 keepAliveAgent.on('free', socket => socket.setTimeout(20000, () => socket.destroy()));
 
 // Fast direct PUT to the Hue local REST API bypassing node-hue-api overhead
@@ -828,7 +871,15 @@ function sendDirectState(lightId, payload) {
       }
     });
   });
-  req.on('error', err => console.warn(`[bridge] PUT light ${lightId} error: ${err.message}`));
+  // A send that never reached the bridge must not poison the dedup cache —
+  // clear it so the next tick re-sends this light's current value instead of
+  // assuming the bulb received it (otherwise a transient network hiccup leaves
+  // the light frozen at a stale state until the value changes by ≥ JITTER).
+  req.on('error', err => {
+    console.warn(`[bridge] PUT light ${lightId} error: ${err.message}`);
+    delete lightLastSent[lightId];
+  });
+  req.setTimeout(5000, () => req.destroy(new Error('timeout')));
   req.write(body);
   req.end();
 }
@@ -859,8 +910,17 @@ function hueBridgeRequest(method, apiPath, body) {
           catch { reject(new Error('Bad JSON from bridge')); }
         });
       });
-      req.on('error', e => { if (port === 80) attempt(https, 443); else reject(e); });
-      req.setTimeout(8000, () => { req.destroy(); if (port === 443) reject(new Error('timeout')); else attempt(https, 443); });
+      // destroy() on timeout also fires 'error' — guard so the HTTPS fallback
+      // runs exactly once (a double fallback duplicates POST side effects).
+      let fellBack = false;
+      const fallback = (err) => {
+        if (fellBack) return;
+        fellBack = true;
+        if (port === 80) attempt(https, 443);
+        else reject(err || new Error('Bridge request failed'));
+      };
+      req.on('error', fallback);
+      req.setTimeout(8000, () => { req.destroy(); fallback(new Error('timeout')); });
       if (payload) req.write(payload);
       req.end();
     }
@@ -900,23 +960,6 @@ function rgbToHsb(r, g, b) {
   return [h, s, v];
 }
 
-function buildLightState(r, g, b, opts = {}) {
-  const { LightState } = v3.lightStates;
-  const state = new LightState();
-
-  if (r === 0 && g === 0 && b === 0) return state.off();
-
-  state.on(true);
-  state.effect('none');
-  state.transitiontime(Math.round((opts.transition || 100) / 100));
-
-  const [h, s, v] = rgbToHsb(r, g, b);
-  state.hue(Math.round(h * 65535));
-  state.saturation(Math.round(s * 100));
-  state.brightness(Math.max(1, Math.round(v * 100)));
-
-  return state;
-}
 
 // Returns the set of universe numbers this protocol's socket should accept.
 // Always includes the base (globally-configured) universe plus any universe
@@ -958,7 +1001,8 @@ function processArtnet(data, packetUniverse, defaultUniverse) {
   // shape (short buffer, bad offset, etc.) is logged once and the frame dropped.
   try {
     // Cache the raw frame so the renderer can read per-universe live data
-    dmxBuffers[packetUniverse] = Buffer.from(data);
+    // (capped at the DMX512 slot count — a malformed length field can't balloon it)
+    dmxBuffers[packetUniverse] = Buffer.from(data.length > 512 ? data.slice(0, 512) : data);
 
     const channelsPerLight = 3;
     const baseOffset       = (config.dmxAddress - 1) + (config.transition === 'channel' ? 1 : 0);
@@ -986,14 +1030,23 @@ function processArtnet(data, packetUniverse, defaultUniverse) {
       if (offset < 0 || offset + 2 >= data.length) continue;
 
       updateCurrent(light.id, data[offset], data[offset + 1], data[offset + 2], null);
+      maybeSendBoundaryNow(light.id);
     }
 
     startBridgeTicker();
 
-    // Send the frame + universe number to the renderer for live display
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      const snapshot = Array.from(data.slice(0, Math.min(data.length, 512)));
-      mainWindow.webContents.send('artnet:dmx-update', snapshot, packetUniverse);
+    // Live-view IPC for the renderer, throttled to ~25 fps per universe.
+    // Serializing a full frame at wire rate (40+/sec × universes) measurably
+    // loads the main event loop — time that competes with the HTTP sends to
+    // the bridge. The renderer only paints swatches/bars, so 25 fps is
+    // visually identical. The Buffer arrives as a Uint8Array; all renderer
+    // consumers only index it and read .length.
+    const nowMs = Date.now();
+    if (nowMs - (_dmxUpdateLastSent[packetUniverse] || 0) >= 40) {
+      _dmxUpdateLastSent[packetUniverse] = nowMs;
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('artnet:dmx-update', dmxBuffers[packetUniverse], packetUniverse);
+      }
     }
   } catch (err) {
     console.warn(`[dmx] dropped malformed frame on universe ${packetUniverse}: ${err.message}`);
@@ -1165,7 +1218,8 @@ function startSACN() {
     sacnRunning = false;
     try { sacnSocket.close(); } catch {} // prevent orphaned socket holding port 5568 after error
     sacnSocket = null;
-    sendToAll('artnet:status', { running: isAnyRunning(), sacnError: err.message });
+    // Field must be `error` — the renderer's status handler reads { running, error }.
+    sendToAll('artnet:status', { running: isAnyRunning(), error: err.message });
   });
 
   sacnSocket.bind(SACN_PORT, () => {
@@ -1211,9 +1265,16 @@ function buildStatusPayload() {
 // ── Lights cache ─────────────────────────────────────────────────────────────
 
 let lightsCache = [];
+let lightsCacheAt = 0;
 
-async function fetchLights() {
+// maxAgeMs > 0 lets chatty callers (tab switches fire several lights:get in a
+// row) reuse a just-fetched cache instead of stacking identical bridge GETs.
+// Callers that need guaranteed-fresh state (recovery sync, connect, add) omit it.
+async function fetchLights(maxAgeMs = 0) {
   if (!hueApi) return [];
+  if (maxAgeMs > 0 && lightsCache.length > 0 && Date.now() - lightsCacheAt < maxAgeMs) {
+    return lightsCache;
+  }
   try {
     const lights = await hueApi.lights.getAll();
     lightsCache = lights.map(l => ({
@@ -1221,6 +1282,7 @@ async function fetchLights() {
       name: l.name,
       state: l.state,
     }));
+    lightsCacheAt = Date.now();
     syncUnreachableFromCache();
     return lightsCache;
   } catch (err) {
@@ -1311,8 +1373,10 @@ function calcDmxChannels() {
 
 // ── Discovery methods ─────────────────────────────────────────────────────────
 
-// Philips/Signify OUI prefixes for ARP-based discovery
-const HUE_OUI = ['00:17:88', 'ec:b5:fa', 'c4:29:96', 'b8:27:eb', '00:17:88', 'a4:34:d9'];
+// Philips/Signify OUI prefixes for ARP-based discovery (candidates only —
+// every ARP hit is verified with a real /api/config probe before it's shown,
+// so a stray OUI match can't surface a non-bridge device).
+const HUE_OUI = ['00:17:88', 'ec:b5:fa', 'c4:29:96', 'b8:27:eb', 'a4:34:d9'];
 
 // Probe a single IP on both HTTP :80 and HTTPS :443 for the Hue /api/config endpoint.
 function probeHueBridge(ip, timeoutMs = 1500) {
@@ -1650,11 +1714,15 @@ ipcMain.handle('bridge:discover', async (event, ifaceIp, extraSubnets = []) => {
   // ── Phase 0: ARP + portal in parallel (fast) ──
   if (scanCancelled) return { success: true, bridges: found };
   if (!sender.isDestroyed()) sender.send('bridge:scan-progress', { phase: 'arp', completed: 0, total: 0, subnets: [] });
-  const [arpResults, portalResults] = await Promise.all([
+  const [arpCandidates, portalResults] = await Promise.all([
     arpCacheScan().catch(() => []),
     portalDiscover().catch(() => []),
   ]);
-  for (const b of arpResults) emit(b);
+  // ARP hits are OUI matches only — confirm each is actually a Hue bridge
+  // before offering a Connect button (an OUI match alone can be any Philips
+  // device, or a Raspberry Pi running anything).
+  const arpVerified = (await Promise.all(arpCandidates.map(c => probeHueBridge(c.ip, 1500)))).filter(Boolean);
+  for (const b of arpVerified) emit(b);
   for (const b of portalResults) emit(b);
 
   // ── Phase 1: SSDP (UPnP multicast from every interface — subnet-independent) ──
@@ -1739,6 +1807,7 @@ ipcMain.handle('bridge:disconnect', async () => {
   config.user = null;
   saveConfig();
   stopArtnet();
+  stopSACN();          // both protocol listeners, not just Art-Net
   stopRecoveryPoller();
   lightsCache = [];
   return { success: true };
@@ -1760,7 +1829,7 @@ ipcMain.handle('bridge:reboot', async () => rebootBridge());
 ipcMain.handle('bridge:reboot-cancel', () => cancelReboot());
 
 ipcMain.handle('lights:get', async () => {
-  const lights         = await fetchLights();
+  const lights         = await fetchLights(800);
   const dmxMap         = calcDmxChannels();
   const ordered        = getOrderedLights();
   const lightAddresses = config.lightAddresses || {};
@@ -1972,11 +2041,20 @@ function hexToRgb(hex) {
   return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
 }
 
-ipcMain.handle('lights:set-state', async (event, lightId, { on, rgb, bri, ct, mode }) => {
+// config.transition may legitimately be the string 'channel' (per-cue transition
+// driven by the first DMX channel). Manual control and scenes must not inherit
+// that — Math.round('channel'/100) is NaN, which serializes to null and makes
+// the bridge reject every command. Fall back to a quick 100 ms ramp instead.
+function manualTransitionDs() {
+  const t = Number(config.transition);
+  return Number.isFinite(t) ? Math.round(t / 100) : 1;
+}
+
+async function applyManualState(lightId, { on, rgb, bri, ct, mode }) {
   if (!hueApi) return { success: false, error: 'Not connected' };
   const { LightState } = v3.lightStates;
   const state = new LightState();
-  state.transitiontime(Math.round((config.transition || 100) / 100));
+  state.transitiontime(manualTransitionDs());
 
   if (!on) {
     state.off();
@@ -1996,12 +2074,40 @@ ipcMain.handle('lights:set-state', async (event, lightId, { on, rgb, bri, ct, mo
     }
   }
 
+  lightLastSendMs[lightId] = Date.now(); // share the per-light pacing bucket with the DMX ticker
   try {
     await hueApi.lights.setLightState(lightId, state);
     return { success: true };
   } catch (err) {
     return { success: false, error: err.message };
   }
+}
+
+// ── Manual-control pacing ─────────────────────────────────────────────────────
+// A color/brightness drag in the control tab fires up to ~12 cmds/sec per light
+// (80 ms renderer debounce). A bulb's Zigbee link sustains ~1-2/sec — flooding
+// it is exactly what makes bulbs drop unreachable. Coalesce to at most one
+// command per light per MANUAL_GAP_MS, always delivering the LATEST value when
+// the window opens so the bulb lands exactly where the fader stopped.
+const MANUAL_GAP_MS = 250;
+const manualPending = {}; // { lightId: { args, timer } }
+
+ipcMain.handle('lights:set-state', async (event, lightId, args) => {
+  if (!hueApi) return { success: false, error: 'Not connected' };
+  const sinceMs = Date.now() - (lightLastSendMs[lightId] || 0);
+  if (!config.noLimit && sinceMs < MANUAL_GAP_MS) {
+    const slot = manualPending[lightId] || (manualPending[lightId] = {});
+    slot.args = args; // keep only the newest value
+    if (!slot.timer) {
+      slot.timer = setTimeout(() => {
+        const pending = manualPending[lightId];
+        delete manualPending[lightId];
+        if (pending && hueApi) applyManualState(lightId, pending.args).catch(() => {});
+      }, Math.max(20, MANUAL_GAP_MS - sinceMs));
+    }
+    return { success: true, coalesced: true };
+  }
+  return applyManualState(lightId, args);
 });
 
 ipcMain.handle('dmx:is-active', () => isDmxActive());
@@ -2026,7 +2132,7 @@ ipcMain.handle('scenes:apply', async (event, name) => {
     try {
       const { LightState } = v3.lightStates;
       const state = new LightState();
-      state.transitiontime(Math.round((config.transition || 100) / 100));
+      state.transitiontime(manualTransitionDs());
       if (!entry.on) {
         state.off();
       } else {
@@ -2075,12 +2181,17 @@ function huePost(ip, path, body) {
           });
         }
       );
-      req.on('error', (e) => {
-        if (port === 443) { reject(e); return; }
-        // HTTP failed — try HTTPS
-        attempt(https, 443);
-      });
-      req.setTimeout(5000, () => { req.destroy(); if (port === 443) reject(new Error('timeout')); else attempt(https, 443); });
+      // Same single-fallback guard as hueBridgeRequest: destroy() on timeout
+      // also fires 'error', and a double fallback would double-POST the pairing.
+      let fellBack = false;
+      const fallback = (e) => {
+        if (fellBack) return;
+        fellBack = true;
+        if (port === 80) attempt(https, 443);
+        else reject(e || new Error('timeout'));
+      };
+      req.on('error', fallback);
+      req.setTimeout(5000, () => { req.destroy(); fallback(new Error('timeout')); });
       req.write(payload);
       req.end();
     }
@@ -2210,6 +2321,8 @@ function startCompanionServer() {
       if (!hueApi) { send(503, { error: 'Not connected' }); return; }
       (async () => {
         for (const light of lightsCache) {
+          // Commands to dead bulbs stall the bridge in Zigbee retries — skip them
+          if (unreachableLights.has(String(light.id))) continue;
           try {
             const { LightState } = v3.lightStates;
             await hueApi.lights.setLightState(light.id, new LightState().off());

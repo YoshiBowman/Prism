@@ -37,10 +37,18 @@ tabs.forEach(t => t.addEventListener('click', () => {
 // ── Toast ─────────────────────────────────────────────────────────────────────
 
 function toast(message, type = 'info') {
+  // Toasts live in a fixed stack container so simultaneous messages (e.g.
+  // several bulbs dropping at once) stack instead of painting over each other.
+  let stack = document.getElementById('toast-stack');
+  if (!stack) {
+    stack = document.createElement('div');
+    stack.id = 'toast-stack';
+    document.body.appendChild(stack);
+  }
   const el = document.createElement('div');
   el.className = `toast ${type}`;
   el.textContent = message;
-  document.body.appendChild(el);
+  stack.appendChild(el);
   setTimeout(() => el.remove(), 3500);
 }
 
@@ -562,26 +570,33 @@ window.hue.on('bridge:reachable', () => {
 
 // ── Per-bulb reachability events ──────────────────────────────────────────────
 
-window.hue.on('bulb-unreachable', ({ id }) => {
+// Sync every surface that shows a bulb's reachability: state cache (so tab
+// re-renders keep the badge), lights-tab row, and control-tab tile.
+function setLightReachableUI(id, reachable) {
+  const light = state.lights.find(l => String(l.id) === String(id));
+  if (light) {
+    if (!light.state) light.state = {};
+    light.state.reachable = reachable;
+  }
   const row = lightsList && lightsList.querySelector(`.light-row[data-id="${id}"]`);
-  if (!row) return;
-  const meta = row.querySelector('.light-meta');
-  if (meta) meta.innerHTML = meta.innerHTML.replace(/\b(Reachable|Unreachable)\b/, 'Unreachable');
+  if (row) {
+    row.classList.toggle('light-unreachable', !reachable);
+    const label = row.querySelector('.reach-label');
+    if (label) label.textContent = reachable ? 'Reachable' : 'Unreachable';
+  }
+  const tile = controlGrid && controlGrid.querySelector(`[data-light-id="${id}"]`);
+  if (tile) tile.classList.toggle('tile-unreachable', !reachable);
+  return light;
+}
+
+window.hue.on('bulb-unreachable', ({ id }) => {
+  const light = setLightReachableUI(id, false);
+  toast(`"${light ? light.name : `Light ${id}`}" unreachable — auto-recovery active`, 'warn');
 });
 
 window.hue.on('bulb-recovered', ({ id }) => {
-  const row = lightsList && lightsList.querySelector(`.light-row[data-id="${id}"]`);
-  if (!row) return;
-  const meta = row.querySelector('.light-meta');
-  if (!meta) return;
-  meta.innerHTML = meta.innerHTML.replace(/\b(Reachable|Unreachable)\b/, 'Reachable');
-  // Brief green flash so the operator notices the recovery
-  meta.style.transition = 'color 0ms';
-  meta.style.color = '#4ade80';
-  setTimeout(() => {
-    meta.style.transition = 'color 200ms';
-    meta.style.color = '';
-  }, 200);
+  const light = setLightReachableUI(id, true);
+  toast(`"${light ? light.name : `Light ${id}`}" back online`, 'success');
 });
 
 // ── Lights panel ──────────────────────────────────────────────────────────────
@@ -650,8 +665,9 @@ function refreshEffectivePatch() {
 }
 
 function buildLightRow(light) {
+  const unreachable = !!(light.state && light.state.reachable === false);
   const row       = document.createElement('div');
-  row.className   = `light-row${light.disabled ? ' disabled-light' : ''}`;
+  row.className   = `light-row${light.disabled ? ' disabled-light' : ''}${unreachable ? ' light-unreachable' : ''}`;
   row.dataset.id  = light.id;
   row.draggable   = true;
 
@@ -688,7 +704,7 @@ function buildLightRow(light) {
     <div class="light-color-swatch" style="background:${swatchColor}"></div>
     <div class="light-info">
       <div class="light-name">${light.name}</div>
-      <div class="light-meta">ID: ${light.id} &nbsp;·&nbsp; ${light.state && light.state.reachable !== false ? 'Reachable' : 'Unreachable'}</div>
+      <div class="light-meta">ID: ${light.id} &nbsp;·&nbsp; <span class="reach-label">${unreachable ? 'Unreachable' : 'Reachable'}</span></div>
       <div class="light-dmx-channels">${univBadge}${chBadges}</div>
     </div>
     <div class="light-addr-wrap" title="Custom DMX start channel (leave blank for sequential)">
@@ -1277,7 +1293,8 @@ function buildControlCards(lights) {
     const s = controlState[light.id];
 
     const tile = document.createElement('div');
-    tile.className      = 'ctrl-tile' + (s.on ? ' active' : '');
+    tile.className      = 'ctrl-tile' + (s.on ? ' active' : '')
+      + (light.state && light.state.reachable === false ? ' tile-unreachable' : '');
     tile.dataset.lightId = light.id;
     tile.style.setProperty('--tile-color', s.rgb);
     tile.innerHTML = `
@@ -1476,7 +1493,7 @@ function onDmxPacket(packetUniverse) {
 
 function buildMonitorCards(lights) {
   if (!lights || lights.length === 0) {
-    monitorGrid.innerHTML = '<div class="empty-state"><div class="icon">📡</div><p>No lights loaded — go to Lights tab and refresh</p></div>';
+    monitorGrid.innerHTML = '<div class="empty-state"><p>No lights loaded — go to Lights tab and refresh</p></div>';
     return;
   }
   monitorGrid.innerHTML = '';
@@ -1565,7 +1582,7 @@ window.hue.on('sacn:diag', ({ rawCount, lastUniverse, wrongUniverse, configured,
 
   if (rawCount === 0) {
     sacnDiagBar.className = '';
-    sacnDiagIcon.textContent = '📡';
+    sacnDiagIcon.textContent = '';
     sacnDiagText.textContent = `sACN: No UDP packets received on port 5568 yet`;
     return;
   }

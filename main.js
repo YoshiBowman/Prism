@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, Tray, nativeImage, screen } = require('electron');
+const { app, BrowserWindow, ipcMain, Tray, nativeImage, screen, dialog } = require('electron');
 
 // ── Single-instance guard ─────────────────────────────────────────────────────
 // Two Prism instances (e.g. a Launch-at-Login packaged build hidden in the tray
@@ -100,6 +100,7 @@ let tray        = null;
 let popoverWin  = null;
 let connectedPromise = null;   // resolves when initial bridge connect attempt finishes
 let startupRetryTimer = null;  // setInterval handle for the login-time reconnect loop
+let updateCheckTimer = null;   // setInterval handle for the periodic update check
 
 // ── Bridge reboot flow state ───────────────────────────────────────────────────
 // isRebooting is true from the moment a reboot command succeeds until the bridge
@@ -2519,21 +2520,110 @@ app.whenReady().then(() => {
   if (!config.bridge) openMainWindow();
 
   // ── Auto-updater (production only) ────────────────────────────────────────
+  // Prism usually lives in the tray with no window open, so update events
+  // can't rely on the in-window banner alone. When the main window is open the
+  // banner keeps working as before; when it isn't, native dialogs take over.
+  // Dialogs are SHOW-SAFE: they never appear while DMX is active — the prompt
+  // waits until the rig has been idle, so nothing pops (and nothing can restart
+  // the app) mid-show.
   if (app.isPackaged) {
     const { autoUpdater } = require('electron-updater');
     autoUpdater.autoDownload = false;
 
+    const mainWindowVisible = () =>
+      mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible();
+
+    // One state object so periodic re-checks can't stack prompts or re-nag:
+    //   dismissed   — version the user clicked "Later" on (skip until next release)
+    //   downloading — version currently downloading (skip repeat availability prompts)
+    //   promptOpen / queued — a dialog is showing or waiting for DMX-idle
+    const updateFlow = { promptOpen: false, queued: false, dismissed: null, downloading: null };
+
+    // Run fn once DMX has been idle — immediately if it already is.
+    function whenDmxIdle(fn) {
+      if (!isDmxActive()) { fn(); return; }
+      const t = setInterval(() => {
+        if (!isDmxActive()) { clearInterval(t); fn(); }
+      }, 60000);
+    }
+
+    async function promptUpdateAvailable(info) {
+      if (updateFlow.promptOpen) return;
+      updateFlow.promptOpen = true;
+      try {
+        app.focus({ steal: true }); // tray-only app — make sure the dialog surfaces
+        const { response } = await dialog.showMessageBox({
+          type: 'info',
+          title: 'Prism Update',
+          message: `Prism ${info.version} is available`,
+          detail: `You're running ${app.getVersion()}. The update downloads in the background — you'll be asked before anything restarts.`,
+          buttons: ['Download Update', 'Later'],
+          defaultId: 0,
+          cancelId: 1,
+        });
+        if (response === 0) {
+          updateFlow.downloading = info.version;
+          autoUpdater.downloadUpdate().catch(err => {
+            updateFlow.downloading = null;
+            dialog.showMessageBox({
+              type: 'error',
+              title: 'Prism Update',
+              message: 'Update download failed',
+              detail: err ? err.message : 'Unknown error',
+              buttons: ['OK'],
+            }).catch(() => {});
+          });
+        } else {
+          updateFlow.dismissed = info.version;
+        }
+      } finally {
+        updateFlow.promptOpen = false;
+        updateFlow.queued = false;
+      }
+    }
+
+    async function promptRestartInstall(info) {
+      if (updateFlow.promptOpen) return;
+      updateFlow.promptOpen = true;
+      try {
+        app.focus({ steal: true });
+        const { response } = await dialog.showMessageBox({
+          type: 'info',
+          title: 'Prism Update',
+          message: `Prism ${info.version} is ready to install`,
+          detail: 'Restart now to finish updating. If you choose Later, it installs automatically the next time Prism quits.',
+          buttons: ['Restart & Install', 'Later'],
+          defaultId: 0,
+          cancelId: 1,
+        });
+        if (response === 0) autoUpdater.quitAndInstall();
+      } finally {
+        updateFlow.promptOpen = false;
+        updateFlow.queued = false;
+      }
+    }
+
     autoUpdater.on('update-available', (info) => {
-      if (mainWindow && !mainWindow.isDestroyed())
+      if (mainWindowVisible()) {
         mainWindow.webContents.send('update:available', { version: info.version });
+        return;
+      }
+      if (updateFlow.dismissed   === info.version) return; // "Later" — wait for the next release
+      if (updateFlow.downloading === info.version) return; // already past this stage
+      if (updateFlow.queued || updateFlow.promptOpen) return;
+      updateFlow.queued = true;
+      whenDmxIdle(() => promptUpdateAvailable(info));
     });
     autoUpdater.on('download-progress', (p) => {
       if (mainWindow && !mainWindow.isDestroyed())
         mainWindow.webContents.send('update:progress', { percent: Math.round(p.percent) });
     });
-    autoUpdater.on('update-downloaded', () => {
-      if (mainWindow && !mainWindow.isDestroyed())
+    autoUpdater.on('update-downloaded', (info) => {
+      if (mainWindowVisible()) {
         mainWindow.webContents.send('update:downloaded');
+        return;
+      }
+      whenDmxIdle(() => promptRestartInstall(info));
     });
     autoUpdater.on('error', (err) => {
       if (mainWindow && !mainWindow.isDestroyed())
@@ -2549,7 +2639,10 @@ app.whenReady().then(() => {
     });
     ipcMain.handle('update:install', () => { autoUpdater.quitAndInstall(); });
 
+    // First check shortly after launch, then every 4 hours — Prism can sit in
+    // the tray for weeks, and a single launch-time check would never re-fire.
     setTimeout(() => autoUpdater.checkForUpdates().catch(() => {}), 5000);
+    updateCheckTimer = setInterval(() => autoUpdater.checkForUpdates().catch(() => {}), 4 * 60 * 60 * 1000);
   }
 
   // Dock icon clicked (macOS) — bring the main window back up
@@ -2567,6 +2660,7 @@ function cleanupAll() {
   isRebooting = false;
   if (takeoverBroadcastTimer) { clearInterval(takeoverBroadcastTimer); takeoverBroadcastTimer = null; }
   if (startupRetryTimer)      { clearInterval(startupRetryTimer);      startupRetryTimer = null; }
+  if (updateCheckTimer)       { clearInterval(updateCheckTimer);       updateCheckTimer = null; }
   if (rebootTimer)            { clearTimeout(rebootTimer);             rebootTimer = null; }
   if (companionServer) { try { companionServer.close(); } catch {} companionServer = null; }
 }

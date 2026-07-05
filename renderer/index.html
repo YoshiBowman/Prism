@@ -305,6 +305,17 @@
         <p>Connect to a bridge and start the listener to monitor channels</p>
       </div>
     </div>
+
+    <!-- Rolling event log: bulb drops/recoveries, reconnects, listener, panic -->
+    <div id="event-log-card">
+      <div id="event-log-head">
+        <span class="ct-label">Event Log</span>
+        <span class="hint" style="margin-left:auto">Bulb drops · recoveries · reconnects · listener · panic</span>
+      </div>
+      <div id="event-log-list">
+        <div class="hint" style="padding:6px 0">No events yet</div>
+      </div>
+    </div>
   </div>
 
   <!-- Settings panel -->
@@ -377,15 +388,13 @@
           </label>
         </div>
 
-        <div class="checkbox-row">
-          <div>
-            <label for="s-nolimit">Disable Rate Limiting</label>
-            <div class="description">Remove per-light command pacing to the bridge (not recommended — flooding the bridge makes bulbs drop offline)</div>
+        <div class="field" style="margin-top:16px">
+          <label>Show Profile</label>
+          <div style="display:flex;gap:8px">
+            <button id="btn-export-show" class="btn btn-secondary btn-sm">Export…</button>
+            <button id="btn-import-show" class="btn btn-secondary btn-sm">Import…</button>
           </div>
-          <label class="toggle">
-            <input id="s-nolimit" type="checkbox">
-            <span class="toggle-slider"></span>
-          </label>
+          <div class="hint">Patch, fixture modes, scenes and bridge pairing in one file — restore a rig on any machine. Contains the bridge API key; treat it like a password.</div>
         </div>
 
       </div>

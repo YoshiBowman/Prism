@@ -33,6 +33,8 @@ contextBridge.exposeInMainWorld('hue', {
   renameLight:     (id, name)     => ipcRenderer.invoke('lights:rename', id, name),
   addLight:        (id)           => ipcRenderer.invoke('lights:add', id),
   deleteLight:     (id)           => ipcRenderer.invoke('lights:delete', id),
+  setLightMode:    (id, mode)     => ipcRenderer.invoke('lights:set-mode', id, mode),
+  allLightsOff:    ()             => ipcRenderer.invoke('lights:all-off'),
 
   // Scenes
   getScenes:    ()            => ipcRenderer.invoke('scenes:get'),
@@ -43,6 +45,11 @@ contextBridge.exposeInMainWorld('hue', {
   // Settings
   getSettings:  (updates) => ipcRenderer.invoke('settings:get'),
   saveSettings: (updates) => ipcRenderer.invoke('settings:save', updates),
+  exportShow:   ()        => ipcRenderer.invoke('config:export-show'),
+  importShow:   ()        => ipcRenderer.invoke('config:import-show'),
+
+  // Event log
+  getEventLog:  ()        => ipcRenderer.invoke('log:get'),
 
   // DMX status
   dmxIsActive: () => ipcRenderer.invoke('dmx:is-active'),
@@ -84,6 +91,8 @@ contextBridge.exposeInMainWorld('hue', {
       'companion:preset-applied',
       'bulb-unreachable',
       'bulb-recovered',
+      'log:event',
+      'lights:all-off',
       'update:available',
       'update:progress',
       'update:downloaded',

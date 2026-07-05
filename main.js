@@ -42,9 +42,11 @@ const DEFAULT_CONFIG = {
   disabledLights: {},
   lightsOrder: [],
   lightAddresses: {},         // { lightId: dmxStartChannel } — custom per-light patch (1-based)
+  lightModes: {},             // { lightId: 'rgb' | 'ct' | 'dim' } — DMX personality (default rgb)
   scenes: {},                 // { sceneName: [ { id, on, rgb, bri } ] }
   lightStates: {},            // { lightId: { on, rgb, bri } } — persisted control-tab state
   lastTab: 'bridge',          // last active tab, restored on launch
+  listenerRunning: false,     // was the DMX listener running at last quit? (auto-resume at launch)
 };
 
 let config = { ...DEFAULT_CONFIG };
@@ -81,9 +83,15 @@ function validateConfig() {
   // Ensure container objects/arrays exist so callers never hit undefined
   if (!config.disabledLights || typeof config.disabledLights !== 'object') config.disabledLights = {};
   if (!config.lightAddresses || typeof config.lightAddresses !== 'object') config.lightAddresses = {};
+  if (!config.lightModes     || typeof config.lightModes     !== 'object') config.lightModes = {};
   if (!config.scenes         || typeof config.scenes         !== 'object') config.scenes = {};
   if (!config.lightStates    || typeof config.lightStates    !== 'object') config.lightStates = {};
   if (!Array.isArray(config.lightsOrder)) config.lightsOrder = [];
+  config.listenerRunning = !!config.listenerRunning;
+  // Only known personalities — anything else falls back to rgb
+  for (const [id, mode] of Object.entries(config.lightModes)) {
+    if (mode !== 'rgb' && mode !== 'ct' && mode !== 'dim') delete config.lightModes[id];
+  }
 }
 
 function saveConfig() {
@@ -148,6 +156,23 @@ function sendToAll(channel, ...args) {
   if (popoverWin && !popoverWin.isDestroyed()) popoverWin.webContents.send(channel, ...args);
 }
 
+// ── Event log ─────────────────────────────────────────────────────────────────
+// Rolling in-memory log of operationally interesting events (bulb drops and
+// recoveries, bridge reconnects, listener start/stop, panic). Surfaced in the
+// Monitor tab so field problems can be diagnosed without a dev console.
+const EVENT_LOG_MAX = 200;
+const eventLog = [];
+
+// type: 'bulb' | 'bridge' | 'listener' | 'panic' | 'info'
+function logEvent(type, message) {
+  const entry = { t: Date.now(), type, message };
+  eventLog.push(entry);
+  if (eventLog.length > EVENT_LOG_MAX) eventLog.shift();
+  sendToAll('log:event', entry);
+}
+
+ipcMain.handle('log:get', () => eventLog);
+
 // ── Bridge health-check / auto-reconnect ──────────────────────────────────────
 // Runs every 30 s. Sends a lightweight GET to the bridge to confirm it's still
 // reachable (also keeps the TCP socket alive between DMX bursts) and silently
@@ -184,6 +209,7 @@ async function healthCheckTick() {
     // Null the API handle so no PUT/GET races against a dead connection, and clear
     // the dedup cache so the reconnect re-sends every light's full current state.
     if (isRebooting) return; // a reboot may have started while the GET was in flight
+    if (hueApi) logEvent('bridge', 'Bridge stopped responding — reconnecting');
     hueApi = null;
     for (const k of Object.keys(lightLastSent)) delete lightLastSent[k];
     await connectToSavedBridge().catch(() => {});
@@ -264,6 +290,7 @@ async function connectToSavedBridge() {
     if (seedCount > 0)
       console.log(`[recovery] ${seedCount} unreachable bulb(s) at startup — recovery poller active`);
     startRecoveryPoller();
+    logEvent('bridge', `Connected to bridge ${config.bridge}`);
     return true;
   } catch (err) {
     console.warn('[bridge] reconnect failed:', err.message);
@@ -333,6 +360,7 @@ async function rebootBridge() {
   }
 
   console.log('[bridge] Reboot command sent — bridge going offline');
+  logEvent('bridge', 'Bridge restart initiated');
   beginRebootOfflineFlow();
   return { success: true };
 }
@@ -436,8 +464,10 @@ function finishReboot(connected, elapsed, outcome) {
   }
   if (outcome === 'no-offline') {
     console.warn(`[bridge] Bridge never went offline after ${elapsed}s — restart likely unsupported on this firmware`);
+    logEvent('bridge', `Bridge restart: never went offline (${elapsed}s) — likely unsupported`);
   } else {
     console.log(`[bridge] Reboot complete — reconnected after ${elapsed}s`);
+    logEvent('bridge', `Bridge restart complete — back online after ${elapsed}s`);
   }
   sendToAll('bridge:reboot-complete', { elapsed, didReboot: outcome === 'rebooted', connected });
 }
@@ -525,17 +555,65 @@ const lightMovingPrev = {};
 //   JITTER      — ignore value changes smaller than this. DMX sources dither by
 //                 ±1-2 units even while "holding"; without this, that jitter
 //                 alone would stream a command every cycle and flood the bridge.
-//   FADE_TT     — transition used while a value is actively moving: long enough
-//                 to cover the gap to the next send (1 s cadence + tick), so a
-//                 fade renders as one continuous glide instead of step-and-hold.
-const SEND_GAP_MS  = 1000;
+//   Fade transitions are computed per tick from the CURRENT send gap (see
+//   computeSendGap) so they always exactly cover the spacing to the next send
+//   and a fade renders as one continuous glide instead of step-and-hold.
+const SEND_GAP_MS  = 1000;   // per-light ceiling; adaptive gap never exceeds this
 const ONOFF_GAP_MS = 500;
 const JITTER       = 3;
-const FADE_TT      = Math.round((SEND_GAP_MS + TICKER_MS) / 100); // 13 ds = 1.3 s
 // A single-tick jump this large cannot be one 250 ms step of a real fade (a
 // full-range 1 s fade moves ~64/tick) — it's a snap cue. Sending it immediately
 // instead of waiting one tick to classify shaves 250 ms off every discrete cue.
 const SNAP_DELTA   = 100;
+
+// ── Fixture personalities ─────────────────────────────────────────────────────
+// Each light's DMX footprint. 'rgb' = 3ch R,G,B. 'ct' = 2ch Intensity + Color
+// Temp (warm→cold). 'dim' = 1ch Intensity. Values ride in the same {r,g,b}
+// slots (ct: r=intensity g=ct, dim: r=intensity) so movement/jitter/snap logic
+// is personality-agnostic.
+function getLightMode(lightId) {
+  const m = config.lightModes && config.lightModes[lightId];
+  return m === 'ct' || m === 'dim' ? m : 'rgb';
+}
+
+function channelsForMode(mode) {
+  return mode === 'ct' ? 2 : mode === 'dim' ? 1 : 3;
+}
+
+function isBlackoutValues(mode, cur) {
+  return mode === 'rgb' ? (cur.r === 0 && cur.g === 0 && cur.b === 0) : cur.r === 0;
+}
+
+// Mode-aware Hue payload. 'ct' maps DMX 0-255 → mireds 153 (cold) … 500 (warm)
+// so fading the CT channel up reads as "warmer", matching how LDs think.
+function buildModePayload(mode, cur, tt) {
+  if (mode === 'rgb') return buildDirectPayload(cur.r, cur.g, cur.b, { tt });
+  if (cur.r === 0)    return { on: false, transitiontime: tt };
+  const payload = {
+    on: true,
+    bri: Math.max(1, Math.round((cur.r / 255) * 254)),
+    transitiontime: tt,
+  };
+  if (mode === 'ct') payload.ct = 153 + Math.round((cur.g / 255) * 347);
+  return payload;
+}
+
+// ── Adaptive send pacing ──────────────────────────────────────────────────────
+// The bridge sustains ~10 commands/sec total, so the per-light command budget
+// depends on how many lights are actually being driven: 3 patched bulbs can
+// each take ~3/sec (visibly smoother fades) while 10+ bulbs get the safe
+// 1/sec ceiling. Clamped to ≥350 ms per light so a tiny rig still can't
+// hammer one bulb's Zigbee link.
+function computeSendGap() {
+  let active = 0;
+  for (const lightId of Object.keys(lightCurrent)) {
+    if (config.disabledLights[lightId]) continue;
+    if (unreachableLights.has(String(lightId))) continue;
+    active++;
+  }
+  if (active <= 0) active = 1;
+  return Math.max(350, Math.min(SEND_GAP_MS, active * 100));
+}
 
 // ── Per-bulb recovery ─────────────────────────────────────────────────────────
 // Set of light IDs (strings) the bridge has marked unreachable.
@@ -601,6 +679,12 @@ function clampByte(v) { return v < 0 ? 0 : v > 255 ? 255 : Math.round(v); }
 function tickBridge() {
   if (!hueApi || !config.bridge || !config.user) return;
   const now = Date.now();
+  // Adaptive per-light budget for this tick, and the fade transition that
+  // exactly covers it so consecutive sends chain into one continuous glide.
+  const sendGap  = computeSendGap();
+  const onoffGap = Math.min(ONOFF_GAP_MS, sendGap);
+  const fadeTt   = Math.round((sendGap + TICKER_MS) / 100);
+
   for (const [lightId, cur] of Object.entries(lightCurrent)) {
     if (config.disabledLights[lightId]) continue;
 
@@ -616,9 +700,10 @@ function tickBridge() {
     // Dead bulbs get no DMX traffic — the recovery system owns them.
     if (unreachableLights.has(String(lightId))) continue;
 
-    const isBlackout = cur.r === 0 && cur.g === 0 && cur.b === 0;
+    const mode = getLightMode(lightId);
+    const isBlackout = isBlackoutValues(mode, cur);
     const last = lightLastSent[lightId];
-    const wasBlackout   = last ? (last.r === 0 && last.g === 0 && last.b === 0) : null;
+    const wasBlackout   = last ? isBlackoutValues(mode, last) : null;
     const onOffBoundary = last != null && isBlackout !== wasBlackout;
 
     let diff = null;
@@ -629,22 +714,22 @@ function tickBridge() {
     }
 
     // Per-light rate cap — protects the bulb's Zigbee link. On/off cues use the
-    // reduced floor so a blackout never waits a full second.
-    const gap = config.noLimit ? 0 : (onOffBoundary ? ONOFF_GAP_MS : SEND_GAP_MS);
-    if (gap > 0 && now - (lightLastSendMs[lightId] || 0) < gap) continue;
+    // reduced floor so a blackout never waits a full send gap.
+    const gap = onOffBoundary ? onoffGap : sendGap;
+    if (now - (lightLastSendMs[lightId] || 0) < gap) continue;
 
     // Pick the transition that matches what the value is doing.
     let tt;
     if (isBlackout)          tt = 0;          // blackout: instant
     else if (onOffBoundary)  tt = FOLLOW_TT;  // lights-up cue: act now, quick ramp
     else if (!moving)        tt = FOLLOW_TT;  // settled target: snappy 300 ms
-    else if (movingPrev)     tt = FADE_TT;    // sustained fade: glide across the send gap
+    else if (movingPrev)     tt = fadeTt;     // sustained fade: glide across the send gap
     else if (diff !== null && diff >= SNAP_DELTA) tt = FOLLOW_TT; // snap cue: too big to be a fade tick — fire now
     else continue;                            // first moving tick of a fade: wait one tick to classify
 
     lightLastSent[lightId]   = { r: cur.r, g: cur.g, b: cur.b };
     lightLastSendMs[lightId] = now;
-    sendDirectState(lightId, buildDirectPayload(cur.r, cur.g, cur.b, { tt }));
+    sendDirectState(lightId, buildModePayload(mode, cur, tt));
   }
 }
 
@@ -661,14 +746,14 @@ function maybeSendBoundaryNow(lightId) {
   const cur  = lightCurrent[lightId];
   const last = lightLastSent[lightId];
   if (!cur || !last) return;                     // first-ever send stays with the ticker
-  const isBlackout  = cur.r === 0 && cur.g === 0 && cur.b === 0;
-  const wasBlackout = last.r === 0 && last.g === 0 && last.b === 0;
+  const mode = getLightMode(lightId);
+  const isBlackout  = isBlackoutValues(mode, cur);
+  const wasBlackout = isBlackoutValues(mode, last);
   if (isBlackout === wasBlackout) return;        // not an on/off boundary
-  const gap = config.noLimit ? 0 : ONOFF_GAP_MS;
-  if (gap > 0 && Date.now() - (lightLastSendMs[lightId] || 0) < gap) return;
+  if (Date.now() - (lightLastSendMs[lightId] || 0) < ONOFF_GAP_MS) return;
   lightLastSent[lightId]   = { r: cur.r, g: cur.g, b: cur.b };
   lightLastSendMs[lightId] = Date.now();
-  sendDirectState(lightId, buildDirectPayload(cur.r, cur.g, cur.b, { tt: isBlackout ? 0 : FOLLOW_TT }));
+  sendDirectState(lightId, buildModePayload(mode, cur, isBlackout ? 0 : FOLLOW_TT));
 }
 
 function startBridgeTicker() {
@@ -710,22 +795,51 @@ function stopRecoveryPoller() {
     recoveryInterval = null;
   }
   unreachableLights.clear();
+  recoveryRotation = [];
+  for (const k of Object.keys(recoveryAttempts)) delete recoveryAttempts[k];
+  for (const k of Object.keys(recoveryNextAt))   delete recoveryNextAt[k];
 }
 
 // Round-robin queue so each 8 s tick probes exactly ONE dead bulb. Every probe
 // to a dead bulb costs the bridge seconds of Zigbee retries; probing the whole
 // set at once multiplies that by the body count and can stall live traffic
 // (Companion / control tab) even while DMX is idle.
+//
+// BACKOFF: bulbs that stay dead probe less often — attempts 1-4 every cycle
+// they come up in rotation, then every ~30 s, then every ~60 s. A permanently
+// unpowered spare stops consuming the probe slot, while a re-powered bulb is
+// still caught quickly by the 30 s reachability sync regardless.
 let recoveryRotation = [];
+const recoveryAttempts = {}; // { sid: count } — reset on recovery
+const recoveryNextAt   = {}; // { sid: ms } — earliest next probe
+
+function recoveryDelayFor(attempts) {
+  if (attempts < 4)  return 0;      // fresh drop — probe every rotation
+  if (attempts < 10) return 30000;  // stubborn — every ~30 s
+  return 60000;                     // long dead — every ~60 s
+}
+
+function clearRecoveryBackoff(sid) {
+  delete recoveryAttempts[sid];
+  delete recoveryNextAt[sid];
+}
 
 function tickRecovery() {
   if (!hueApi || !config.bridge || !config.user) return;
   if (unreachableLights.size === 0) return;
   if (isDmxActive()) return; // never add Zigbee load mid-show — see block comment
   if (recoveryRotation.length === 0) recoveryRotation = [...unreachableLights];
+  const now = Date.now();
   let sid;
   while ((sid = recoveryRotation.shift()) !== undefined) {
-    if (unreachableLights.has(sid)) { sendRecoveryProbe(sid); break; } // skip ids that recovered meanwhile
+    if (!unreachableLights.has(sid)) continue;        // recovered meanwhile
+    if (now < (recoveryNextAt[sid] || 0)) continue;   // backing off
+    if (sendRecoveryProbe(sid)) {
+      const n = (recoveryAttempts[sid] || 0) + 1;
+      recoveryAttempts[sid] = n;
+      recoveryNextAt[sid]   = now + recoveryDelayFor(n);
+    }
+    break;
   }
 }
 
@@ -739,9 +853,9 @@ function sendRecoveryProbe(lightId) {
   if (!config.bridge || !config.user) return false;
   if (isDmxActive()) return false; // in-show recovery is handled by the 30 s sync
 
-  // Honour the same per-light rate limit used by the DMX ticker
+  // Honour the per-light rate ceiling used by the DMX ticker
   const lastMs = lightLastSendMs[lightId] || 0;
-  if (!config.noLimit && Date.now() - lastMs < SEND_GAP_MS) return false; // too soon — retry next cycle
+  if (Date.now() - lastMs < SEND_GAP_MS) return false; // too soon — retry next cycle
 
   lightLastSendMs[lightId] = Date.now();
 
@@ -795,8 +909,10 @@ function confirmReachability(sid) {
         if (body && body.state && body.state.reachable === true) {
           // Bridge confirms the bulb is back on the Zigbee mesh
           unreachableLights.delete(sid);
+          clearRecoveryBackoff(sid);
           delete lightLastSent[sid]; // clear dedup so next DMX tick sends a full resync
           console.log(`[recovery] Bulb ${sid} recovered — resuming DMX control`);
+          logEvent('bulb', `Bulb ${sid} recovered — DMX control resumed`);
           if (mainWindow && !mainWindow.isDestroyed())
             mainWindow.webContents.send('bulb-recovered', { id: sid });
         } else {
@@ -855,6 +971,7 @@ function sendDirectState(lightId, payload) {
           unreachableLights.add(sid);
           if (isNew) {
             console.warn(`[recovery] Bulb ${sid} went unreachable — queued for recovery`);
+            logEvent('bulb', `Bulb ${sid} went unreachable (send failed) — recovery active`);
             if (mainWindow && !mainWindow.isDestroyed())
               mainWindow.webContents.send('bulb-unreachable', { id: sid });
             // Accelerated first attempt — probe after 2 s before the 8 s poller kicks in
@@ -885,22 +1002,58 @@ function sendDirectState(lightId, payload) {
   req.end();
 }
 
-// Raw HTTP/HTTPS request helper for the Hue local REST API.
-// Tries port 80 first; falls back to cert-free HTTPS on failure.
-// Returns the parsed JSON body (rejects on network errors or bad JSON).
-function hueBridgeRequest(method, apiPath, body) {
+// ── Group actions ─────────────────────────────────────────────────────────────
+// One PUT to group 0 (= every light on the bridge). The bridge turns a group
+// action into a single Zigbee groupcast, so a rig-wide blackout costs ONE
+// bridge command instead of one per bulb — instant, and it can't trip the
+// per-light pacing or stall on unreachable bulbs.
+function sendGroupAction(payload) {
+  return new Promise(resolve => {
+    if (!config.bridge || !config.user) { resolve(false); return; }
+    const body = Buffer.from(JSON.stringify(payload));
+    const req = http.request({
+      hostname: config.bridge, port: 80,
+      path:     `/api/${config.user}/groups/0/action`, method: 'PUT',
+      headers:  { 'Content-Type': 'application/json', 'Content-Length': body.length },
+      agent:    keepAliveAgent,
+    }, res => {
+      let data = '';
+      res.on('data', c => { data += c; });
+      res.on('end', () => resolve(res.statusCode < 400 && !data.includes('"error"')));
+    });
+    req.on('error', () => resolve(false));
+    req.setTimeout(5000, () => req.destroy(new Error('timeout')));
+    req.write(body);
+    req.end();
+  });
+}
+
+// Rig-wide instant off. Clears the per-light dedup cache so the next DMX tick
+// re-asserts every light's value cleanly if a show starts afterwards, and
+// tells the renderer so the control tab reflects it.
+async function allLightsOff(source) {
+  const ok = await sendGroupAction({ on: false, transitiontime: 0 });
+  for (const k of Object.keys(lightLastSent)) delete lightLastSent[k];
+  logEvent('panic', `All lights off (${source})${ok ? '' : ' — group command FAILED'}`);
+  sendToAll('lights:all-off', { source });
+  return ok;
+}
+
+ipcMain.handle('lights:all-off', () => allLightsOff('control tab'));
+
+// Low-level JSON request to ANY Hue bridge IP and raw path, HTTP first with a
+// cert-free HTTPS fallback. Single shared implementation behind both
+// hueBridgeRequest (saved bridge, /api/{user} paths) and huePost (pairing
+// against arbitrary IPs) — one home for the destroy()-fires-'error' fallback
+// guard so the duplicated-request bug class can't come back.
+function hueRawRequest(ip, method, rawPath, body, timeoutMs = 8000) {
   return new Promise((resolve, reject) => {
-    const payload = body ? Buffer.from(JSON.stringify(body)) : null;
+    const payload = body != null ? Buffer.from(JSON.stringify(body)) : null;
     const tlsAgent = new https.Agent({ rejectUnauthorized: false, minVersion: 'TLSv1', ciphers: 'ALL' });
 
     function attempt(mod, port) {
-      const opts = {
-        hostname: config.bridge,
-        port,
-        path:     `/api/${config.user}${apiPath}`,
-        method,
-        agent:    port === 443 ? tlsAgent : keepAliveAgent,
-      };
+      const opts = { hostname: ip, port, path: rawPath, method,
+        agent: port === 443 ? tlsAgent : keepAliveAgent };
       if (payload) opts.headers = { 'Content-Type': 'application/json', 'Content-Length': payload.length };
 
       const req = mod.request(opts, res => {
@@ -921,12 +1074,17 @@ function hueBridgeRequest(method, apiPath, body) {
         else reject(err || new Error('Bridge request failed'));
       };
       req.on('error', fallback);
-      req.setTimeout(8000, () => { req.destroy(); fallback(new Error('timeout')); });
+      req.setTimeout(timeoutMs, () => { req.destroy(); fallback(new Error('timeout')); });
       if (payload) req.write(payload);
       req.end();
     }
     attempt(http, 80);
   });
+}
+
+// Request against the SAVED bridge's authed API.
+function hueBridgeRequest(method, apiPath, body) {
+  return hueRawRequest(config.bridge, method, `/api/${config.user}${apiPath}`, body);
 }
 
 // Build a plain-object payload (Hue API units) instead of a LightState object
@@ -1005,13 +1163,21 @@ function processArtnet(data, packetUniverse, defaultUniverse) {
     // (capped at the DMX512 slot count — a malformed length field can't balloon it)
     dmxBuffers[packetUniverse] = Buffer.from(data.length > 512 ? data.slice(0, 512) : data);
 
-    const channelsPerLight = 3;
-    const baseOffset       = (config.dmxAddress - 1) + (config.transition === 'channel' ? 1 : 0);
-    const lightAddresses   = config.lightAddresses || {};
-    const orderedLights    = getOrderedLights();
+    const baseOffset     = (config.dmxAddress - 1) + (config.transition === 'channel' ? 1 : 0);
+    const lightAddresses = config.lightAddresses || {};
+    const orderedLights  = getOrderedLights();
 
+    // Sequential slots advance by each light's personality footprint (3/2/1ch).
+    // Every light consumes its slot whether or not it's custom-patched, so a
+    // custom patch relocates its own light without shifting the neighbours.
+    let seq = baseOffset;
     for (let i = 0; i < orderedLights.length; i++) {
       const light = orderedLights[i];
+      const mode  = getLightMode(light.id);
+      const ch    = channelsForMode(mode);
+      const defaultOffset = seq;
+      seq += ch;
+
       if (config.disabledLights[light.id]) continue;
 
       const raw = lightAddresses[light.id];
@@ -1024,13 +1190,15 @@ function processArtnet(data, packetUniverse, defaultUniverse) {
       if (lightUniverse !== packetUniverse) continue;
 
       // Determine the 0-based offset within this universe's buffer
-      const offset = patch?.channel != null
-        ? (patch.channel - 1)
-        : baseOffset + i * channelsPerLight;
+      const offset = patch?.channel != null ? (patch.channel - 1) : defaultOffset;
 
-      if (offset < 0 || offset + 2 >= data.length) continue;
+      if (offset < 0 || offset + ch - 1 >= data.length) continue;
 
-      updateCurrent(light.id, data[offset], data[offset + 1], data[offset + 2], null);
+      updateCurrent(light.id,
+        data[offset],
+        ch > 1 ? data[offset + 1] : 0,
+        ch > 2 ? data[offset + 2] : 0,
+        null);
       maybeSendBoundaryNow(light.id);
     }
 
@@ -1304,6 +1472,7 @@ function syncUnreachableFromCache() {
         // Newly unreachable — start recovery
         unreachableLights.add(sid);
         console.warn(`[recovery] Bulb ${sid} went unreachable (detected via poll) — queued for recovery`);
+        logEvent('bulb', `Bulb ${sid} (${light.name || 'unknown'}) went unreachable — recovery active`);
         if (mainWindow && !mainWindow.isDestroyed())
           mainWindow.webContents.send('bulb-unreachable', { id: sid });
         // Accelerated first attempt
@@ -1313,8 +1482,10 @@ function syncUnreachableFromCache() {
       if (unreachableLights.has(sid)) {
         // Was unreachable, now showing online in the full fetch
         unreachableLights.delete(sid);
+        clearRecoveryBackoff(sid);
         delete lightLastSent[sid];
         console.log(`[recovery] Bulb ${sid} recovered (detected via poll) — resuming DMX control`);
+        logEvent('bulb', `Bulb ${sid} (${light.name || 'unknown'}) recovered — DMX control resumed`);
         if (mainWindow && !mainWindow.isDestroyed())
           mainWindow.webContents.send('bulb-recovered', { id: sid });
       }
@@ -1338,12 +1509,18 @@ function getOrderedLights() {
 }
 
 function calcDmxChannels() {
-  const channelsPerLight = 3;
-  const base             = (config.dmxAddress - 1) + (config.transition === 'channel' ? 1 : 0);
-  const orderedLights    = getOrderedLights();
-  const lightAddresses   = config.lightAddresses || {};
+  const base           = (config.dmxAddress - 1) + (config.transition === 'channel' ? 1 : 0);
+  const orderedLights  = getOrderedLights();
+  const lightAddresses = config.lightAddresses || {};
   const map = {};
-  orderedLights.forEach((light, i) => {
+  // Cumulative sequential addressing — must mirror processArtnet exactly.
+  let seq = base;
+  orderedLights.forEach((light) => {
+    const mode = getLightMode(light.id);
+    const ch   = channelsForMode(mode);
+    const defaultStart = seq + 1; // 1-based for display
+    seq += ch;
+
     const raw   = lightAddresses[light.id];
     // Backward compat: plain number → treat as { channel: n }
     const patch = (raw != null && typeof raw === 'number') ? { channel: raw } : raw;
@@ -1352,16 +1529,18 @@ function calcDmxChannels() {
     const customUniverse = patch?.universe ?? null;
     const isCustom       = patch != null;
 
-    const start    = customChannel  != null ? customChannel  : base + i * channelsPerLight + 1;
+    const start = customChannel != null ? customChannel : defaultStart;
     // Default universe is protocol-specific: Art-Net uses config.universe, sACN uses config.sacnUniverse
     const defaultUniverse = config.protocol === 'sacn' ? (config.sacnUniverse ?? 1) : (config.universe ?? 0);
     const universe = customUniverse != null ? customUniverse : defaultUniverse;
 
+    const chanNames = mode === 'ct' ? ['Int', 'CT'] : mode === 'dim' ? ['Int'] : ['R', 'G', 'B'];
     map[light.id] = {
       start,
       universe,
-      channels: channelsPerLight,
-      labels:   ['R', 'G', 'B'].map((l, j) => `ch${start + j}:${l}`),
+      channels: ch,
+      mode,
+      labels:   chanNames.map((l, j) => `ch${start + j}:${l}`),
       custom:   isCustom,
     };
   });
@@ -1897,6 +2076,22 @@ ipcMain.handle('lights:set-address', (event, lightId, patch) => {
   return { success: true };
 });
 
+// Set a light's DMX personality: 'rgb' (3ch R,G,B) | 'ct' (2ch Int+CT) |
+// 'dim' (1ch Int). Changing a footprint shifts every sequential slot after it,
+// so the runtime value caches are cleared — the next frames repopulate them
+// with the new mapping within one tick.
+ipcMain.handle('lights:set-mode', (event, lightId, mode) => {
+  if (mode !== 'ct' && mode !== 'dim') mode = 'rgb';
+  if (mode === 'rgb') delete config.lightModes[lightId];
+  else                config.lightModes[lightId] = mode;
+  for (const k of Object.keys(lightCurrent))    delete lightCurrent[k];
+  for (const k of Object.keys(lightTickPrev))   delete lightTickPrev[k];
+  for (const k of Object.keys(lightMovingPrev)) delete lightMovingPrev[k];
+  delete lightLastSent[lightId]; // value slots mean something new for this light
+  saveConfig();
+  return { success: true, mode };
+});
+
 // ── Hue bulb discovery ────────────────────────────────────────────────────────
 
 // POST /lights — tells the bridge to open a 40-second Zigbee inclusion window.
@@ -2002,7 +2197,7 @@ ipcMain.handle('settings:get', () => {
 ipcMain.handle('settings:save', (event, updates) => {
   const safeKeys = [
     'dmxAddress', 'universe', 'sacnUniverse', 'sacnMulticast',
-    'protocol', 'host', 'transition', 'noLimit',
+    'protocol', 'host', 'transition',
     'lightStates', 'lastTab',
   ];
   for (const key of safeKeys) {
@@ -2012,14 +2207,84 @@ ipcMain.handle('settings:save', (event, updates) => {
   return { success: true };
 });
 
-ipcMain.handle('artnet:start', () => {
+// ── Show profile export / import ──────────────────────────────────────────────
+// Everything needed to rebuild this rig on another machine: bridge address +
+// API key (Hue whitelist entries work from any machine), patch, personalities,
+// scenes, and control-tab state. The file contains the bridge API key — treat
+// it like a credential.
+const SHOW_PROFILE_KEYS = [
+  'bridge', 'user', 'dmxAddress', 'universe', 'sacnUniverse', 'sacnMulticast',
+  'protocol', 'host', 'transition', 'disabledLights', 'lightsOrder',
+  'lightAddresses', 'lightModes', 'scenes', 'lightStates',
+];
+
+ipcMain.handle('config:export-show', async () => {
+  const stamp = new Date().toISOString().slice(0, 10);
+  const { canceled, filePath } = await dialog.showSaveDialog({
+    title: 'Export Show Profile',
+    defaultPath: `prism-show-${stamp}.json`,
+    filters: [{ name: 'Prism Show Profile', extensions: ['json'] }],
+  });
+  if (canceled || !filePath) return { success: false, canceled: true };
+  try {
+    const profile = {};
+    for (const k of SHOW_PROFILE_KEYS) profile[k] = config[k];
+    fs.writeFileSync(filePath, JSON.stringify(
+      { prismShowProfile: 1, exportedAt: new Date().toISOString(), config: profile }, null, 2));
+    logEvent('info', `Show profile exported (${path.basename(filePath)})`);
+    return { success: true, path: filePath };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('config:import-show', async () => {
+  const { canceled, filePaths } = await dialog.showOpenDialog({
+    title: 'Import Show Profile',
+    filters: [{ name: 'Prism Show Profile', extensions: ['json'] }],
+    properties: ['openFile'],
+  });
+  if (canceled || !filePaths || !filePaths[0]) return { success: false, canceled: true };
+  try {
+    const raw = JSON.parse(fs.readFileSync(filePaths[0], 'utf8'));
+    if (!raw || raw.prismShowProfile !== 1 || typeof raw.config !== 'object') {
+      return { success: false, error: 'Not a Prism show profile' };
+    }
+    for (const k of SHOW_PROFILE_KEYS) {
+      if (raw.config[k] !== undefined) config[k] = raw.config[k];
+    }
+    validateConfig();
+    invalidateWatchedUniverses();
+    saveConfig();
+    logEvent('info', `Show profile imported (${path.basename(filePaths[0])})`);
+    // Reconnect using the imported bridge credentials
+    hueApi = null;
+    const connected = await connectToSavedBridge().catch(() => false);
+    sendBridgeStatus();
+    return { success: true, connected };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+// Start the listener(s) for the configured protocol. Shared by the UI Start
+// button, the tray popover, and launch-time auto-resume.
+function startConfiguredListener() {
   const p = config.protocol;
-  if (p === 'artnet') return startArtnet();
-  if (p === 'sacn')   return startSACN();
-  // 'both'
-  startArtnet();
-  startSACN();
+  if (p === 'artnet')      startArtnet();
+  else if (p === 'sacn')   startSACN();
+  else { startArtnet(); startSACN(); } // 'both'
   return { success: true };
+}
+
+ipcMain.handle('artnet:start', () => {
+  const res = startConfiguredListener();
+  // Remember across restarts — a headless rig machine that reboots (power
+  // blip, update) must come back listening without anyone opening the window.
+  config.listenerRunning = true;
+  saveConfig();
+  logEvent('listener', `DMX listener started (${config.protocol})`);
+  return res;
 });
 
 ipcMain.handle('artnet:stop', () => {
@@ -2028,6 +2293,9 @@ ipcMain.handle('artnet:stop', () => {
   // stopBridgeTicker() is called inside stopArtnet/stopSACN; calling it here
   // as a safety net in case both were already stopped individually
   stopBridgeTicker();
+  config.listenerRunning = false;
+  saveConfig();
+  logEvent('listener', 'DMX listener stopped');
   // Explicitly broadcast stopped state — stopArtnet/stopSACN don't emit events
   sendToAll('artnet:status', buildStatusPayload());
   return { success: true };
@@ -2096,7 +2364,7 @@ const manualPending = {}; // { lightId: { args, timer } }
 ipcMain.handle('lights:set-state', async (event, lightId, args) => {
   if (!hueApi) return { success: false, error: 'Not connected' };
   const sinceMs = Date.now() - (lightLastSendMs[lightId] || 0);
-  if (!config.noLimit && sinceMs < MANUAL_GAP_MS) {
+  if (sinceMs < MANUAL_GAP_MS) {
     const slot = manualPending[lightId] || (manualPending[lightId] = {});
     slot.args = args; // keep only the newest value
     if (!slot.timer) {
@@ -2164,40 +2432,9 @@ ipcMain.handle('scenes:delete', (event, name) => {
 
 // ── Bridge pairing ───────────────────────────────────────────────────────────
 
-// POST to the Hue pairing endpoint over raw HTTPS — no node-hue-api connect needed.
+// POST to the Hue pairing endpoint — thin wrapper over the shared request core.
 function huePost(ip, path, body) {
-  return new Promise((resolve, reject) => {
-    const payload = JSON.stringify(body);
-    const agent = new https.Agent({ rejectUnauthorized: false, minVersion: 'TLSv1', ciphers: 'ALL' });
-    // Try HTTPS first; fall back to HTTP if HTTPS gets a hard error
-    function attempt(mod, port) {
-      const req = mod.request(
-        { hostname: ip, port, path, method: 'POST', agent: port === 443 ? agent : undefined,
-          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } },
-        (res) => {
-          let data = '';
-          res.on('data', c => { data += c; });
-          res.on('end', () => {
-            try { resolve(JSON.parse(data)); } catch { reject(new Error('Bad JSON from bridge')); }
-          });
-        }
-      );
-      // Same single-fallback guard as hueBridgeRequest: destroy() on timeout
-      // also fires 'error', and a double fallback would double-POST the pairing.
-      let fellBack = false;
-      const fallback = (e) => {
-        if (fellBack) return;
-        fellBack = true;
-        if (port === 80) attempt(https, 443);
-        else reject(e || new Error('timeout'));
-      };
-      req.on('error', fallback);
-      req.setTimeout(5000, () => { req.destroy(); fallback(new Error('timeout')); });
-      req.write(payload);
-      req.end();
-    }
-    attempt(http, 80);
-  });
+  return hueRawRequest(ip, 'POST', path, body, 5000);
 }
 
 async function pairBridge(ip, sender) {
@@ -2244,6 +2481,8 @@ async function pairBridge(ip, sender) {
 
 let companionServer = null;
 const COMPANION_PORT = 38765;
+// Runtime-only — the last preset Companion applied (never persisted to config)
+let activePreset = null;
 
 function startCompanionServer() {
   if (companionServer) return;
@@ -2261,8 +2500,12 @@ function startCompanionServer() {
       send(200, {
         connected: !!hueApi,
         bridge: config.bridge || null,
-        activePreset: config._activePreset || null,
+        activePreset: activePreset || null,
         presets: config.scenes || {},
+        dmxActive: isDmxActive(),
+        listening: isAnyRunning(),
+        unreachable: unreachableLights.size,
+        version: app.getVersion(),
       });
       return;
     }
@@ -2281,7 +2524,7 @@ function startCompanionServer() {
       if (!scene) { send(404, { error: 'Preset not found' }); return; }
       if (!hueApi) { send(503, { error: 'Not connected to bridge' }); return; }
 
-      config._activePreset = name;
+      activePreset = name;
       // Apply each light state from the preset
       (async () => {
         for (const entry of scene) {
@@ -2317,19 +2560,20 @@ function startCompanionServer() {
       return;
     }
 
-    // POST /api/lights/all/off
+    // POST /api/lights/all/off — one group-0 command instead of a per-bulb loop
     if (req.method === 'POST' && url.pathname === '/api/lights/all/off') {
       if (!hueApi) { send(503, { error: 'Not connected' }); return; }
-      (async () => {
-        for (const light of lightsCache) {
-          // Commands to dead bulbs stall the bridge in Zigbee retries — skip them
-          if (unreachableLights.has(String(light.id))) continue;
-          try {
-            const { LightState } = v3.lightStates;
-            await hueApi.lights.setLightState(light.id, new LightState().off());
-          } catch {}
-        }
-      })();
+      allLightsOff('companion').catch(() => {});
+      send(200, { ok: true });
+      return;
+    }
+
+    // POST /api/panic — show-saver: instant rig-wide blackout via group 0.
+    // Same as all/off; separate path so a Companion button can be labeled PANIC
+    // and the event log records it as such.
+    if (req.method === 'POST' && url.pathname === '/api/panic') {
+      if (!hueApi) { send(503, { error: 'Not connected' }); return; }
+      allLightsOff('PANIC').catch(() => {});
       send(200, { ok: true });
       return;
     }
@@ -2489,6 +2733,16 @@ ipcMain.handle('login-item:set', (_, enabled) => {
 app.whenReady().then(() => {
   loadConfig();
   startCompanionServer();
+
+  // Auto-resume the DMX listener if it was running at last quit. Without this,
+  // a machine reboot leaves Prism connected to the bridge but deaf to DMX until
+  // someone opens the window and presses Start — the worst failure mode for a
+  // headless rig machine. The sockets don't need the bridge connection to bind,
+  // so this runs immediately; frames are dropped until hueApi is up.
+  if (config.listenerRunning) {
+    startConfiguredListener();
+    logEvent('listener', `DMX listener auto-resumed (${config.protocol})`);
+  }
 
   // Create tray icon and hidden popover — these live for the entire app lifetime
   createTray();

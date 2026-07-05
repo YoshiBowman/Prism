@@ -1732,7 +1732,7 @@ var require_util = __commonJS({
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.literal = literal;
     exports2.assertNever = assertNever;
-    exports2.combineRgb = combineRgb;
+    exports2.combineRgb = combineRgb2;
     exports2.splitRgb = splitRgb;
     exports2.splitHsl = splitHsl;
     exports2.splitHsv = splitHsv;
@@ -1745,7 +1745,7 @@ var require_util = __commonJS({
     }
     function assertNever(_val) {
     }
-    function combineRgb(r, g, b, a) {
+    function combineRgb2(r, g, b, a) {
       let colorNumber = (r & 255) << 16 | (g & 255) << 8 | b & 255;
       if (a && a >= 0 && a < 1) {
         colorNumber += 16777216 * Math.round(255 * (1 - a));
@@ -5674,9 +5674,10 @@ var require_dist2 = __commonJS({
   }
 });
 
-// dist/index.js
-var { InstanceBase, InstanceStatus, runEntrypoint } = require_dist2();
+// src/index.js
+var { InstanceBase, InstanceStatus, runEntrypoint, combineRgb } = require_dist2();
 var http = require("http");
+var POLL_MS = 2e3;
 var PrismInstance = class extends InstanceBase {
   constructor(internal) {
     super(internal);
@@ -5685,6 +5686,15 @@ var PrismInstance = class extends InstanceBase {
     this.pollTimer = null;
     this.presets = [];
     this.activePreset = null;
+    this.prismStatus = {
+      // last /api/status payload highlights
+      connected: false,
+      bridge: null,
+      dmxActive: false,
+      listening: false,
+      unreachable: 0,
+      version: ""
+    };
   }
   async init(config) {
     this.host = config.host || "localhost";
@@ -5724,7 +5734,7 @@ var PrismInstance = class extends InstanceBase {
     if (this.pollTimer) clearInterval(this.pollTimer);
     this._startPolling();
   }
-  // ── HTTP helpers ──────────────────────────────────────────────────────────
+  // ── HTTP helpers ────────────────────────────────────────────────────────────
   _get(path) {
     return new Promise((resolve, reject) => {
       const req = http.get({ hostname: this.host, port: this.port, path }, (res) => {
@@ -5756,10 +5766,7 @@ var PrismInstance = class extends InstanceBase {
           port: this.port,
           path,
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Content-Length": Buffer.byteLength(payload)
-          }
+          headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) }
         },
         (res) => {
           let data = "";
@@ -5784,10 +5791,10 @@ var PrismInstance = class extends InstanceBase {
       req.end();
     });
   }
-  // ── Polling ───────────────────────────────────────────────────────────────
+  // ── Polling ─────────────────────────────────────────────────────────────────
   _startPolling() {
     this._poll();
-    this.pollTimer = setInterval(() => this._poll(), 3e3);
+    this.pollTimer = setInterval(() => this._poll(), POLL_MS);
   }
   async _poll() {
     try {
@@ -5797,26 +5804,38 @@ var PrismInstance = class extends InstanceBase {
       const changed = JSON.stringify(incoming) !== JSON.stringify(this.presets);
       this.presets = incoming;
       this.activePreset = status.activePreset || null;
-      // Always (re)define on the first successful poll, then only when the preset
-      // list actually changes. Without the !_defined clause, a Prism instance with
-      // zero scenes (incoming === [] === this.presets) would never register the
-      // apply_preset/all_off actions or the preset_active feedback.
-      if (changed || !this._defined) {
-        this._defineAll();
-      }
-      this.checkFeedbacks("preset_active");
+      this.prismStatus = {
+        connected: !!status.connected,
+        bridge: status.bridge || null,
+        dmxActive: !!status.dmxActive,
+        listening: !!status.listening,
+        unreachable: status.unreachable || 0,
+        version: status.version || ""
+      };
+      if (changed || !this._defined) this._defineAll();
+      this.setVariableValues({
+        bridge: this.prismStatus.bridge || "not connected",
+        active_preset: this.activePreset || "none",
+        dmx_active: this.prismStatus.dmxActive ? "yes" : "no",
+        listening: this.prismStatus.listening ? "yes" : "no",
+        unreachable: this.prismStatus.unreachable,
+        preset_count: this.presets.length,
+        prism_version: this.prismStatus.version
+      });
+      this.checkFeedbacks("preset_active", "bridge_connected", "dmx_active", "has_unreachable", "listening");
     } catch {
       this.updateStatus(InstanceStatus.ConnectionFailure, "Cannot reach Prism");
     }
   }
-  // Register all action, feedback, and preset definitions in one place.
+  // Register all action, feedback, variable, and preset definitions.
   _defineAll() {
     this._updateActions();
     this._updateFeedbacks();
+    this._updateVariables();
     this._updatePresets();
     this._defined = true;
   }
-  // ── Actions ───────────────────────────────────────────────────────────────
+  // ── Actions ─────────────────────────────────────────────────────────────────
   _updateActions() {
     const choices = this.presets.map((p) => ({ id: p, label: p }));
     this.setActionDefinitions({
@@ -5852,17 +5871,29 @@ var PrismInstance = class extends InstanceBase {
             this.log("error", `All off failed: ${e.message}`);
           }
         }
+      },
+      panic: {
+        name: "PANIC \u2014 Instant Blackout",
+        description: "One group command to the bridge: every light off with zero transition",
+        options: [],
+        callback: async () => {
+          try {
+            await this._post("/api/panic");
+          } catch (e) {
+            this.log("error", `Panic failed: ${e.message}`);
+          }
+        }
       }
     });
   }
-  // ── Feedbacks ─────────────────────────────────────────────────────────────
+  // ── Feedbacks ───────────────────────────────────────────────────────────────
   _updateFeedbacks() {
     const choices = this.presets.map((p) => ({ id: p, label: p }));
     this.setFeedbackDefinitions({
       preset_active: {
         name: "Preset Is Active",
         type: "boolean",
-        defaultStyle: { bgcolor: 6684876, color: 16777215 },
+        defaultStyle: { bgcolor: combineRgb(102, 0, 204), color: combineRgb(255, 255, 255) },
         options: [
           {
             type: "dropdown",
@@ -5873,45 +5904,92 @@ var PrismInstance = class extends InstanceBase {
             allowCustom: true
           }
         ],
-        callback: (feedback) => {
-          return this.activePreset === feedback.options.preset;
-        }
+        callback: (feedback) => this.activePreset === feedback.options.preset
+      },
+      bridge_connected: {
+        name: "Prism Connected To Bridge",
+        type: "boolean",
+        defaultStyle: { bgcolor: combineRgb(0, 102, 0), color: combineRgb(255, 255, 255) },
+        options: [],
+        callback: () => this.prismStatus.connected
+      },
+      listening: {
+        name: "DMX Listener Running",
+        type: "boolean",
+        defaultStyle: { bgcolor: combineRgb(0, 82, 153), color: combineRgb(255, 255, 255) },
+        options: [],
+        callback: () => this.prismStatus.listening
+      },
+      dmx_active: {
+        name: "DMX Signal Active",
+        type: "boolean",
+        defaultStyle: { bgcolor: combineRgb(153, 102, 0), color: combineRgb(255, 255, 255) },
+        options: [],
+        callback: () => this.prismStatus.dmxActive
+      },
+      has_unreachable: {
+        name: "Any Bulb Unreachable",
+        type: "boolean",
+        defaultStyle: { bgcolor: combineRgb(153, 0, 0), color: combineRgb(255, 255, 255) },
+        options: [],
+        callback: () => this.prismStatus.unreachable > 0
       }
     });
   }
-  // ── Preset buttons ────────────────────────────────────────────────────────
+  // ── Variables ───────────────────────────────────────────────────────────────
+  _updateVariables() {
+    this.setVariableDefinitions([
+      { variableId: "bridge", name: "Bridge IP" },
+      { variableId: "active_preset", name: "Active preset" },
+      { variableId: "dmx_active", name: "DMX signal active (yes/no)" },
+      { variableId: "listening", name: "DMX listener running (yes/no)" },
+      { variableId: "unreachable", name: "Unreachable bulb count" },
+      { variableId: "preset_count", name: "Number of presets" },
+      { variableId: "prism_version", name: "Prism version" }
+    ]);
+  }
+  // ── Preset buttons ──────────────────────────────────────────────────────────
   _updatePresets() {
     const presetDefs = this.presets.map((name) => ({
       category: "Presets",
       name,
       type: "button",
-      style: {
-        text: name,
-        size: "auto",
-        color: 16777215,
-        bgcolor: 6684876
-      },
+      style: { text: name, size: "auto", color: combineRgb(255, 255, 255), bgcolor: combineRgb(102, 0, 204) },
       feedbacks: [
         {
           feedbackId: "preset_active",
           options: { preset: name },
-          style: { bgcolor: 11158783, color: 16777215 }
+          style: { bgcolor: combineRgb(170, 68, 255), color: combineRgb(255, 255, 255) }
         }
       ],
-      steps: [
-        {
-          down: [{ actionId: "apply_preset", options: { preset: name } }],
-          up: []
-        }
-      ]
+      steps: [{ down: [{ actionId: "apply_preset", options: { preset: name } }], up: [] }]
     }));
     presetDefs.push({
       category: "Controls",
       name: "All Off",
       type: "button",
-      style: { text: "All Off", size: "auto", color: 16777215, bgcolor: 3342336 },
+      style: { text: "All Off", size: "auto", color: combineRgb(255, 255, 255), bgcolor: combineRgb(51, 0, 0) },
       feedbacks: [],
       steps: [{ down: [{ actionId: "all_off", options: {} }], up: [] }]
+    });
+    presetDefs.push({
+      category: "Controls",
+      name: "PANIC",
+      type: "button",
+      style: { text: "PANIC", size: "18", color: combineRgb(255, 255, 255), bgcolor: combineRgb(153, 0, 0) },
+      feedbacks: [],
+      steps: [{ down: [{ actionId: "panic", options: {} }], up: [] }]
+    });
+    presetDefs.push({
+      category: "Status",
+      name: "Bridge Status",
+      type: "button",
+      style: { text: "Bridge\\n$(prism:bridge)", size: "auto", color: combineRgb(255, 255, 255), bgcolor: combineRgb(26, 26, 26) },
+      feedbacks: [
+        { feedbackId: "bridge_connected", options: {}, style: { bgcolor: combineRgb(0, 102, 0) } },
+        { feedbackId: "has_unreachable", options: {}, style: { bgcolor: combineRgb(153, 0, 0), text: "UNREACH\\n$(prism:unreachable)" } }
+      ],
+      steps: [{ down: [], up: [] }]
     });
     this.setPresetDefinitions(presetDefs);
   }

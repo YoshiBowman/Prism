@@ -25,7 +25,10 @@ function showTab(name) {
   panels.forEach(p => p.classList.toggle('active', p.id === `panel-${name}`));
   if (name === 'lights'   && state.connected) refreshLights();
   if (name === 'settings') refreshSettings();
-  if (name === 'monitor'  && state.lights.length > 0) buildMonitorCards(state.lights);
+  if (name === 'monitor') {
+    if (state.lights.length > 0) buildMonitorCards(state.lights);
+    loadEventLog();
+  }
   if (name === 'control') {
     // Landing here before the Lights tab has ever loaded (e.g. restored last
     // tab on launch) — fetch the lights so the grid isn't empty.
@@ -687,7 +690,7 @@ function buildLightRow(light) {
   // Channel badges — turn purple when a custom patch is active
   const chBadges = dmx ? dmx.labels.map(l => {
     const [, name] = l.split(':');
-    const cls = { R: 'r', G: 'g', B: 'b', CT: 'ct', Bri: 'bri' }[name] || '';
+    const cls = { R: 'r', G: 'g', B: 'b', CT: 'ct', Bri: 'bri', Int: 'bri' }[name] || '';
     return `<span class="ch-badge ${cls}${dmx.custom ? ' custom-patch' : ''}">${l}</span>`;
   }).join('') : '';
 
@@ -834,6 +837,15 @@ function openLightOptionsPopup(light, trigger) {
 
     <div class="light-opts-divider"></div>
 
+    <div class="light-opts-section-label">Fixture Mode</div>
+    <select class="select select-sm light-opts-mode" style="width:100%">
+      <option value="rgb">Color — 3ch (R, G, B)</option>
+      <option value="ct">Tunable White — 2ch (Int, CT)</option>
+      <option value="dim">Dimmer — 1ch (Int)</option>
+    </select>
+
+    <div class="light-opts-divider"></div>
+
     <div class="light-opts-section-label">Rename</div>
     <div class="light-opts-rename-row">
       <input type="text" class="input light-opts-rename"
@@ -881,6 +893,20 @@ function openLightOptionsPopup(light, trigger) {
     const customBadge = popup.querySelector('.pop-univ-custom');
     if (customBadge) customBadge.style.display = 'none';
     refreshLights();
+  });
+
+  // ── Fixture mode (DMX personality) ─────────────────────────────────────────
+  const modeSel = popup.querySelector('.light-opts-mode');
+  modeSel.value = (light.dmx && light.dmx.mode) || 'rgb';
+  modeSel.addEventListener('change', async () => {
+    const res = await window.hue.setLightMode(light.id, modeSel.value);
+    if (res && res.success) {
+      const names = { rgb: 'Color (3ch)', ct: 'Tunable White (2ch)', dim: 'Dimmer (1ch)' };
+      toast(`"${light.name}" set to ${names[res.mode] || res.mode}`, 'success');
+      refreshLights(); // footprint changed — every sequential address after it shifts
+    } else {
+      toast('Mode change failed', 'error');
+    }
   });
 
   // ── Rename ─────────────────────────────────────────────────────────────────
@@ -976,28 +1002,31 @@ window.hue.on('artnet:dmx-update', (dmx, universe) => {
   updateDmxBars();
   onDmxPacket(univ);
 
-  const { dmxAddress, white, transition } = state.settings;
-  if (!dmxAddress) return;
-  const channelsPerLight = white ? 5 : 3;
-  const base = (dmxAddress - 1) + (transition === 'channel' ? 1 : 0);
   // Use the protocol-aware default universe (same logic as updateDmxBars / updateMonitorCards)
   const proto    = lbProtocol.value;
   const mainUniv = proto === 'sacn'
     ? (parseInt(lbSacnUniverse.value)   || (state.settings.sacnUniverse ?? 1))
     : (parseInt(lbArtnetUniverse.value) || (state.settings.universe     ?? 0));
 
-  // Use per-light addressing from state.lights (supports custom patches)
-  for (let i = 0; i < state.lights.length; i++) {
-    const light = state.lights[i];
+  // light.dmx (from main) is the authoritative patch — start, channel count,
+  // and personality all come from the same map that drives the bridge.
+  for (const light of state.lights) {
+    if (!light.dmx) continue;
     const patch = light.customAddress;
     const lightUniv   = patch?.universe ?? mainUniv;
     const lightBuffer = dmxByUniverse[lightUniv] || [];
-    const offset = patch?.channel != null
-      ? (patch.channel - 1)
-      : base + i * channelsPerLight;
+    const offset = light.dmx.start - 1;
+    const ch     = light.dmx.channels || 3;
 
-    if (offset + 2 >= lightBuffer.length) continue;
-    const r = lightBuffer[offset], g = lightBuffer[offset + 1], b = lightBuffer[offset + 2];
+    if (offset < 0 || offset + ch - 1 >= lightBuffer.length) continue;
+    let r, g, b;
+    if (ch === 3) {
+      r = lightBuffer[offset]; g = lightBuffer[offset + 1]; b = lightBuffer[offset + 2];
+    } else {
+      // Intensity-based personalities (ct/dim) render as warm white at level
+      const v = lightBuffer[offset];
+      r = v; g = Math.round(v * 0.85); b = Math.round(v * 0.6);
+    }
     const on = r > 0 || g > 0 || b > 0;
 
     // Update lights-tab swatch
@@ -1222,9 +1251,21 @@ document.getElementById('btn-all-on').addEventListener('click', () => {
   eachControllableLight((light, s) => { s.on = true; sendLightState(light.id, s); });
   repaintAllTiles();
 });
-document.getElementById('btn-all-off').addEventListener('click', () => {
-  eachControllableLight((light, s) => { s.on = false; sendLightState(light.id, s); });
+document.getElementById('btn-all-off').addEventListener('click', async () => {
+  // One group-0 bridge command — instant rig-wide off. Per-bulb sends would be
+  // paced ~1/sec each; the group action lands everywhere at once.
+  for (const light of state.lights) { const s = controlState[light.id]; if (s) s.on = false; }
+  persistControlState();
   repaintAllTiles();
+  await window.hue.allLightsOff().catch(() => {});
+});
+
+// All-off fired from elsewhere (Companion, panic endpoint) — mirror it in the UI
+window.hue.on('lights:all-off', ({ source } = {}) => {
+  for (const light of state.lights) { const s = controlState[light.id]; if (s) s.on = false; }
+  persistControlState();
+  repaintAllTiles();
+  if (source && source !== 'control tab') toast(`All lights off (${source})`, 'warn');
 });
 
 // Master dimmer + color apply to the lights that are ON — All On/Off are the
@@ -1667,7 +1708,7 @@ function buildMonitorCards(lights) {
 
     const channelRows = light.dmx.labels.map(lbl => {
       const [chStr, name] = lbl.split(':');
-      const cls = { R: 'r', G: 'g', B: 'b', CT: 'ct', Bri: 'bri' }[name] || '';
+      const cls = { R: 'r', G: 'g', B: 'b', CT: 'ct', Bri: 'bri', Int: 'bri' }[name] || '';
       return `<div class="monitor-channel" data-ch="${chStr}">
         <span class="monitor-ch-label">${name}</span>
         <div class="monitor-bar-bg"><div class="monitor-bar-fill ${cls}" style="width:0%"></div></div>
@@ -1687,31 +1728,23 @@ function buildMonitorCards(lights) {
 }
 
 function updateMonitorCards() {
-  const cfg = state.settings;
-  if (!cfg.dmxAddress) return;
-  const channelsPerLight = 3;
-  const base     = (cfg.dmxAddress - 1) + (cfg.transition === 'channel' ? 1 : 0);
   // Read from listener bar (same source of truth used everywhere else), fall back to saved config
+  const cfg      = state.settings;
   const proto    = lbProtocol.value;
   const mainUniv = proto === 'sacn'
     ? (parseInt(lbSacnUniverse.value)   || cfg.sacnUniverse || 1)
     : (parseInt(lbArtnetUniverse.value) || cfg.universe     || 0);
 
-  // Build a quick lookup: lightId → index in state.lights (for sequential offset calc)
-  const lightIndex = {};
-  state.lights.forEach((l, i) => { lightIndex[l.id] = i; });
-
   monitorGrid.querySelectorAll('.monitor-card').forEach(card => {
     const lightId = card.dataset.lightId;
     const light   = state.lights.find(l => String(l.id) === String(lightId));
-    const idx     = lightIndex[lightId] ?? 0;
+    if (!light || !light.dmx) return;
 
-    const patch      = light?.customAddress;
+    const patch      = light.customAddress;
     const lightUniv  = patch?.universe ?? mainUniv;
     const dmx        = dmxByUniverse[lightUniv] || [];
-    const offset     = patch?.channel != null
-      ? (patch.channel - 1)
-      : base + idx * channelsPerLight;
+    const offset     = light.dmx.start - 1;   // authoritative patch from main
+    const chCount    = light.dmx.channels || 3;
 
     const channels = card.querySelectorAll('.monitor-channel');
     let anyActive  = false;
@@ -1723,12 +1756,50 @@ function updateMonitorCards() {
       row.querySelector('.monitor-ch-val').textContent   = val;
     });
 
-    const r = dmx[offset] || 0, g = dmx[offset + 1] || 0, b = dmx[offset + 2] || 0;
+    let r, g, b;
+    if (chCount === 3) {
+      r = dmx[offset] || 0; g = dmx[offset + 1] || 0; b = dmx[offset + 2] || 0;
+    } else {
+      const v = dmx[offset] || 0;
+      r = v; g = Math.round(v * 0.85); b = Math.round(v * 0.6);
+    }
     card.querySelector('.monitor-swatch').style.background =
       (r > 0 || g > 0 || b > 0) ? `rgb(${r},${g},${b})` : 'rgba(255,255,255,0.05)';
     card.classList.toggle('active', anyActive);
   });
 }
+
+// ── Event log (Monitor tab) ───────────────────────────────────────────────────
+
+const eventLogList = document.getElementById('event-log-list');
+
+function fmtLogTime(t) { return new Date(t).toTimeString().slice(0, 8); }
+
+function appendLogEntry(e, newestFirst = true) {
+  const div = document.createElement('div');
+  div.className = `log-entry log-${e.type || 'info'}`;
+  div.innerHTML = `<span class="log-time"></span><span class="log-msg"></span>`;
+  div.querySelector('.log-time').textContent = fmtLogTime(e.t);
+  div.querySelector('.log-msg').textContent  = e.message;
+  if (newestFirst) eventLogList.prepend(div); else eventLogList.appendChild(div);
+  while (eventLogList.children.length > 200) eventLogList.lastChild.remove();
+}
+
+async function loadEventLog() {
+  const entries = await window.hue.getEventLog().catch(() => []);
+  eventLogList.innerHTML = '';
+  if (!entries || entries.length === 0) {
+    eventLogList.innerHTML = '<div class="hint" style="padding:6px 0">No events yet</div>';
+    return;
+  }
+  for (const e of entries.slice().reverse()) appendLogEntry(e, false);
+}
+
+window.hue.on('log:event', (e) => {
+  const placeholder = eventLogList.querySelector('.hint');
+  if (placeholder) placeholder.remove();
+  appendLogEntry(e);
+});
 
 // ── sACN diagnostics ──────────────────────────────────────────────────────────
 
@@ -1820,7 +1891,6 @@ async function refreshSettings() {
   document.getElementById('s-sacn-universe').value  = cfg.sacnUniverse ?? 1;
   document.getElementById('s-sacn-multicast').checked = cfg.sacnMulticast !== false;
   document.getElementById('s-transition').value     = cfg.transition === 'channel' ? 'channel' : (cfg.transition ?? 100);
-  document.getElementById('s-nolimit').checked      = !!cfg.noLimit;
 
   // Launch at Login (read from OS — not stored in config.json)
   const loginItemEl = document.getElementById('s-login-item');
@@ -1857,6 +1927,25 @@ document.getElementById('s-universe').addEventListener('input', () => {
   lbArtnetUniverse.value = document.getElementById('s-universe').value;
 });
 
+// ── Show profile export / import ─────────────────────────────────────────────
+document.getElementById('btn-export-show').addEventListener('click', async () => {
+  const res = await window.hue.exportShow().catch(() => null);
+  if (res && res.success) toast('Show profile exported', 'success');
+  else if (res && !res.canceled) toast(`Export failed: ${res.error || ''}`, 'error');
+});
+
+document.getElementById('btn-import-show').addEventListener('click', async () => {
+  const res = await window.hue.importShow().catch(() => null);
+  if (res && res.success) {
+    toast(res.connected ? 'Show imported — bridge connected' : 'Show imported', 'success');
+    await refreshSettings();
+    setBridgeStatus(!!res.connected, state.settings.bridge || null, false);
+    if (res.connected) refreshLights();
+  } else if (res && !res.canceled) {
+    toast(`Import failed: ${res.error || ''}`, 'error');
+  }
+});
+
 document.getElementById('btn-save-settings').addEventListener('click', async () => {
   const transRaw = document.getElementById('s-transition').value.trim();
   const updates  = {
@@ -1867,7 +1956,6 @@ document.getElementById('btn-save-settings').addEventListener('click', async () 
     sacnMulticast: document.getElementById('s-sacn-multicast').checked,
     host:          document.getElementById('s-nic').value || '0.0.0.0',
     transition:    transRaw === 'channel' ? 'channel' : (parseInt(transRaw) || 100),
-    noLimit:       document.getElementById('s-nolimit').checked,
   };
 
   await window.hue.saveSettings(updates);

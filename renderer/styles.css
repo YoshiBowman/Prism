@@ -1305,6 +1305,47 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
 
 /* ── Monitor panel ──────────────────────────────────────────────────────────── */
 
+/* Event log */
+#event-log-card {
+  margin-top: 16px;
+  background: var(--glass);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 16px;
+}
+#event-log-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+#event-log-list {
+  max-height: 240px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.log-entry {
+  display: flex;
+  gap: 10px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  border-left: 2px solid transparent;
+}
+.log-entry:nth-child(odd) { background: rgba(255,255,255,0.03); }
+.log-time { color: var(--text3); flex-shrink: 0; }
+.log-msg  { color: var(--text2); word-break: break-word; }
+.log-bulb     { border-left-color: var(--yellow); }
+.log-bridge   { border-left-color: var(--blue); }
+.log-listener { border-left-color: var(--accent2); }
+.log-panic    { border-left-color: var(--red); }
+.log-info     { border-left-color: var(--border2); }
+
 #monitor-signal-bar {
   display: flex;
   align-items: center;

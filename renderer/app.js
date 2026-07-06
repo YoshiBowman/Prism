@@ -150,7 +150,8 @@ window.hue.on('artnet:status', ({ running, error }) => setListenerRunning(runnin
 const bridgeStatusDot  = document.getElementById('bridge-status-dot');
 const bridgeStatusText = document.getElementById('bridge-status-text');
 const bridgeList       = document.getElementById('bridge-list');
-const pairDialog       = document.getElementById('pair-dialog');
+const pairModalOverlay = document.getElementById('pair-modal-overlay');
+function setPairDialogVisible(v) { pairModalOverlay.style.display = v ? 'flex' : 'none'; }
 const pairCountdown    = document.getElementById('pair-countdown');
 const pairMessage      = document.getElementById('pair-message');
 const pairTimerBar     = document.getElementById('pair-timer-bar');
@@ -256,7 +257,14 @@ document.getElementById('btn-scan').addEventListener('click', async () => {
     ? `Scan complete — ${count} bridge${count !== 1 ? 's' : ''} found`
     : 'Scan complete';
   if (count === 0 && !bridgeList.querySelector('.bridge-item')) {
-    bridgeList.innerHTML = '<div class="empty-state"><p>No bridges found</p><small>Check that your Hue bridge is powered on and connected to this network</small></div>';
+    bridgeList.innerHTML = `<div class="empty-state">
+      <p>No bridges found</p>
+      <small>The scan can only search subnets this computer can see — a bridge on a
+      different VLAN or subnet won't announce itself here. If you know the bridge's IP,
+      the <strong>Manual IP</strong> field below is the reliable path (it works whenever the
+      bridge is routable). Or add its subnet in <strong>Additional Subnet</strong> above and
+      re-scan.</small>
+    </div>`;
   }
 });
 
@@ -290,12 +298,12 @@ async function startPair(ip) {
   pairStepVerify.style.display = '';
   pairStepLink.style.display   = 'none';
   pairMessage.textContent      = '';
-  pairDialog.className         = 'card visible';
+  setPairDialogVisible(true);
 
   const verify = await window.hue.verifyBridge(ip);
   if (!verify.success) {
     state.pairing        = false;
-    pairDialog.className = 'card';
+    setPairDialogVisible(false);
     setBridgeStatus(false, null, false);
     toast(`Bridge not found at ${ip} — check the IP address`, 'error');
     return;
@@ -303,7 +311,7 @@ async function startPair(ip) {
 
   if (verify.autoConnected) {
     state.pairing        = false;
-    pairDialog.className = 'card';
+    setPairDialogVisible(false);
     setBridgeStatus(true, ip);
     window.hue.bridgeStatus().then(s => setBridgeStatus(true, s.bridge));
     bridgeList.innerHTML = '';
@@ -331,7 +339,7 @@ window.hue.on('bridge:pair-event', (event) => {
     pairMessage.textContent      = '';
   } else if (event.type === 'success') {
     state.pairing        = false;
-    pairDialog.className = 'card';
+    setPairDialogVisible(false);
     setBridgeStatus(true, state.bridge || '');
     window.hue.bridgeStatus().then(s => setBridgeStatus(true, s.bridge));
     // Clear the discovered list — no point showing "Connect" on a bridge we just connected to
@@ -341,7 +349,7 @@ window.hue.on('bridge:pair-event', (event) => {
     showTab('lights');
   } else if (event.type === 'error') {
     state.pairing        = false;
-    pairDialog.className = 'card';
+    setPairDialogVisible(false);
     setBridgeStatus(false, null, false);
     toast(`Pairing failed: ${event.message}`, 'error');
   } else if (event.type === 'timeout') {
@@ -355,8 +363,8 @@ window.hue.on('bridge:pair-event', (event) => {
 });
 
 function cancelPairing() {
-  state.pairing        = false;
-  pairDialog.className = 'card';
+  state.pairing = false;
+  setPairDialogVisible(false);
   setBridgeStatus(false, null, false);
 }
 document.getElementById('btn-cancel-pair').addEventListener('click', cancelPairing);

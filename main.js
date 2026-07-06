@@ -1559,7 +1559,7 @@ function calcDmxChannels() {
 const HUE_OUI = ['00:17:88', 'ec:b5:fa', 'c4:29:96', 'b8:27:eb', 'a4:34:d9'];
 
 // Probe a single IP on both HTTP :80 and HTTPS :443 for the Hue /api/config endpoint.
-function probeHueBridge(ip, timeoutMs = 1500) {
+function probeHueBridge(ip, timeoutMs = 2200) {
   function tryFetch(mod, port) {
     const opts = {
       hostname: ip, port, path: '/api/config',
@@ -1780,7 +1780,7 @@ function resolveMDNSService(instanceName) {
       if (!hostname) { resolve(null); return; }
       const ip = await resolveDotLocal(hostname).catch(() => null);
       resolve(ip ? { ip, name: `Hue Bridge — ${instanceName}`, bridgeid } : null);
-    }, 2500);
+    }, 3500);
   });
 }
 
@@ -1792,7 +1792,7 @@ function resolveDotLocal(hostname) {
       if (m) { proc.kill(); resolve(m[1]); }
     });
     proc.on('error', () => resolve(null));
-    setTimeout(() => { proc.kill(); resolve(null); }, 2000);
+    setTimeout(() => { proc.kill(); resolve(null); }, 2800);
   });
 }
 
@@ -1886,7 +1886,7 @@ ipcMain.handle('bridge:discover', async (event, ifaceIp, extraSubnets = []) => {
       await localConnect(config.bridge, config.user);
       emit({ ip: config.bridge, name: 'Hue Bridge', bridgeid: null });
     } catch {
-      const savedResult = await probeHueBridge(config.bridge, 2000).catch(() => null);
+      const savedResult = await probeHueBridge(config.bridge, 3000).catch(() => null);
       if (savedResult) emit(savedResult);
     }
   }
@@ -1901,7 +1901,7 @@ ipcMain.handle('bridge:discover', async (event, ifaceIp, extraSubnets = []) => {
   // ARP hits are OUI matches only — confirm each is actually a Hue bridge
   // before offering a Connect button (an OUI match alone can be any Philips
   // device, or a Raspberry Pi running anything).
-  const arpVerified = (await Promise.all(arpCandidates.map(c => probeHueBridge(c.ip, 1500)))).filter(Boolean);
+  const arpVerified = (await Promise.all(arpCandidates.map(c => probeHueBridge(c.ip, 2500)))).filter(Boolean);
   for (const b of arpVerified) emit(b);
   for (const b of portalResults) emit(b);
 
@@ -1914,7 +1914,7 @@ ipcMain.handle('bridge:discover', async (event, ifaceIp, extraSubnets = []) => {
   // ── Phase 2: mDNS (finds bridges on any reachable subnet, incl. direct connections) ──
   if (scanCancelled) return { success: true, bridges: found };
   if (!sender.isDestroyed()) sender.send('bridge:scan-progress', { phase: 'mdns', completed: 0, total: 0, subnets: [] });
-  const mdnsResults = await mDNSDiscover(4500).catch(() => []);
+  const mdnsResults = await mDNSDiscover(5500).catch(() => []);
   for (const b of mdnsResults) emit(b);
 
   // ── Phase 3: HTTP/HTTPS subnet scan fallback ──
@@ -1930,7 +1930,7 @@ ipcMain.handle('bridge:discover', async (event, ifaceIp, extraSubnets = []) => {
   if (subnets.length > 0) {
     const ips = [];
     for (const s of subnets) for (let i = 1; i <= 254; i++) ips.push(`${s}.${i}`);
-    const CONCURRENCY = 20;
+    const CONCURRENCY = 40;
     let completed = 0;
 
     for (let i = 0; i < ips.length; i += CONCURRENCY) {

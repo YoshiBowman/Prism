@@ -163,36 +163,6 @@
       </div>
     </div>
 
-    <!-- Pairing dialog -->
-    <div id="pair-dialog" class="card">
-      <h2>Bridge Pairing</h2>
-
-      <div id="pair-step-verify" class="pair-step">
-        <div style="display:flex;align-items:center;gap:10px">
-          <div class="spinner"></div>
-          <span id="pair-verify-label">Checking bridge at <span id="pair-ip"></span>…</span>
-        </div>
-      </div>
-
-      <div id="pair-step-link" class="pair-step" style="display:none">
-        <div class="pair-found-banner">
-          ✓ Bridge found — <span id="pair-bridge-name"></span>
-        </div>
-        <div class="pair-link-instruction">
-          <div class="pair-link-icon">◉</div>
-          <div>
-            <strong>Press the round link button on top of your Hue Bridge</strong>
-            <p>The button is on the physical hardware. You have <span id="pair-countdown">30</span> seconds.</p>
-          </div>
-        </div>
-        <div class="scan-progress-bar-bg" style="margin-top:12px">
-          <div id="pair-timer-bar" class="scan-progress-bar-fill" style="background:var(--green);width:100%;transition:width 1s linear"></div>
-        </div>
-        <div id="pair-message" style="font-size:11px;color:var(--text3);margin-top:8px">Waiting…</div>
-      </div>
-
-      <button id="btn-cancel-pair" class="btn btn-secondary btn-sm" style="margin-top:16px">Cancel</button>
-    </div>
   </div>
 
   <!-- Lights panel -->
@@ -415,6 +385,40 @@
 
 <!-- DMX channel bar (bottom) -->
 <div id="dmx-bar-wrap"></div>
+
+<!-- Bridge pairing modal — centered overlay so the 30 s link-button countdown
+     can never render below the fold -->
+<div id="pair-modal-overlay" class="modal-overlay" style="display:none">
+  <div id="pair-dialog" class="modal-box">
+    <h2>Bridge Pairing</h2>
+
+    <div id="pair-step-verify" class="pair-step">
+      <div style="display:flex;align-items:center;gap:10px">
+        <div class="spinner"></div>
+        <span id="pair-verify-label">Checking bridge at <span id="pair-ip"></span>…</span>
+      </div>
+    </div>
+
+    <div id="pair-step-link" class="pair-step" style="display:none">
+      <div class="pair-found-banner">
+        ✓ Bridge found — <span id="pair-bridge-name"></span>
+      </div>
+      <div class="pair-link-instruction">
+        <div class="pair-link-icon">◉</div>
+        <div>
+          <strong>Press the round link button on top of your Hue Bridge</strong>
+          <p>The button is on the physical hardware. You have <span id="pair-countdown">30</span> seconds.</p>
+        </div>
+      </div>
+      <div class="scan-progress-bar-bg" style="margin-top:12px">
+        <div id="pair-timer-bar" class="scan-progress-bar-fill" style="background:var(--green);width:100%;transition:width 1s linear"></div>
+      </div>
+      <div id="pair-message" style="font-size:11px;color:var(--text3);margin-top:8px">Waiting…</div>
+    </div>
+
+    <button id="btn-cancel-pair" class="btn btn-secondary btn-sm" style="margin-top:16px">Cancel</button>
+  </div>
+</div>
 
 <!-- Restart-bridge confirmation modal -->
 <div id="reboot-modal-overlay" class="modal-overlay" style="display:none">

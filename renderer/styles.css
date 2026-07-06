@@ -423,12 +423,11 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
 
 /* ── Pairing dialog ─────────────────────────────────────────────────────────── */
 
+/* Pairing lives in a centered modal (.modal-overlay/.modal-box) — width only */
 #pair-dialog {
-  display: none;
-  max-width: 480px;
-  margin-top: 16px;
+  width: 480px;
+  max-width: 92vw;
 }
-#pair-dialog.visible { display: block; }
 
 .pair-found-banner {
   background: rgba(52,211,153,0.1);

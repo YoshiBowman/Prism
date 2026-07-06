@@ -1586,64 +1586,84 @@ function syncTilesFromScene(name) {
 
 async function loadScenes() {
   scenesCache = await window.hue.getScenes() || {};
-  const sceneChips = document.getElementById('scene-chips');
-  sceneChips.innerHTML = '';
+  const wrap = document.getElementById('scene-cards');
+  wrap.innerHTML = '';
 
   for (const name of Object.keys(scenesCache)) {
-    const chip = document.createElement('div');
-    chip.className = 'scene-chip';
-    chip.innerHTML = `<span class="scene-chip-name"></span><button class="scene-chip-x" title="Delete scene">✕</button>`;
-    chip.querySelector('.scene-chip-name').textContent = name;
+    const entries = scenesCache[name] || [];
+    // Color preview built from the scene's lit fixtures — the card *shows*
+    // the look instead of just naming it.
+    const colors  = entries.filter(e => e.on && e.rgb).map(e => e.rgb).slice(0, 6);
+    const tint = colors.length >= 2 ? `linear-gradient(135deg, ${colors.join(', ')})`
+               : colors.length === 1 ? colors[0]
+               : 'rgba(255,255,255,0.06)';
+    const onCount = entries.filter(e => e.on).length;
 
-    chip.addEventListener('click', async (e) => {
-      if (e.target.closest('.scene-chip-x')) return;
+    const card = document.createElement('div');
+    card.className = 'scene-card';
+    card.innerHTML = `
+      <div class="scene-card-tint"></div>
+      <button class="scene-card-x" title="Delete scene">✕</button>
+      <div class="scene-card-name"></div>
+      <div class="scene-card-meta"></div>`;
+    card.querySelector('.scene-card-tint').style.background = tint;
+    card.querySelector('.scene-card-name').textContent = name;
+    card.querySelector('.scene-card-name').title = name;
+    card.querySelector('.scene-card-meta').textContent = entries.length
+      ? (onCount > 0 ? `${onCount} of ${entries.length} on` : `all ${entries.length} off`)
+      : 'empty scene';
+
+    card.addEventListener('click', async (e) => {
+      if (e.target.closest('.scene-card-x')) return;
       const res = await window.hue.applyScene(name);
       if (res.success) {
-        chip.classList.add('applied');
-        setTimeout(() => chip.classList.remove('applied'), 900);
+        wrap.querySelectorAll('.scene-card.applied').forEach(c => c.classList.remove('applied'));
+        card.classList.add('applied');
+        setTimeout(() => card.classList.remove('applied'), 1200);
         syncTilesFromScene(name);
       } else {
         toast(`Scene failed: ${(res.errors || []).join(', ')}`, 'error');
       }
     });
 
-    const x = chip.querySelector('.scene-chip-x');
+    const x = card.querySelector('.scene-card-x');
     let confirmTimer = null;
     x.addEventListener('click', async (e) => {
       e.stopPropagation();
-      if (chip.classList.contains('confirm-delete')) {
+      if (card.classList.contains('confirm-delete')) {
         clearTimeout(confirmTimer);
         await window.hue.deleteScene(name);
-        chip.remove();
+        card.remove();
         toast(`Scene "${name}" deleted`, 'info');
       } else {
-        chip.classList.add('confirm-delete');
-        confirmTimer = setTimeout(() => chip.classList.remove('confirm-delete'), 2500);
+        card.classList.add('confirm-delete');
+        confirmTimer = setTimeout(() => card.classList.remove('confirm-delete'), 2500);
       }
     });
 
-    sceneChips.appendChild(chip);
+    wrap.appendChild(card);
   }
 
-  // "+ Save Scene" chip — transforms into an inline name input
+  // "+ Save Scene" card — becomes an inline name input
+  const ADD_HTML = `<div class="scene-card-name">+ Save Scene</div><div class="scene-card-meta">snapshot the current look</div>`;
   const add = document.createElement('div');
-  add.className = 'scene-chip scene-chip-add';
-  add.textContent = '+ Save Scene';
+  add.className = 'scene-card scene-card-add';
+  add.innerHTML = ADD_HTML;
   add.title = 'Save the current look as a scene';
   add.addEventListener('click', () => {
     if (add.querySelector('input')) return;
-    add.textContent = '';
+    add.innerHTML = '';
     const inp = document.createElement('input');
-    inp.className   = 'scene-chip-input';
+    inp.className   = 'scene-card-input';
     inp.placeholder = 'Scene name…';
     add.appendChild(inp);
     inp.focus();
-    const cancel = () => { if (add.isConnected) { add.textContent = '+ Save Scene'; } };
+    const restore = () => { if (add.isConnected) add.innerHTML = ADD_HTML; };
     inp.addEventListener('keydown', async (e) => {
-      if (e.key === 'Escape') { cancel(); return; }
+      if (e.key === 'Escape') { restore(); return; }
       if (e.key !== 'Enter') return;
       const name = inp.value.trim();
-      if (!name) { cancel(); return; }
+      if (!name) { restore(); return; }
       const snapshot = state.lights
         .filter(l => controlState[l.id])
         .map(l => ({ id: l.id, ...controlState[l.id] }));
@@ -1651,9 +1671,9 @@ async function loadScenes() {
       toast(`Scene "${name}" saved`, 'success');
       await loadScenes();
     });
-    inp.addEventListener('blur', () => setTimeout(cancel, 100));
+    inp.addEventListener('blur', () => setTimeout(restore, 100));
   });
-  sceneChips.appendChild(add);
+  wrap.appendChild(add);
 }
 
 // ── Monitor panel ─────────────────────────────────────────────────────────────

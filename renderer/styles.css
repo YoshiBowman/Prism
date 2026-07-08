@@ -1090,9 +1090,10 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
   color: var(--text2);
   text-shadow: 0 1px 3px rgba(0,0,0,0.5);
 }
-.scene-card-x {
+.scene-card-x,
+.scene-card-update {
   position: absolute;
-  top: 8px; right: 8px;
+  top: 8px;
   z-index: 2;
   border: none;
   background: rgba(0,0,0,0.35);
@@ -1103,10 +1104,21 @@ body[data-platform="linux"] #titlebar { padding-left: 16px; }
   line-height: 1;
   cursor: pointer;
   opacity: 0;
-  transition: opacity 120ms ease, color 120ms ease;
+  padding: 0;
+  transition: opacity 120ms ease, color 120ms ease, background 120ms ease;
 }
-.scene-card:hover .scene-card-x { opacity: 1; }
+.scene-card-x      { right: 8px; }
+.scene-card-update { right: 34px; font-size: 13px; }
+.scene-card:hover .scene-card-x,
+.scene-card:hover .scene-card-update { opacity: 1; }
 .scene-card-x:hover { color: var(--red); }
+.scene-card-update:hover { color: var(--accent2); }
+/* Armed state — click again to overwrite */
+.scene-card-update.confirming {
+  opacity: 1;
+  background: var(--accent2);
+  color: #fff;
+}
 .scene-card.applied {
   border-color: var(--green);
   box-shadow: 0 0 0 1px rgba(52,211,153,0.4), 0 0 20px rgba(52,211,153,0.25);

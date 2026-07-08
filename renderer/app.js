@@ -1592,6 +1592,13 @@ function syncTilesFromScene(name) {
   persistControlState();
 }
 
+// Snapshot the current control-tab state as a scene payload.
+function snapshotCurrentLook() {
+  return state.lights
+    .filter(l => controlState[l.id])
+    .map(l => ({ id: l.id, ...controlState[l.id] }));
+}
+
 async function loadScenes() {
   scenesCache = await window.hue.getScenes() || {};
   const wrap = document.getElementById('scene-cards');
@@ -1611,6 +1618,7 @@ async function loadScenes() {
     card.className = 'scene-card';
     card.innerHTML = `
       <div class="scene-card-tint"></div>
+      <button class="scene-card-update" title="Update scene to the current look">↻</button>
       <button class="scene-card-x" title="Delete scene">✕</button>
       <div class="scene-card-name"></div>
       <div class="scene-card-meta"></div>`;
@@ -1634,10 +1642,31 @@ async function loadScenes() {
       }
     });
 
+    // ── Update: overwrite this scene with the current look (two-click confirm) ──
+    const upd = card.querySelector('.scene-card-update');
+    let updTimer = null;
+    upd.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      if (upd.classList.contains('confirming')) {
+        clearTimeout(updTimer);
+        upd.classList.remove('confirming');
+        await window.hue.saveScene(name, snapshotCurrentLook());
+        toast(`Scene "${name}" updated`, 'success');
+        await loadScenes();
+      } else {
+        // Cancel any pending delete-confirm so the two states can't overlap
+        card.classList.remove('confirm-delete');
+        upd.classList.add('confirming');
+        upd.title = 'Click again to overwrite this scene';
+        updTimer = setTimeout(() => { upd.classList.remove('confirming'); upd.title = 'Update scene to the current look'; }, 2500);
+      }
+    });
+
     const x = card.querySelector('.scene-card-x');
     let confirmTimer = null;
     x.addEventListener('click', async (e) => {
       e.stopPropagation();
+      upd.classList.remove('confirming'); // clear a pending update-confirm
       if (card.classList.contains('confirm-delete')) {
         clearTimeout(confirmTimer);
         await window.hue.deleteScene(name);
@@ -1672,11 +1701,9 @@ async function loadScenes() {
       if (e.key !== 'Enter') return;
       const name = inp.value.trim();
       if (!name) { restore(); return; }
-      const snapshot = state.lights
-        .filter(l => controlState[l.id])
-        .map(l => ({ id: l.id, ...controlState[l.id] }));
-      await window.hue.saveScene(name, snapshot);
-      toast(`Scene "${name}" saved`, 'success');
+      const existed = Object.prototype.hasOwnProperty.call(scenesCache, name);
+      await window.hue.saveScene(name, snapshotCurrentLook());
+      toast(`Scene "${name}" ${existed ? 'updated' : 'saved'}`, 'success');
       await loadScenes();
     });
     inp.addEventListener('blur', () => setTimeout(restore, 100));

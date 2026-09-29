@@ -2198,7 +2198,7 @@ ipcMain.handle('settings:save', (event, updates) => {
   const safeKeys = [
     'dmxAddress', 'universe', 'sacnUniverse', 'sacnMulticast',
     'protocol', 'host', 'transition',
-    'lightStates', 'lastTab',
+    'lightStates', 'lastTab', 'ambient',
   ];
   for (const key of safeKeys) {
     if (updates[key] !== undefined) config[key] = updates[key];
@@ -2593,11 +2593,11 @@ function startCompanionServer() {
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 1100,
-    height: 760,
-    minWidth: 800,
-    minHeight: 600,
-    backgroundColor: '#0d1117',
+    width: 1280,
+    height: 820,
+    minWidth: 1000,
+    minHeight: 640,
+    backgroundColor: '#0F1012',
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),

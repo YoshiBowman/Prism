@@ -30,7 +30,7 @@ let cachedSettings = {};
 
 function applyStatus({ running }) {
   dot.className = running ? 'dot running' : 'dot';
-  statusText.textContent = running ? 'DMX Active' : 'Stopped';
+  statusText.textContent = running ? 'Listening' : 'Input off';
   btnStart.disabled = !!running;
   btnStop.disabled  = !running;
 }

@@ -10,28 +10,60 @@ const state = {
   settings: {},
   pairing: false,
   rebooting: false,
+  dmxActive: false,
+  selectedId: null,     // Patch inspector
+  activeScene: null,    // Control rail highlight
 };
 
 // Per-universe DMX frame cache — keyed by universe number, updated on artnet:dmx-update
 const dmxByUniverse = {};
 
+const $ = (id) => document.getElementById(id);
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function debounce(fn, ms) {
+  let t;
+  return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
+}
+
+function inTextField(el) {
+  return el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable);
+}
+
+// ── Toast ─────────────────────────────────────────────────────────────────────
+
+function toast(message, type = 'info') {
+  const stack = $('toast-stack');
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  el.textContent = message;
+  stack.appendChild(el);
+  setTimeout(() => el.remove(), 3500);
+}
+
 // ── Tabs ─────────────────────────────────────────────────────────────────────
 
+const TAB_ALIASES = { lights: 'patch', monitor: 'log', bridge: 'setup', settings: 'setup' };
 const tabs   = document.querySelectorAll('.tab');
 const panels = document.querySelectorAll('.panel');
+let currentTab = 'setup';
 
 function showTab(name) {
+  name = TAB_ALIASES[name] || name;
+  currentTab = name;
   tabs.forEach(t   => t.classList.toggle('active', t.dataset.tab === name));
   panels.forEach(p => p.classList.toggle('active', p.id === `panel-${name}`));
-  if (name === 'lights'   && state.connected) refreshLights();
-  if (name === 'settings') refreshSettings();
-  if (name === 'monitor') {
-    if (state.lights.length > 0) buildMonitorCards(state.lights);
-    loadEventLog();
-  }
+  document.querySelectorAll('.tab-actions').forEach(a => a.classList.toggle('active', a.dataset.for === name));
+
+  if (name === 'patch' && state.connected) refreshLights();
+  if (name === 'setup') refreshSettings();
+  if (name === 'log') loadEventLog();
   if (name === 'control') {
-    // Landing here before the Lights tab has ever loaded (e.g. restored last
-    // tab on launch) — fetch the lights so the grid isn't empty.
+    // Landing here before the lights have loaded (e.g. restored last tab on
+    // launch) — fetch them so the grid isn't empty.
     if (state.connected && state.lights.length === 0) refreshLights();
     buildControlCards(state.lights);
     loadScenes();
@@ -44,227 +76,347 @@ tabs.forEach(t => t.addEventListener('click', () => {
   window.hue.saveSettings({ lastTab: t.dataset.tab });
 }));
 
-// ── Toast ─────────────────────────────────────────────────────────────────────
+document.querySelectorAll('[data-goto]').forEach(b => b.addEventListener('click', () => {
+  showTab(b.dataset.goto);
+  window.hue.saveSettings({ lastTab: b.dataset.goto });
+}));
 
-function toast(message, type = 'info') {
-  // Toasts live in a fixed stack container so simultaneous messages (e.g.
-  // several bulbs dropping at once) stack instead of painting over each other.
-  let stack = document.getElementById('toast-stack');
-  if (!stack) {
-    stack = document.createElement('div');
-    stack.id = 'toast-stack';
-    document.body.appendChild(stack);
+// ── Universe / light helpers ─────────────────────────────────────────────────
+
+function protocol() { return (state.settings && state.settings.protocol) || 'artnet'; }
+
+function defaultUniverse() {
+  const cfg = state.settings || {};
+  return protocol() === 'sacn' ? (cfg.sacnUniverse ?? 1) : (cfg.universe ?? 0);
+}
+
+function lightUniverse(light) {
+  return light.dmx?.universe ?? light.customAddress?.universe ?? defaultUniverse();
+}
+
+function channelNames(light) {
+  return light.dmx ? light.dmx.labels.map(l => l.split(':')[1]) : [];
+}
+
+const MODE_INFO = {
+  rgb: { short: 'RGB',  title: 'Color',         seg: 'RGB · 3' },
+  ct:  { short: 'I·CT', title: 'Tunable white', seg: 'I·CT · 2' },
+  dim: { short: 'I',    title: 'Dimmer',        seg: 'I · 1' },
+};
+const CH_CLASS = { R: 'm-r', G: 'm-g', B: 'm-b', Int: 'm-i', Bri: 'm-i', CT: 'm-ct' };
+const CH_LABEL = { R: 'Red', G: 'Green', B: 'Blue', Int: 'Int', Bri: 'Int', CT: 'CT' };
+
+function isColorLight(light) {
+  // Hue types: "Extended color light", "Color light", "Color temperature light", "Dimmable light"
+  return !light.type || /^(extended )?color light$/i.test(light.type.trim());
+}
+
+function isUnreachable(light) {
+  return !!(light.state && light.state.reachable === false);
+}
+
+function hexToRgb(hex) {
+  const n = parseInt(String(hex).replace('#', ''), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+// Incoming DMX values for a light's footprint (zeros when nothing received)
+function dmxValues(light) {
+  if (!light.dmx) return [];
+  const buf = dmxByUniverse[lightUniverse(light)] || [];
+  const off = light.dmx.start - 1;
+  const out = [];
+  for (let j = 0; j < light.dmx.channels; j++) out.push(buf[off + j] || 0);
+  return out;
+}
+
+// DMX values → full-intensity color [r,g,b] plus intensity k (0..1).
+// Mirrors main: 'ct' channel 0 = cold (153 mireds) … 255 = warm (500).
+function colorFromDmx(light, vals) {
+  const mode = light.dmx?.mode || 'rgb';
+  if (mode === 'rgb') {
+    const max = Math.max(vals[0] || 0, vals[1] || 0, vals[2] || 0);
+    if (!max) return { c: [0, 0, 0], k: 0 };
+    return { c: [vals[0], vals[1], vals[2]].map(v => (v * 255) / max), k: max / 255 };
   }
-  const el = document.createElement('div');
-  el.className = `toast ${type}`;
-  el.textContent = message;
-  stack.appendChild(el);
-  setTimeout(() => el.remove(), 3500);
+  const k = (vals[0] || 0) / 255;
+  if (mode === 'ct') {
+    const w = (vals[1] || 0) / 255;
+    return { c: [222 + 33 * w, 232 - 52 * w, 255 - 148 * w], k };
+  }
+  return { c: [255, 214, 170], k };
 }
 
-// ── Listener bar (always-visible protocol / universe / start / stop) ──────────
-
-const lbProtocol      = document.getElementById('lb-protocol');
-const lbArtnetUniverse = document.getElementById('lb-artnet-universe');
-const lbSacnUniverse   = document.getElementById('lb-sacn-universe');
-const lbArtnetField    = document.getElementById('lb-artnet-field');
-const lbSacnField      = document.getElementById('lb-sacn-field');
-const lbStart          = document.getElementById('lb-start');
-const lbStop           = document.getElementById('lb-stop');
-const lbStatus         = document.getElementById('lb-status');
-const lbLabel          = document.getElementById('lb-label');
-
-function updateListenerBarVisibility(protocol) {
-  lbArtnetField.style.display = (protocol === 'sacn')   ? 'none' : '';
-  lbSacnField.style.display   = (protocol === 'artnet') ? 'none' : '';
+function colorFromControl(s) {
+  if (!s) return { c: [0, 0, 0], k: 0 };
+  return { c: hexToRgb(s.rgb || '#ffcc66'), k: s.on ? (s.bri || 0) / 100 : 0 };
 }
 
-lbProtocol.addEventListener('change', () => updateListenerBarVisibility(lbProtocol.value));
+function cssColor({ c, k }) {
+  if (!k) return null;
+  const s = Math.max(0.2, k);
+  return `rgb(${c.map(v => Math.round(v * s)).join(', ')})`;
+}
 
-// Keep listener bar ↔ settings universes in sync
-lbArtnetUniverse.addEventListener('input', () => {
-  document.getElementById('s-universe').value = lbArtnetUniverse.value;
-  refreshEffectivePatch();
-});
-lbSacnUniverse.addEventListener('input', () => {
-  document.getElementById('s-sacn-universe').value = lbSacnUniverse.value;
-  updateMulticastHint();
-  refreshEffectivePatch();
-});
+// What a light is actually doing right now: DMX when a signal is live and the
+// light is patched in, otherwise the last manual/bridge state.
+function liveColor(light) {
+  if (signalLive() && !light.disabled && light.dmx) return colorFromDmx(light, dmxValues(light));
+  return colorFromControl(controlState[light.id]);
+}
 
-async function listenerBarStart() {
-  // Save current values before starting
-  const proto       = lbProtocol.value;
-  const artnetUniv  = parseInt(lbArtnetUniverse.value) || 0;
-  const sacnUniv    = parseInt(lbSacnUniverse.value)   || 1;
+// ── Ambient background ───────────────────────────────────────────────────────
+// Fixtures in rig order are bucketed left→right; each bucket's color is the
+// level-weighted mix of its lights, blended into the dark base by `ambient`.
 
-  await window.hue.saveSettings({ protocol: proto, universe: artnetUniv, sacnUniverse: sacnUniv });
-  state.settings.protocol      = proto;
-  state.settings.universe      = artnetUniv;
-  state.settings.sacnUniverse  = sacnUniv;
+const BASE = [15, 16, 18];
+let ambientQueued = false;
 
+function scheduleAmbient() {
+  if (ambientQueued) return;
+  ambientQueued = true;
+  requestAnimationFrame(() => { ambientQueued = false; paintAmbient(); });
+}
+
+function paintAmbient() {
+  const app = $('app');
+  const strength = (state.settings.ambient ?? 45) / 100;
+  const lights = state.connected
+    ? state.lights.filter(l => !l.disabled && !isUnreachable(l)).map(liveColor)
+    : [];
+  if (!lights.length || strength === 0) { app.style.backgroundImage = 'none'; return; }
+
+  const N = 5;
+  const stops = [];
+  for (let i = 0; i < N; i++) {
+    const chunk = lights.filter((_, j) => Math.floor((j * N) / lights.length) === i);
+    let w = 0, r = 0, g = 0, b = 0;
+    for (const l of chunk) { w += l.k; r += l.c[0] * l.k; g += l.c[1] * l.k; b += l.c[2] * l.k; }
+    const col = w > 0 ? [r / w, g / w, b / w] : BASE;
+    const m = strength * (chunk.length ? Math.min(1, w / chunk.length) : 0);
+    stops.push(`rgb(${col.map((v, j) => Math.round(BASE[j] + (v - BASE[j]) * m)).join(', ')})`);
+  }
+  app.style.backgroundImage =
+    'linear-gradient(180deg, rgba(15,16,18,0) 0%, rgba(15,16,18,0.5) 50%, rgba(15,16,18,0.92) 100%), ' +
+    `linear-gradient(90deg, ${stops.join(', ')})`;
+}
+
+// ── Status strip ─────────────────────────────────────────────────────────────
+
+function protoLabel(p = protocol()) {
+  return p === 'sacn' ? 'sACN' : p === 'both' ? 'Art-Net + sACN' : 'Art-Net';
+}
+
+function setDot(el, kind) {
+  el.className = 'dot' + (kind ? ` dot-${kind}` : '') + (kind === 'warn' ? ' pulse' : '');
+}
+
+function paintBridgeStatus() {
+  const dot = $('sb-bridge-dot'), val = $('sb-bridge-value');
+  if (state.rebooting)      { setDot(dot, 'warn'); val.textContent = 'Restarting…'; }
+  else if (state.pairing)   { setDot(dot, 'warn'); val.textContent = 'Pairing…'; }
+  else if (state.connected) { setDot(dot, 'ok');   val.textContent = state.bridge || 'Connected'; }
+  else                      { setDot(dot, 'bad');  val.textContent = 'Not connected'; }
+  val.classList.toggle('bad', !state.connected && !state.pairing && !state.rebooting);
+}
+
+function paintInputStatus() {
+  const cfg = state.settings || {};
+  const p = protocol();
+  $('sb-input-label').textContent = p === 'both'
+    ? `Art-Net ${cfg.universe ?? 0} · sACN ${cfg.sacnUniverse ?? 1}`
+    : `${protoLabel(p)} U${defaultUniverse()}`;
+
+  const dot = $('sb-input-dot'), val = $('sb-input-value');
+  if (!state.artnetRunning)  { setDot(dot, null); val.textContent = 'Off'; }
+  else if (signalLive())     { setDot(dot, 'ok'); val.textContent = packetRate ? `${packetRate} Hz` : 'Receiving'; }
+  else if (lastPacketMs)     { setDot(dot, 'bad'); val.textContent = 'Signal lost'; }
+  else                       { setDot(dot, null); val.textContent = 'Listening · no signal'; }
+
+  const btn = $('btn-listen');
+  btn.setAttribute('aria-checked', String(!!state.artnetRunning));
+  btn.disabled = state.rebooting && !state.artnetRunning;
+}
+
+function paintFixtureHealth() {
+  const dot = $('sb-fixtures-dot'), val = $('sb-fixtures-value');
+  if (!state.connected || state.lights.length === 0) { setDot(dot, null); val.textContent = '—'; val.classList.remove('bad'); return; }
+  const down = state.lights.filter(l => !l.disabled && isUnreachable(l)).length;
+  setDot(dot, down ? 'bad' : 'ok');
+  val.textContent = down ? `${down} not responding` : 'All responding';
+  val.classList.toggle('bad', down > 0);
+}
+
+// ── Listener ─────────────────────────────────────────────────────────────────
+
+async function listenerStart() {
   const res = await window.hue.startArtnet();
   if (!res.success) toast(`Listener failed: ${res.message || ''}`, 'error');
 }
 
-async function listenerBarStop() {
+async function listenerStop() {
   await window.hue.stopArtnet();
   setListenerRunning(false);
 }
 
 function setListenerRunning(running, error) {
-  state.artnetRunning = running;
-  lbStart.disabled = running || state.rebooting; // stay locked while the bridge is restarting
-  lbStop.disabled  = !running;
-  lbStatus.className = error ? 'error' : running ? 'running' : '';
-
-  const proto = lbProtocol.value || (state.settings && state.settings.protocol) || 'artnet';
-  const protoLabel = proto === 'sacn' ? 'sACN' : proto === 'both' ? 'Art-Net + sACN' : 'Art-Net';
-  lbLabel.textContent = error ? `${protoLabel}: Error` : running ? `${protoLabel}: Active` : 'Stopped';
-
-  // Keep titlebar badge in sync
-  updateArtnetBadge(running, error);
+  state.artnetRunning = !!running;
+  if (error) toast(`${protoLabel()} listener error`, 'error');
+  paintInputStatus();
 }
 
-lbStart.addEventListener('click', listenerBarStart);
-lbStop.addEventListener('click',  listenerBarStop);
-
-// ── Art-Net badge (titlebar) ──────────────────────────────────────────────────
-
-const artnetBadge = document.getElementById('artnet-badge');
-const artnetLabel = document.getElementById('artnet-label');
-
-function updateArtnetBadge(running, error) {
-  artnetBadge.className = 'artnet-badge ' + (error ? 'error' : running ? 'running' : '');
-  const proto = (state.settings && state.settings.protocol) || 'artnet';
-  const protoLabel = proto === 'sacn' ? 'sACN' : proto === 'both' ? 'Art-Net+sACN' : 'Art-Net';
-  artnetLabel.textContent = error   ? `${protoLabel}: Error`
-    : running ? `${protoLabel}: Active`
-    : `${protoLabel}: Stopped`;
-}
-
+$('btn-listen').addEventListener('click', () => (state.artnetRunning ? listenerStop() : listenerStart()));
 window.hue.on('artnet:status', ({ running, error }) => setListenerRunning(running, error));
 
-// ── Bridge panel ──────────────────────────────────────────────────────────────
+// ── Blackout + keyboard ──────────────────────────────────────────────────────
 
-const bridgeStatusDot  = document.getElementById('bridge-status-dot');
-const bridgeStatusText = document.getElementById('bridge-status-text');
-const bridgeList       = document.getElementById('bridge-list');
-const pairModalOverlay = document.getElementById('pair-modal-overlay');
-function setPairDialogVisible(v) { pairModalOverlay.style.display = v ? 'flex' : 'none'; }
-const pairCountdown    = document.getElementById('pair-countdown');
-const pairMessage      = document.getElementById('pair-message');
-const pairTimerBar     = document.getElementById('pair-timer-bar');
-const pairStepVerify   = document.getElementById('pair-step-verify');
-const pairStepLink     = document.getElementById('pair-step-link');
-const manualIpInput    = document.getElementById('manual-ip');
+async function blackout() {
+  for (const light of state.lights) { const s = controlState[light.id]; if (s) s.on = false; }
+  persistControlState();
+  repaintAllTiles();
+  await window.hue.allLightsOff().catch(() => {});
+}
+$('btn-blackout').addEventListener('click', blackout);
+
+document.addEventListener('keydown', (e) => {
+  const mod = e.metaKey || e.ctrlKey;
+  if (mod && e.key.toLowerCase() === 'b') { e.preventDefault(); blackout(); return; }
+  if (mod && e.key.toLowerCase() === 'f') {
+    e.preventDefault();
+    if (currentTab !== 'patch') showTab('patch');
+    $('patch-filter').focus();
+    $('patch-filter').select();
+    return;
+  }
+  if (e.key === 'Escape') {
+    closeModalsOnEscape();
+    if (currentTab === 'control') clearSelection();
+    return;
+  }
+  if (inTextField(document.activeElement)) return;
+
+  if (currentTab === 'control' && !state.dmxActive) {
+    if (mod && e.key.toLowerCase() === 'a') { e.preventDefault(); selectAll(); return; }
+    if (!mod && /^[1-9]$/.test(e.key)) {
+      const name = Object.keys(scenesCache)[Number(e.key) - 1];
+      if (name) { e.preventDefault(); applyScene(name); }
+    }
+  }
+  if (currentTab === 'patch' && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+    const rows = [...patchRows.querySelectorAll('.prow:not([hidden])')];
+    if (!rows.length) return;
+    e.preventDefault();
+    let i = rows.findIndex(r => r.dataset.id === String(state.selectedId));
+    i = e.key === 'ArrowDown' ? Math.min(rows.length - 1, i + 1) : Math.max(0, i - 1);
+    selectFixture(rows[i].dataset.id);
+    rows[i].focus();
+  }
+});
+
+// ── Bridge (Setup tab) ───────────────────────────────────────────────────────
+
+const bridgeList       = $('bridge-list');
+const pairCountdown    = $('pair-countdown');
+const pairMessage      = $('pair-message');
+const pairTimerBar     = $('pair-timer-bar');
+const pairStepVerify   = $('pair-step-verify');
+const pairStepLink     = $('pair-step-link');
+const manualIpInput    = $('manual-ip');
+
+function setPairDialogVisible(v) { $('pair-modal-overlay').hidden = !v; }
 
 function setBridgeStatus(connected, bridge, connecting) {
   state.connected = connected;
   state.bridge    = bridge;
-  bridgeStatusDot.className  = 'status-dot ' + (connecting ? 'connecting' : connected ? 'connected' : 'error');
-  bridgeStatusText.textContent = connecting ? 'Connecting…'
+  state.pairing   = !!connecting && state.pairing;
+  $('bridge-status-dot').className = 'dot ' + (connecting ? 'dot-warn pulse' : connected ? 'dot-ok' : 'dot-bad');
+  $('bridge-status-text').textContent = connecting ? 'Connecting…'
     : connected ? `Connected to ${bridge}` : 'Not connected';
-  document.getElementById('btn-disconnect').style.display = connected ? '' : 'none';
-  document.getElementById('btn-scan').disabled = connecting;
-  // Restart Bridge is only meaningful with a live connection and never during a reboot
-  const rebootBtn = document.getElementById('btn-reboot-bridge');
-  if (rebootBtn) rebootBtn.disabled = !connected || state.rebooting;
+  $('btn-disconnect').hidden = !connected;
+  $('discover-block').hidden = connected;
+  $('btn-scan').disabled = !!connecting;
+  $('btn-reboot-bridge').disabled = !connected || state.rebooting;
+  paintBridgeStatus();
+  paintFixtureHealth();
+  scheduleAmbient();
 }
 
-const scanProgressWrap  = document.getElementById('scan-progress-wrap');
-const scanProgressBar   = document.getElementById('scan-progress-bar');
-const scanProgressLabel = document.getElementById('scan-progress-label');
+const scanProgressWrap  = $('scan-progress-wrap');
+const scanProgressBar   = $('scan-progress-bar');
+const scanProgressLabel = $('scan-progress-label');
 
 window.hue.on('bridge:found', (bridge) => {
-  const placeholder = bridgeList.querySelector('.empty-state');
+  const placeholder = bridgeList.querySelector('.empty');
   if (placeholder) placeholder.remove();
   bridgeList.appendChild(buildBridgeItem(bridge));
 });
 
 window.hue.on('bridge:scan-progress', ({ phase, completed, total, subnets }) => {
-  if (phase === 'saved') {
-    scanProgressBar.style.width = '3%';
-    scanProgressLabel.textContent = 'Checking last known bridge IP…';
-  } else if (phase === 'arp') {
-    scanProgressBar.style.width = '10%';
-    scanProgressLabel.textContent = 'Checking ARP cache for known Hue bridges…';
-  } else if (phase === 'ssdp') {
-    scanProgressBar.style.width = '20%';
-    scanProgressLabel.textContent = 'Sending UPnP/SSDP multicast on all interfaces…';
-  } else if (phase === 'mdns') {
-    scanProgressBar.style.width = '30%';
-    scanProgressLabel.textContent = 'Searching via mDNS…';
+  const steps = {
+    saved: [3,  'Checking the last known bridge address…'],
+    arp:   [10, 'Checking the ARP cache for Hue bridges…'],
+    ssdp:  [20, 'Sending UPnP/SSDP discovery on all interfaces…'],
+    mdns:  [30, 'Searching via mDNS…'],
+  };
+  if (steps[phase]) {
+    scanProgressBar.style.width = `${steps[phase][0]}%`;
+    scanProgressLabel.textContent = steps[phase][1];
   } else {
-    const pct = 30 + Math.round((completed / total) * 70);
-    scanProgressBar.style.width = `${pct}%`;
-    scanProgressLabel.textContent =
-      `Scanning ${subnets.map(s => s + '.0/24').join(', ')} — ${completed}/${total} hosts`;
+    scanProgressBar.style.width = `${30 + Math.round((completed / total) * 70)}%`;
+    scanProgressLabel.textContent = `Scanning ${subnets.map(s => s + '.0/24').join(', ')} — ${completed}/${total} hosts`;
   }
 });
 
-document.getElementById('btn-show-subnets').addEventListener('click', async () => {
-  const preview = document.getElementById('subnet-preview');
+$('btn-show-subnets').addEventListener('click', async () => {
+  const preview = $('subnet-preview');
   const subnets = await window.hue.getScanSubnets();
   const extra   = parseExtraSubnet();
   const all     = extra ? [...new Set([...subnets, extra])] : subnets;
-  preview.style.display  = '';
+  preview.hidden = false;
   preview.textContent = `Will scan: ${all.map(s => s + '.0/24').join(', ') || 'none'}`;
 });
 
 function parseExtraSubnet() {
-  const raw   = document.getElementById('extra-subnet').value.trim();
+  const raw   = $('extra-subnet').value.trim();
   if (!raw) return null;
   const parts = raw.replace(/\/\d+$/, '').split('.');
-  if (parts.length >= 3) return parts.slice(0, 3).join('.');
-  return null;
+  return parts.length >= 3 ? parts.slice(0, 3).join('.') : null;
 }
 
 function setScanRunning(running) {
-  document.getElementById('btn-scan').style.display        = running ? 'none' : '';
-  document.getElementById('btn-cancel-scan').style.display = running ? ''     : 'none';
-  scanProgressWrap.style.display = running ? '' : 'none';
+  $('btn-scan').hidden        = running;
+  $('btn-cancel-scan').hidden = !running;
+  scanProgressWrap.hidden     = !running;
 }
 
-document.getElementById('btn-cancel-scan').addEventListener('click', () => {
+$('btn-cancel-scan').addEventListener('click', () => {
   window.hue.cancelScan();
   setScanRunning(false);
   scanProgressLabel.textContent = 'Scan cancelled';
-  scanProgressWrap.style.display = '';
+  scanProgressWrap.hidden = false;
 });
 
-document.getElementById('btn-scan').addEventListener('click', async () => {
-  bridgeList.innerHTML = '<div class="empty-state"><small>Scanning — results appear as bridges are found…</small></div>';
+$('btn-scan').addEventListener('click', async () => {
+  bridgeList.innerHTML = '<div class="empty">Scanning — bridges appear here as they are found…</div>';
   scanProgressBar.style.width   = '0%';
   scanProgressLabel.textContent = 'Starting scan…';
   setScanRunning(true);
 
-  const ifaceIp = document.getElementById('discover-nic').value;
-  const extra   = parseExtraSubnet();
-  const res     = await window.hue.discoverBridges(ifaceIp, extra ? [extra] : []);
+  const res = await window.hue.discoverBridges($('discover-nic').value, parseExtraSubnet() ? [parseExtraSubnet()] : []);
 
   setScanRunning(false);
   scanProgressBar.style.width = '100%';
 
   if (!res.success) {
-    bridgeList.innerHTML = `<div class="empty-state"><p>Scan error</p><small>${res.error}</small></div>`;
-    scanProgressWrap.style.display = 'none';
+    bridgeList.innerHTML = `<div class="empty">Scan error: ${esc(res.error)}</div>`;
+    scanProgressWrap.hidden = true;
     return;
   }
-
   const count = res.bridges.length;
-  scanProgressLabel.textContent = count > 0
-    ? `Scan complete — ${count} bridge${count !== 1 ? 's' : ''} found`
-    : 'Scan complete';
+  scanProgressWrap.hidden = false;
+  scanProgressLabel.textContent = count > 0 ? `Scan complete — ${count} bridge${count !== 1 ? 's' : ''} found` : 'Scan complete';
   if (count === 0 && !bridgeList.querySelector('.bridge-item')) {
-    bridgeList.innerHTML = `<div class="empty-state">
-      <p>No bridges found</p>
-      <small>The scan can only search subnets this computer can see — a bridge on a
-      different VLAN or subnet won't announce itself here. If you know the bridge's IP,
-      the <strong>Manual IP</strong> field below is the reliable path (it works whenever the
-      bridge is routable). Or add its subnet in <strong>Additional Subnet</strong> above and
-      re-scan.</small>
-    </div>`;
+    bridgeList.innerHTML = `<div class="empty">No bridges found. The scan only reaches subnets this computer can see — a bridge on another VLAN won't announce itself. If you know its IP, connect by IP below, or add its subnet above and scan again.</div>`;
   }
 });
 
@@ -272,93 +424,82 @@ function buildBridgeItem(b) {
   const div = document.createElement('div');
   div.className = 'bridge-item';
   div.innerHTML = `
-    <div class="bridge-info">
-      <div class="bridge-name">${b.name || 'Hue Bridge'}</div>
-      <div class="bridge-ip">${b.ip}</div>
-    </div>
-    <button class="btn btn-primary btn-sm">Connect</button>
-  `;
+    <div class="bi-info"><div class="bi-name">${esc(b.name || 'Hue Bridge')}</div><div class="bi-ip">${esc(b.ip)}</div></div>
+    <button class="btn btn-primary btn-sm">Connect</button>`;
   div.querySelector('button').addEventListener('click', () => startPair(b.ip));
   return div;
 }
 
-document.getElementById('btn-manual-connect').addEventListener('click', () => {
+$('btn-manual-connect').addEventListener('click', () => {
   const ip = manualIpInput.value.trim();
-  if (!ip) return;
-  startPair(ip);
+  if (ip) startPair(ip);
 });
+manualIpInput.addEventListener('keydown', e => { if (e.key === 'Enter') $('btn-manual-connect').click(); });
+
+function onConnected(name) {
+  setPairDialogVisible(false);
+  state.pairing = false;
+  window.hue.bridgeStatus().then(s => setBridgeStatus(true, s.bridge));
+  bridgeList.innerHTML = '';
+  scanProgressWrap.hidden = true;
+  manualIpInput.value = '';
+  toast(name ? `Connected to ${name}` : 'Bridge paired — loading lights…', 'success');
+  showTab('patch');
+}
 
 async function startPair(ip) {
   if (state.pairing) return;
   state.pairing = true;
   setBridgeStatus(false, null, true);
 
-  document.getElementById('pair-ip').textContent     = ip;
-  document.getElementById('pair-verify-label').innerHTML = `Checking bridge at <strong>${ip}</strong>…`;
-  pairStepVerify.style.display = '';
-  pairStepLink.style.display   = 'none';
-  pairMessage.textContent      = '';
+  $('pair-verify-label').innerHTML = `Checking bridge at <span class="mono">${esc(ip)}</span>…`;
+  pairStepVerify.hidden = false;
+  pairStepLink.hidden   = true;
+  pairMessage.textContent = '';
   setPairDialogVisible(true);
 
   const verify = await window.hue.verifyBridge(ip);
   if (!verify.success) {
-    state.pairing        = false;
+    state.pairing = false;
     setPairDialogVisible(false);
     setBridgeStatus(false, null, false);
-    toast(`Bridge not found at ${ip} — check the IP address`, 'error');
+    toast(`No bridge at ${ip} — check the address`, 'error');
     return;
   }
-
   if (verify.autoConnected) {
-    state.pairing        = false;
-    setPairDialogVisible(false);
     setBridgeStatus(true, ip);
-    window.hue.bridgeStatus().then(s => setBridgeStatus(true, s.bridge));
-    bridgeList.innerHTML = '';
-    scanProgressWrap.style.display = 'none';
-    manualIpInput.value  = '';
-    toast(`Connected to ${verify.name || ip}`, 'success');
-    showTab('lights');
+    onConnected(verify.name || ip);
     return;
   }
 
-  document.getElementById('pair-bridge-name').textContent =
-    verify.name + (verify.bridgeid ? ` (${verify.bridgeid.slice(-6)})` : '');
-  pairStepVerify.style.display = 'none';
-  pairStepLink.style.display   = '';
-  pairCountdown.textContent    = '30';
-  pairTimerBar.style.width     = '100%';
-
+  $('pair-bridge-name').textContent = verify.name + (verify.bridgeid ? ` (${verify.bridgeid.slice(-6)})` : '');
+  pairStepVerify.hidden = true;
+  pairStepLink.hidden   = false;
+  pairCountdown.textContent = '30';
+  pairTimerBar.style.width  = '100%';
   await window.hue.startPair(ip);
 }
 
 window.hue.on('bridge:pair-event', (event) => {
   if (event.type === 'waiting') {
-    pairCountdown.textContent    = event.remaining;
-    pairTimerBar.style.width     = `${Math.round((event.remaining / 30) * 100)}%`;
-    pairMessage.textContent      = '';
+    pairCountdown.textContent = event.remaining;
+    pairTimerBar.style.width  = `${Math.round((event.remaining / 30) * 100)}%`;
+    pairMessage.textContent   = '';
   } else if (event.type === 'success') {
-    state.pairing        = false;
-    setPairDialogVisible(false);
     setBridgeStatus(true, state.bridge || '');
-    window.hue.bridgeStatus().then(s => setBridgeStatus(true, s.bridge));
-    // Clear the discovered list — no point showing "Connect" on a bridge we just connected to
-    bridgeList.innerHTML = '';
-    scanProgressWrap.style.display = 'none';
-    toast('Bridge paired! Loading lights…', 'success');
-    showTab('lights');
+    onConnected();
   } else if (event.type === 'error') {
-    state.pairing        = false;
+    state.pairing = false;
     setPairDialogVisible(false);
     setBridgeStatus(false, null, false);
     toast(`Pairing failed: ${event.message}`, 'error');
   } else if (event.type === 'timeout') {
-    state.pairing              = false;
-    pairStepLink.style.display = 'none';
-    pairStepVerify.style.display = '';
-    document.getElementById('pair-verify-label').textContent = 'Timed out — link button not pressed. Try again.';
+    state.pairing = false;
+    pairStepLink.hidden   = true;
+    pairStepVerify.hidden = false;
+    $('pair-verify-label').textContent = 'Timed out — the link button wasn\'t pressed. Try again.';
     setBridgeStatus(false, null, false);
-    toast('Timed out — press the link button within 30 s then retry', 'error');
+    toast('Timed out — press the link button within 30 s, then retry', 'error');
   }
 });
 
@@ -367,102 +508,76 @@ function cancelPairing() {
   setPairDialogVisible(false);
   setBridgeStatus(false, null, false);
 }
-document.getElementById('btn-cancel-pair').addEventListener('click', cancelPairing);
+$('btn-cancel-pair').addEventListener('click', cancelPairing);
 
-document.getElementById('btn-disconnect').addEventListener('click', async () => {
+$('btn-disconnect').addEventListener('click', async () => {
   await window.hue.disconnect();
   setBridgeStatus(false, null, false);
-  document.getElementById('lights-list').innerHTML = '';
+  state.lights = [];
+  renderPatch();
+  buildControlCards([]);
   toast('Disconnected from bridge', 'info');
 });
 
-// ── Bridge restart (reboot) flow ───────────────────────────────────────────────
+function closeModalsOnEscape() {
+  if (!$('reboot-modal-overlay').hidden) $('reboot-modal-overlay').hidden = true;
+  if (!$('pair-modal-overlay').hidden) cancelPairing();
+}
 
-const bridgeLayout      = document.querySelector('#panel-bridge .bridge-layout');
-const rebootPanel       = document.getElementById('reboot-status-panel');
-const rebootTitle       = document.getElementById('reboot-status-title');
-const rebootMsg         = document.getElementById('reboot-status-msg');
-const rebootManualBtn   = document.getElementById('btn-reboot-manual');
-const rebootCancelLink  = document.getElementById('reboot-cancel-link');
-const offlineBanner     = document.getElementById('offline-banner');
-const rebootModal       = document.getElementById('reboot-modal-overlay');
-const rebootDmxWarn     = document.getElementById('reboot-modal-dmx-warn');
+// ── Bridge restart (reboot) flow ─────────────────────────────────────────────
 
-let rebootElapsedTimer = null;   // local ticker that drives the elapsed-time message
+const bridgeCard       = $('bridge-card');
+const rebootPanel      = $('reboot-status-panel');
+const rebootTitle      = $('reboot-status-title');
+const rebootMsg        = $('reboot-status-msg');
+const rebootManualBtn  = $('btn-reboot-manual');
+const rebootCancelLink = $('reboot-cancel-link');
+const offlineBanner    = $('offline-banner');
+const rebootModal      = $('reboot-modal-overlay');
+
+let rebootElapsedTimer = null;
 let rebootStartedAt    = 0;
 
-// Show the normal Bridge connection layout (default state)
-function showBridgeConnectionUI() {
-  if (bridgeLayout) bridgeLayout.style.display = '';
-  if (rebootPanel)  rebootPanel.style.display = 'none';
-}
-
-// Swap the connection layout for the reboot status panel
+function showBridgeConnectionUI() { bridgeCard.hidden = false; rebootPanel.hidden = true; }
 function showRebootStatusUI() {
-  if (bridgeLayout) bridgeLayout.style.display = 'none';
-  if (rebootPanel)  rebootPanel.style.display = '';
-  rebootManualBtn.style.display = 'none';
-  rebootCancelLink.style.display = '';
+  bridgeCard.hidden = true;
+  rebootPanel.hidden = false;
+  rebootManualBtn.hidden = true;
+  rebootCancelLink.hidden = false;
 }
-
-// Lock/unlock the listener-bar Start button during the offline period
-function setListenerBarRebootLock(locked) {
-  if (locked) {
-    lbStart.disabled = true;
-    lbStart.title = 'Bridge restarting';
-  } else {
-    lbStart.title = '';
-    lbStart.disabled = state.artnetRunning; // restore normal rule
-  }
-}
-
 function stopRebootElapsedTicker() {
   if (rebootElapsedTimer) { clearInterval(rebootElapsedTimer); rebootElapsedTimer = null; }
 }
-
-// End the reboot UI and return to a normal Bridge tab in the given connection state
 function exitRebootUI() {
   state.rebooting = false;
   stopRebootElapsedTicker();
-  offlineBanner.style.display = 'none';
-  setListenerBarRebootLock(false);
+  offlineBanner.hidden = true;
   showBridgeConnectionUI();
+  paintBridgeStatus();
+  paintInputStatus();
 }
 
-// Open the confirmation modal (populating the DMX-active warning if needed)
-document.getElementById('btn-reboot-bridge').addEventListener('click', async () => {
+$('btn-reboot-bridge').addEventListener('click', async () => {
   let dmxActive = false;
   try { dmxActive = await window.hue.dmxIsActive(); } catch {}
-  rebootDmxWarn.style.display = dmxActive ? '' : 'none';
-  rebootModal.style.display = 'flex';
+  $('reboot-modal-dmx-warn').hidden = !dmxActive;
+  rebootModal.hidden = false;
 });
-
-// Cancel the modal — no state changes
-document.getElementById('btn-reboot-cancel').addEventListener('click', () => {
-  rebootModal.style.display = 'none';
-});
-
-// Confirm — send the reboot command
-document.getElementById('btn-reboot-confirm').addEventListener('click', async () => {
-  rebootModal.style.display = 'none';
+$('btn-reboot-cancel').addEventListener('click', () => { rebootModal.hidden = true; });
+$('btn-reboot-confirm').addEventListener('click', async () => {
+  rebootModal.hidden = true;
   const res = await window.hue.rebootBridge();
-  if (!res || !res.success) {
-    toast(`Restart failed: ${(res && res.error) || 'unknown error'}`, 'error');
-    return;
-  }
+  if (!res || !res.success) toast(`Restart failed: ${(res && res.error) || 'unknown error'}`, 'error');
   // Success path is driven by the bridge:reboot-* events below.
 });
 
-// Cancel link in the status panel — abort the reconnect loop
-rebootCancelLink.addEventListener('click', async (e) => {
-  e.preventDefault();
+rebootCancelLink.addEventListener('click', async () => {
   await window.hue.cancelReboot().catch(() => {});
   exitRebootUI();
   setBridgeStatus(false, state.bridge, false);
   toast('Bridge restart cancelled', 'info');
 });
 
-// Manual reconnect (shown after a timeout)
 rebootManualBtn.addEventListener('click', async () => {
   rebootMsg.textContent = 'Reconnecting…';
   rebootManualBtn.disabled = true;
@@ -471,15 +586,13 @@ rebootManualBtn.addEventListener('click', async () => {
   if (res && res.success) {
     exitRebootUI();
     setBridgeStatus(true, res.bridge || state.bridge, false);
-    if (state.connected) refreshLights();
+    refreshLights();
     toast('Bridge back online', 'success');
   } else {
-    rebootMsg.textContent = 'Bridge not found at saved address. Try scanning for it in the Bridge tab.';
+    rebootMsg.textContent = 'No bridge at the saved address. Try scanning for it.';
   }
 });
 
-// The current phase label is set by events; a local 1 s ticker appends the
-// elapsed-seconds counter so the message keeps moving between events.
 let rebootPhaseTitle = 'Restarting bridge…';
 let rebootPhaseMsg   = 'Sending restart command…';
 function paintRebootStatus() {
@@ -488,957 +601,719 @@ function paintRebootStatus() {
   rebootMsg.textContent   = `${rebootPhaseMsg} (${s}s)`;
 }
 
-window.hue.on('bridge:reboot-started', ({ estimatedSeconds }) => {
+window.hue.on('bridge:reboot-started', () => {
   state.rebooting = true;
   rebootStartedAt = Date.now();
   showRebootStatusUI();
-  offlineBanner.style.display = 'flex';
-  setListenerBarRebootLock(true);
-  document.getElementById('btn-reboot-bridge').disabled = true;
+  offlineBanner.hidden = false;
+  $('btn-reboot-bridge').disabled = true;
   rebootPhaseTitle = 'Restarting bridge…';
-  rebootPhaseMsg   = 'Sending restart command — waiting for the bridge to go offline';
+  rebootPhaseMsg   = 'Waiting for the bridge to go offline';
   paintRebootStatus();
+  paintBridgeStatus();
+  paintInputStatus();
   toast('Bridge restarting — reconnecting automatically', 'warn');
-
   stopRebootElapsedTicker();
   rebootElapsedTimer = setInterval(paintRebootStatus, 1000);
 });
 
 window.hue.on('bridge:reboot-reconnecting', ({ attempt, phase }) => {
-  switch (phase) {
-    case 'going-offline':
-      rebootPhaseTitle = 'Restarting bridge…';
-      rebootPhaseMsg   = 'Waiting for the bridge to go offline';
-      break;
-    case 'offline-confirmed':
-      rebootPhaseTitle = 'Bridge went offline ✓';
-      rebootPhaseMsg   = 'Waiting for it to come back online';
-      break;
-    case 'reconnecting':
-      rebootPhaseTitle = 'Reconnecting…';
-      rebootPhaseMsg   = `Bridge is back — reconnecting (attempt ${attempt})`;
-      break;
-    case 'waiting-online':
-    default:
-      rebootPhaseTitle = 'Waiting for bridge…';
-      rebootPhaseMsg   = 'Waiting for it to come back online';
-  }
+  const phases = {
+    'going-offline':     ['Restarting bridge…', 'Waiting for the bridge to go offline'],
+    'offline-confirmed': ['Bridge went offline', 'Waiting for it to come back online'],
+    'reconnecting':      ['Reconnecting…', `Bridge is back — reconnecting (attempt ${attempt})`],
+  };
+  [rebootPhaseTitle, rebootPhaseMsg] = phases[phase] || ['Waiting for bridge…', 'Waiting for it to come back online'];
   paintRebootStatus();
 });
 
 window.hue.on('bridge:reboot-complete', ({ elapsed, didReboot, connected }) => {
   stopRebootElapsedTicker();
-  rebootCancelLink.style.display = 'none';
-  offlineBanner.style.display = 'none';
-  setListenerBarRebootLock(false);
-
+  rebootCancelLink.hidden = true;
+  offlineBanner.hidden = true;
   if (didReboot) {
-    rebootTitle.textContent = 'Bridge reconnected.';
-    rebootMsg.textContent   = `Bridge restarted and reconnected after ${elapsed}s.`;
+    rebootTitle.textContent = 'Bridge reconnected';
+    rebootMsg.textContent   = `Restarted and reconnected after ${elapsed}s.`;
     toast('Bridge back online', 'success');
   } else {
-    // Command was accepted but the bridge never actually dropped.
-    rebootTitle.textContent = 'Bridge did not restart.';
-    rebootMsg.textContent   = 'The bridge never went offline — this firmware may not support remote restart. Still connected; try power-cycling the bridge manually.';
+    rebootTitle.textContent = 'Bridge did not restart';
+    rebootMsg.textContent   = 'It never went offline — this firmware may not support remote restart. Still connected; power-cycle it by hand if needed.';
     toast('Bridge did not appear to restart', 'warn');
   }
   setBridgeStatus(!!connected, state.bridge, false);
-  // Hold the message a little longer when it's a warning so it can be read.
   setTimeout(() => {
-    state.rebooting = false;
-    showBridgeConnectionUI();
+    exitRebootUI();
     if (state.connected) refreshLights();
   }, didReboot ? 3000 : 6000);
 });
 
 window.hue.on('bridge:reboot-timeout', () => {
   stopRebootElapsedTicker();
-  state.rebooting = false; // loop has stopped; allow manual action
-  rebootTitle.textContent = 'Reconnect timed out.';
-  rebootMsg.textContent   = 'Bridge did not come back at its saved address. Try scanning for it in the Bridge tab.';
-  rebootManualBtn.style.display = '';
-  offlineBanner.style.display = 'none';
-  setListenerBarRebootLock(false);
-  toast('Bridge reconnect timed out — try connecting manually', 'error');
+  state.rebooting = false;
+  rebootTitle.textContent = 'Reconnect timed out';
+  rebootMsg.textContent   = 'The bridge did not come back at its saved address. Try scanning for it.';
+  rebootManualBtn.hidden = false;
+  offlineBanner.hidden = true;
+  paintBridgeStatus();
+  paintInputStatus();
+  toast('Bridge reconnect timed out — connect manually', 'error');
 });
 
 window.hue.on('bridge:auto-connect', async ({ connected, bridge }) => {
-  // Always restore settings so listener bar/controls reflect saved config
   await refreshSettings();
-
   setBridgeStatus(connected, bridge, false);
   if (connected) {
-    // Clear any leftover scan results — already connected, no need to show the list
     bridgeList.innerHTML = '';
-    scanProgressWrap.style.display = 'none';
+    scanProgressWrap.hidden = true;
     toast(`Connected to ${bridge}`, 'success');
-    // Restore last active tab (default to lights when connected)
-    const saved = state.settings.lastTab;
-    showTab(saved && saved !== 'bridge' ? saved : 'lights');
+    const saved = TAB_ALIASES[state.settings.lastTab] || state.settings.lastTab;
+    showTab(saved && saved !== 'setup' ? saved : 'patch');
   }
 });
 
-window.hue.on('bridge:unreachable', () => {
-  toast('Bridge not responding — check connection or re-scan on the Bridge tab', 'error');
-});
+window.hue.on('bridge:unreachable', () => toast('Bridge not responding — check the connection or re-scan in Setup', 'error'));
+window.hue.on('bridge:reachable',   () => toast('Bridge connection restored', 'success'));
 
-window.hue.on('bridge:reachable', () => {
-  toast('Bridge connection restored', 'success');
-});
+// ── Per-bulb reachability ────────────────────────────────────────────────────
 
-// ── Per-bulb reachability events ──────────────────────────────────────────────
-
-// Sync every surface that shows a bulb's reachability: state cache (so tab
-// re-renders keep the badge), lights-tab row, and control-tab tile.
 function setLightReachableUI(id, reachable) {
   const light = state.lights.find(l => String(l.id) === String(id));
   if (light) {
     if (!light.state) light.state = {};
     light.state.reachable = reachable;
   }
-  const row = lightsList && lightsList.querySelector(`.light-row[data-id="${id}"]`);
-  if (row) {
-    row.classList.toggle('light-unreachable', !reachable);
-    const label = row.querySelector('.reach-label');
-    if (label) label.textContent = reachable ? 'Reachable' : 'Unreachable';
-  }
-  const tile = controlGrid && controlGrid.querySelector(`[data-light-id="${id}"]`);
-  if (tile) tile.classList.toggle('tile-unreachable', !reachable);
+  renderPatch();
+  const tile = controlGrid.querySelector(`[data-light-id="${id}"]`);
+  if (tile && light) paintTile(tile, light);
+  paintFixtureHealth();
+  scheduleAmbient();
   return light;
 }
 
 window.hue.on('bulb-unreachable', ({ id }) => {
   const light = setLightReachableUI(id, false);
-  toast(`"${light ? light.name : `Light ${id}`}" unreachable — auto-recovery active`, 'warn');
+  toast(`"${light ? light.name : `Light ${id}`}" not responding — auto-recovery on`, 'warn');
 });
-
 window.hue.on('bulb-recovered', ({ id }) => {
   const light = setLightReachableUI(id, true);
   toast(`"${light ? light.name : `Light ${id}`}" back online`, 'success');
 });
 
-// ── Lights panel ──────────────────────────────────────────────────────────────
+// ── Patch ────────────────────────────────────────────────────────────────────
 
-const lightsList = document.getElementById('lights-list');
+const patchRows = $('patch-rows');
+const inspector = $('inspector');
 let dragSrc = null;
 
-document.getElementById('btn-refresh-lights').addEventListener('click', refreshLights);
+$('btn-refresh-lights').addEventListener('click', refreshLights);
+$('patch-filter').addEventListener('input', applyPatchFilter);
 
 async function refreshLights() {
-  if (!state.connected) {
-    lightsList.innerHTML = '<div class="empty-state empty-state--left"><p>Not connected to a bridge</p></div>';
-    return;
-  }
+  if (!state.connected) { renderPatch(); return; }
   try {
     const res = await window.hue.getLights();
     state.lights = res.lights || [];
-    renderLights();
   } catch (err) {
-    console.error('[refreshLights] ERROR:', err);
-    lightsList.innerHTML = `<div class="empty-state empty-state--left"><p>Error loading lights</p><small>${err.message}</small></div>`;
-  }
-}
-
-function renderLights() {
-  lightsList.innerHTML = '';
-  if (state.lights.length === 0) {
-    lightsList.innerHTML = '<div class="empty-state empty-state--left"><p>No lights found</p><small>Make sure your lights are powered on</small></div>';
-    buildMonitorCards([]);
+    console.error('[refreshLights]', err);
+    toast(`Couldn't load lights: ${err.message}`, 'error');
     return;
   }
-  for (const light of state.lights) {
-    try {
-      lightsList.appendChild(buildLightRow(light));
-    } catch (err) {
-      console.error('[renderLights] buildLightRow threw for light', light && light.id, light && light.name, err);
+  renderPatch();
+  buildControlCards(state.lights);
+  paintFixtureHealth();
+  scheduleAmbient();
+}
+
+// Overlapping footprints among patched (non-parked) fixtures in the same universe
+function findOverlaps() {
+  const out = {};
+  const active = state.lights.filter(l => l.dmx && !l.disabled);
+  for (const a of active) {
+    const aEnd = a.dmx.start + a.dmx.channels - 1;
+    for (const b of active) {
+      if (a === b || lightUniverse(a) !== lightUniverse(b)) continue;
+      const bEnd = b.dmx.start + b.dmx.channels - 1;
+      if (a.dmx.start <= bEnd && b.dmx.start <= aEnd) { out[a.id] = b; break; }
     }
   }
-  buildMonitorCards(state.lights);
-  buildControlCards(state.lights);
-  buildDmxBars();
+  return out;
 }
 
-// Update the Effective Patch summary in every visible light row.
-// Called whenever the default universe input changes (live) or after a patch save.
-function refreshEffectivePatch() {
-  const proto       = lbProtocol.value;
-  const defaultUniv = proto === 'sacn'
-    ? (parseInt(lbSacnUniverse.value) || 1)
-    : (parseInt(lbArtnetUniverse.value) || 0);
-
-  lightsList.querySelectorAll('.light-row').forEach(row => {
-    const light = state.lights.find(l => String(l.id) === String(row.dataset.id));
-    if (!light || !light.dmx) return;
-    const effectiveUniv = light.customAddress?.universe ?? defaultUniv;
-    const patchText = `${effectiveUniv}-${light.dmx.start}`;
-    const el = row.querySelector('.effective-patch');
-    if (el) el.textContent = patchText;
-  });
-
-  // Also update the placeholder in any currently-open popup
-  if (activePopup) {
-    const univInput = activePopup.querySelector('.light-opts-univ');
-    if (univInput) univInput.placeholder = `Using default (${defaultUniv})`;
+function renderPatch() {
+  if (!state.connected) {
+    patchRows.innerHTML = '<div class="empty">Connect to a bridge in Setup to load your lights.</div>';
+    inspector.innerHTML = '<div class="empty">Select a fixture to inspect its patch and incoming values.</div>';
+    $('patch-summary').textContent = '';
+    return;
   }
+  if (state.lights.length === 0) {
+    patchRows.innerHTML = '<div class="empty">No lights on this bridge yet. Use Find lights to add bulbs — make sure they are powered on.</div>';
+    renderInspector();
+    $('patch-summary').textContent = '';
+    return;
+  }
+
+  const overlaps = findOverlaps();
+  patchRows.innerHTML = '';
+  for (const light of state.lights) patchRows.appendChild(buildPatchRow(light, overlaps[light.id]));
+  applyPatchFilter();
+
+  // Summary
+  const byU = {};
+  for (const l of state.lights) if (l.dmx && !l.disabled) byU[lightUniverse(l)] = (byU[lightUniverse(l)] || 0) + l.dmx.channels;
+  const parked = state.lights.filter(l => l.disabled).length;
+  $('patch-summary').textContent = [
+    `${state.lights.length} fixture${state.lights.length !== 1 ? 's' : ''}`,
+    ...Object.keys(byU).sort((a, b) => a - b).map(u => `U${u}: ${byU[u]} ch`),
+    `${parked} parked`,
+  ].join('  ·  ');
+
+  if (state.selectedId == null || !state.lights.some(l => String(l.id) === String(state.selectedId))) {
+    state.selectedId = state.lights[0].id;
+  }
+  markSelectedRow();
+  renderInspector();
+  updatePatchLive();
 }
 
-function buildLightRow(light) {
-  const unreachable = !!(light.state && light.state.reachable === false);
-  const row       = document.createElement('div');
-  row.className   = `light-row${light.disabled ? ' disabled-light' : ''}${unreachable ? ' light-unreachable' : ''}`;
-  row.dataset.id  = light.id;
-  row.draggable   = true;
+function buildPatchRow(light, overlapWith) {
+  const row = document.createElement('div');
+  row.className = 'prow' + (light.disabled ? ' parked' : '');
+  row.dataset.id = light.id;
+  row.draggable = true;
+  row.tabIndex = 0;
 
-  const swatchColor = getLightColor(light);
-  const dmx         = light.dmx;
-  const seqStart    = dmx ? dmx.start : null;
-  const customCh   = light.customAddress?.channel  ?? null;
-  const customUniv = light.customAddress?.universe ?? null;
+  const dmx = light.dmx;
+  const names = channelNames(light);
+  const mode = MODE_INFO[dmx?.mode || 'rgb'];
+  const custom = !!light.customAddress;
+  const range = dmx ? (dmx.channels > 1 ? `${dmx.start}–${dmx.start + dmx.channels - 1}` : `${dmx.start}`) : '—';
 
-  // Channel badges — turn purple when a custom patch is active
-  const chBadges = dmx ? dmx.labels.map(l => {
-    const [, name] = l.split(':');
-    const cls = { R: 'r', G: 'g', B: 'b', CT: 'ct', Bri: 'bri', Int: 'bri' }[name] || '';
-    return `<span class="ch-badge ${cls}${dmx.custom ? ' custom-patch' : ''}">${l}</span>`;
-  }).join('') : '';
-
-  // Universe badge — shown only when a non-default universe is patched
-  const univBadge = customUniv != null
-    ? `<span class="ch-badge universe-badge">U${customUniv}</span>`
-    : '';
-
-  // Patch column — "universe-startchannel" format, e.g. "22-1"
-  // Read default universe from the listener bar (source of truth for current session),
-  // falling back to saved config if the field is empty.
-  const proto       = lbProtocol.value;
-  const defaultUniv = proto === 'sacn'
-    ? (parseInt(lbSacnUniverse.value)   || state.settings.sacnUniverse || 1)
-    : (parseInt(lbArtnetUniverse.value) || state.settings.universe     || 0);
-  const effectiveUniv = customUniv ?? defaultUniv;
-  const effectivePatch = dmx ? `${effectiveUniv}-${dmx.start}` : '—';
+  let statusCls = '', statusDot = 'ok', statusText = 'OK';
+  if (light.disabled)           { statusCls = 'muted'; statusDot = null;  statusText = 'Parked'; }
+  else if (overlapWith)         { statusCls = 'bad';   statusDot = 'bad'; statusText = `Overlaps #${overlapWith.id}`; }
+  else if (isUnreachable(light)) { statusCls = 'bad';  statusDot = 'bad'; statusText = 'No response'; }
 
   row.innerHTML = `
-    <span class="drag-handle" title="Drag to reorder">⠿</span>
-    <div class="light-color-swatch" style="background:${swatchColor}"></div>
-    <div class="light-info">
-      <div class="light-name">${light.name}</div>
-      <div class="light-meta">ID: ${light.id} &nbsp;·&nbsp; <span class="reach-label">${unreachable ? 'Unreachable' : 'Reachable'}</span></div>
-      <div class="light-dmx-channels">${univBadge}${chBadges}</div>
-    </div>
-    <div class="light-addr-wrap" title="Custom DMX start channel (leave blank for sequential)">
-      <span class="light-addr-label">ch</span>
-      <input type="number" class="light-addr-input" min="1" max="512"
-        value="${customCh != null ? customCh : ''}"
-        placeholder="${seqStart != null ? seqStart : '—'}">
-    </div>
-    <div class="light-patch-col">
-      <span class="effective-patch">${effectivePatch}</span>
-    </div>
-    <button class="btn btn-secondary btn-sm btn-light-opts" title="Rename · Patch universe · Delete">⋯</button>
-    <label class="toggle" title="${light.disabled ? 'Enable' : 'Disable'} in DMX mapping">
-      <input type="checkbox" ${light.disabled ? '' : 'checked'}>
-      <span class="toggle-slider"></span>
-    </label>
-  `;
+    <span class="c-id p-id">${esc(light.id)}</span>
+    <span class="c-name p-name-wrap"><span class="swatch"></span><span class="p-name">${esc(light.name)}</span></span>
+    <span class="c-type p-type"><b>${mode.short}</b><i>${dmx ? dmx.channels : '–'}ch</i></span>
+    <span class="c-patch p-patch${custom ? ' custom' : ''}" title="${custom ? 'Custom patch' : 'Sequential patch'}">${dmx ? `${lightUniverse(light)}/${dmx.start}` : '—'}</span>
+    <span class="c-range p-range">${range}</span>
+    <span class="c-out p-out"><span class="meters">${names.map(n => `<span class="meter ${CH_CLASS[n] || 'm-i'}"></span>`).join('')}</span><span class="p-int">—</span></span>
+    <span class="c-status p-status ${statusCls}"><span class="dot${statusDot ? ' dot-' + statusDot : ''}"></span>${esc(statusText)}</span>
+    <label class="c-park"><input type="checkbox" ${light.disabled ? 'checked' : ''} aria-label="Park ${esc(light.name)}"></label>`;
 
-  // ── Toggle disabled ────────────────────────────────────────────────────────
-  row.querySelector('input[type=checkbox]').addEventListener('change', async () => {
+  row.addEventListener('click', (e) => {
+    if (e.target.closest('.c-park')) return;
+    selectFixture(light.id);
+  });
+  row.addEventListener('keydown', (e) => {
+    if (e.target !== row) return;
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectFixture(light.id); }
+  });
+
+  // Park = excluded from the DMX mapping (keeps its last state)
+  row.querySelector('.c-park input').addEventListener('change', async () => {
     await window.hue.toggleDisabled(light.id);
-    light.disabled = !light.disabled;
-    row.classList.toggle('disabled-light', light.disabled);
     refreshLights();
   });
 
-  // ── Custom DMX channel (inline) ────────────────────────────────────────────
-  const addrInput = row.querySelector('.light-addr-input');
-  addrInput.addEventListener('change', async () => {
-    const raw  = addrInput.value.trim();
-    const num  = parseInt(raw);
-    const ch   = (raw === '' || isNaN(num)) ? null : Math.max(1, Math.min(512, num));
-    const univ = light.customAddress?.universe ?? null;
-    await window.hue.setLightAddress(light.id, { channel: ch, universe: univ });
-    light.customAddress = (ch == null && univ == null) ? null : { channel: ch, universe: univ };
-    refreshLights();
-  });
-  addrInput.addEventListener('mousedown', e => e.stopPropagation());
-
-  // ── Options popup (⋯) ─────────────────────────────────────────────────────
-  row.querySelector('.btn-light-opts').addEventListener('click', e => {
-    e.stopPropagation();
-    openLightOptionsPopup(light, e.currentTarget);
-  });
-
-  // ── Drag-and-drop reorder ──────────────────────────────────────────────────
+  // Drag-and-drop reorder — sets the sequential patch order
   row.addEventListener('dragstart', (e) => { dragSrc = row; row.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; });
-  row.addEventListener('dragend',   ()  => { row.classList.remove('dragging'); document.querySelectorAll('.light-row').forEach(r => r.classList.remove('drag-over')); });
+  row.addEventListener('dragend',   () => { row.classList.remove('dragging'); patchRows.querySelectorAll('.drag-over').forEach(r => r.classList.remove('drag-over')); });
   row.addEventListener('dragover',  (e) => { e.preventDefault(); if (dragSrc && dragSrc !== row) row.classList.add('drag-over'); });
-  row.addEventListener('dragleave', ()  => row.classList.remove('drag-over'));
+  row.addEventListener('dragleave', () => row.classList.remove('drag-over'));
   row.addEventListener('drop', async (e) => {
     e.preventDefault();
     row.classList.remove('drag-over');
     if (!dragSrc || dragSrc === row) return;
-    const rows   = [...lightsList.querySelectorAll('.light-row')];
-    const srcIdx = rows.indexOf(dragSrc);
-    const dstIdx = rows.indexOf(row);
-    if (srcIdx < dstIdx) row.after(dragSrc); else row.before(dragSrc);
-    const newOrder = [...lightsList.querySelectorAll('.light-row')].map(r => Number(r.dataset.id));
-    await window.hue.setLightOrder(newOrder);
+    const rows = [...patchRows.querySelectorAll('.prow')];
+    if (rows.indexOf(dragSrc) < rows.indexOf(row)) row.after(dragSrc); else row.before(dragSrc);
+    const order = [...patchRows.querySelectorAll('.prow')].map(r => Number(r.dataset.id));
+    await window.hue.setLightOrder(order);
     await refreshLights();
   });
 
   return row;
 }
 
-// ── Light options popup (⋯) ───────────────────────────────────────────────────
-// Provides: multi-universe DMX patch (universe + channel), rename, delete.
-
-let activePopup = null;
-
-function closeActivePopup() {
-  if (activePopup) { activePopup.remove(); activePopup = null; }
-}
-document.addEventListener('mousedown', e => {
-  if (activePopup && !activePopup.contains(e.target)) closeActivePopup();
-});
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeActivePopup(); });
-
-function openLightOptionsPopup(light, trigger) {
-  closeActivePopup();
-
-  const _proto = lbProtocol.value;
-  const mainUniverse = _proto === 'sacn'
-    ? (parseInt(lbSacnUniverse.value)   || (state.settings.sacnUniverse ?? 1))
-    : (parseInt(lbArtnetUniverse.value) || (state.settings.universe     ?? 0));
-  const seqLabel     = light.dmx ? `${light.dmx.start}` : '—';
-  const customCh     = light.customAddress?.channel  ?? null;
-  const customUniv   = light.customAddress?.universe ?? null;
-
-  const popup = document.createElement('div');
-  popup.className = 'light-opts-popup';
-  popup.addEventListener('mousedown', e => e.stopPropagation());
-
-  popup.innerHTML = `
-    <div class="light-opts-title">${light.name}</div>
-
-    <div class="light-opts-section-label">DMX Patch</div>
-    <div class="light-opts-patch-row">
-      <div class="light-opts-field">
-        <div style="display:flex;align-items:center;gap:5px;margin-bottom:3px">
-          <span class="light-opts-field-label" style="margin-bottom:0">Universe Override</span>
-          <span class="custom-badge pop-univ-custom" style="${customUniv != null ? '' : 'display:none'}">Custom</span>
-        </div>
-        <input type="number" class="input light-opts-univ${customUniv != null ? ' input-custom-patch' : ''}" min="0" max="63999"
-          value="${customUniv != null ? customUniv : ''}"
-          placeholder="Using default (${mainUniverse})">
-      </div>
-      <div class="light-opts-field">
-        <span class="light-opts-field-label">Channel</span>
-        <input type="number" class="input light-opts-ch" min="1" max="512"
-          value="${customCh != null ? customCh : ''}"
-          placeholder="${seqLabel}">
-      </div>
-    </div>
-    <button class="btn btn-secondary btn-sm light-opts-patch-clear"
-      style="${customCh == null && customUniv == null ? 'display:none' : ''}">
-      Clear patch
-    </button>
-
-    <div class="light-opts-divider"></div>
-
-    <div class="light-opts-section-label">Fixture Mode</div>
-    <select class="select select-sm light-opts-mode" style="width:100%">
-      <option value="rgb">Color — 3ch (R, G, B)</option>
-      <option value="ct">Tunable White — 2ch (Int, CT)</option>
-      <option value="dim">Dimmer — 1ch (Int)</option>
-    </select>
-
-    <div class="light-opts-divider"></div>
-
-    <div class="light-opts-section-label">Rename</div>
-    <div class="light-opts-rename-row">
-      <input type="text" class="input light-opts-rename"
-        value="${light.name.replace(/"/g, '&quot;')}" placeholder="Light name…">
-      <button class="btn btn-primary btn-sm light-opts-rename-confirm">✓</button>
-    </div>
-
-    <div class="light-opts-divider"></div>
-
-    <button class="btn btn-danger btn-sm light-opts-delete" style="width:100%">Delete from bridge</button>
-  `;
-
-  // ── Save patch when inputs change ──────────────────────────────────────────
-  async function savePatch() {
-    const univStr = popup.querySelector('.light-opts-univ').value.trim();
-    const chStr   = popup.querySelector('.light-opts-ch').value.trim();
-    const univ    = univStr !== '' ? parseInt(univStr) : null;
-    const ch      = chStr   !== '' ? parseInt(chStr)   : null;
-    await window.hue.setLightAddress(light.id, { channel: ch, universe: univ });
-    light.customAddress = (ch == null && univ == null) ? null : { channel: ch, universe: univ };
-    // Sync inline channel input in the light row
-    const addrInput = lightsList.querySelector(`.light-row[data-id="${light.id}"] .light-addr-input`);
-    if (addrInput) addrInput.value = ch != null ? ch : '';
-    popup.querySelector('.light-opts-patch-clear').style.display =
-      (ch == null && univ == null) ? 'none' : '';
-    // Toggle Custom badge and accent border on the universe input
-    const univInput   = popup.querySelector('.light-opts-univ');
-    const customBadge = popup.querySelector('.pop-univ-custom');
-    univInput.classList.toggle('input-custom-patch', univ !== null);
-    if (customBadge) customBadge.style.display = univ !== null ? '' : 'none';
-    refreshLights();
-  }
-  popup.querySelector('.light-opts-univ').addEventListener('change', savePatch);
-  popup.querySelector('.light-opts-ch').addEventListener('change',   savePatch);
-
-  // ── Clear patch ────────────────────────────────────────────────────────────
-  popup.querySelector('.light-opts-patch-clear').addEventListener('click', async () => {
-    popup.querySelector('.light-opts-univ').value = '';
-    popup.querySelector('.light-opts-ch').value   = '';
-    await window.hue.setLightAddress(light.id, null);
-    light.customAddress = null;
-    popup.querySelector('.light-opts-patch-clear').style.display = 'none';
-    // Clear Custom badge and accent border
-    popup.querySelector('.light-opts-univ').classList.remove('input-custom-patch');
-    const customBadge = popup.querySelector('.pop-univ-custom');
-    if (customBadge) customBadge.style.display = 'none';
-    refreshLights();
+function applyPatchFilter() {
+  const q = $('patch-filter').value.trim().toLowerCase();
+  patchRows.querySelectorAll('.prow').forEach(row => {
+    const light = state.lights.find(l => String(l.id) === row.dataset.id);
+    row.hidden = !!q && !(light && (light.name.toLowerCase().includes(q) || String(light.id) === q));
   });
+}
 
-  // ── Fixture mode (DMX personality) ─────────────────────────────────────────
-  const modeSel = popup.querySelector('.light-opts-mode');
-  modeSel.value = (light.dmx && light.dmx.mode) || 'rgb';
-  modeSel.addEventListener('change', async () => {
-    const res = await window.hue.setLightMode(light.id, modeSel.value);
+function selectFixture(id) {
+  state.selectedId = id;
+  markSelectedRow();
+  renderInspector();
+  updatePatchLive();
+}
+
+function markSelectedRow() {
+  patchRows.querySelectorAll('.prow').forEach(r => r.classList.toggle('selected', r.dataset.id === String(state.selectedId)));
+}
+
+function renderInspector() {
+  const light = state.lights.find(l => String(l.id) === String(state.selectedId));
+  if (!light) {
+    inspector.innerHTML = '<div class="empty">Select a fixture to inspect its patch and incoming values.</div>';
+    return;
+  }
+  const dmx = light.dmx;
+  const mode = dmx?.mode || 'rgb';
+  const customCh   = light.customAddress?.channel  ?? null;
+  const customUniv = light.customAddress?.universe ?? null;
+  const overlap = findOverlaps()[light.id];
+  const univ = lightUniverse(light);
+  const end = dmx ? dmx.start + dmx.channels - 1 : null;
+  const model = light.productname || light.type || 'Hue light';
+
+  let note = '', noteBad = false;
+  if (light.disabled) note = 'Parked — ignores DMX and keeps its last state.';
+  else if (!dmx) note = 'Not patched.';
+  else if (overlap) { note = `Channels ${dmx.start}–${end} overlap #${overlap.id} ${overlap.name}. Move one of them.`; noteBad = true; }
+  else note = `Uses channels ${dmx.start}${dmx.channels > 1 ? '–' + end : ''} · ${dmx.channels} ch · ${light.customAddress ? 'custom patch' : 'sequential'}`;
+  if (!isColorLight(light) && mode === 'rgb') note += ' White-only bulb — I·CT or I fits it better.';
+
+  inspector.innerHTML = `
+    <div class="insp-sec insp-head">
+      <span class="insp-swatch" id="insp-swatch"></span>
+      <div class="insp-title">
+        <input class="insp-name" id="insp-name" value="${esc(light.name)}" aria-label="Fixture name" spellcheck="false">
+        <span class="insp-sub">Hue light ${esc(light.id)} · ${esc(model)}</span>
+      </div>
+    </div>
+    ${isUnreachable(light) && !light.disabled ? '<div class="insp-alert"><strong>No response</strong> from this bulb. Auto-recovery keeps retrying.</div>' : ''}
+    <div class="insp-sec">
+      <div class="insp-row-head">
+        <span class="section-label">Patch</span>
+        ${light.customAddress ? '<button class="link" id="insp-clear">Back to sequential</button>' : ''}
+      </div>
+      <div class="field-pair">
+        <label class="field"><span class="field-label">Universe</span>
+          <input class="input mono" id="insp-univ" type="number" min="0" max="63999" value="${univ}"></label>
+        <label class="field"><span class="field-label">Address</span>
+          <input class="input mono${overlap ? ' bad' : ''}" id="insp-addr" type="number" min="1" max="512" value="${dmx ? dmx.start : ''}"></label>
+      </div>
+      <div class="field">
+        <span class="field-label">Mode</span>
+        <div class="seg" role="group" aria-label="DMX mode">
+          ${Object.entries(MODE_INFO).map(([k, m]) => `<button data-mode="${k}" class="${k === mode ? 'active' : ''}" aria-pressed="${k === mode}" title="${m.title}">${m.seg}</button>`).join('')}
+        </div>
+      </div>
+      <div class="insp-note${noteBad ? ' bad' : ''}">${esc(note)}</div>
+    </div>
+    <div class="insp-sec">
+      <div class="insp-row-head"><span class="section-label">Incoming</span><span class="hint mono">0–255</span></div>
+      ${channelNames(light).map((n, j) => `
+        <div class="chan"><span class="chan-label">${CH_LABEL[n] || n}</span>
+          <span class="chan-bar"><span class="chan-fill ${CH_CLASS[n] || 'm-i'}" data-ch="${j}"></span></span>
+          <span class="chan-val" data-ch="${j}">0</span></div>`).join('')}
+    </div>
+    <div class="insp-sec">
+      <div class="insp-row-head"><span class="section-label">Universe ${univ}</span><span class="hint" id="insp-used"></span></div>
+      <div class="umap" id="insp-umap" aria-hidden="true"></div>
+      <div class="legend">
+        <span><i style="background:var(--accent)"></i>This fixture</span>
+        <span><i style="background:#6B7078"></i>Patched</span>
+        <span><i style="background:var(--bad)"></i>Overlap</span>
+      </div>
+    </div>
+    <div class="insp-sec">
+      <div class="row"><button class="btn btn-danger" id="insp-delete">Remove from bridge</button></div>
+    </div>`;
+
+  // Universe map
+  const cells = new Array(512).fill('');
+  const inUniv = state.lights.filter(l => l.dmx && !l.disabled && lightUniverse(l) === univ);
+  let used = 0;
+  for (const l of inUniv) {
+    used += l.dmx.channels;
+    for (let c = l.dmx.start; c < l.dmx.start + l.dmx.channels && c <= 512; c++) {
+      cells[c - 1] = cells[c - 1] ? 'u-clash' : 'u-used';
+    }
+  }
+  if (dmx && !light.disabled) {
+    for (let c = dmx.start; c <= Math.min(512, end); c++) if (cells[c - 1] !== 'u-clash') cells[c - 1] = 'u-self';
+  }
+  $('insp-umap').innerHTML = cells.map(c => `<span${c ? ` class="${c}"` : ''}></span>`).join('');
+  $('insp-used').textContent = `${used} of 512 used`;
+
+  // Rename
+  const nameEl = $('insp-name');
+  const rename = async () => {
+    const newName = nameEl.value.trim();
+    if (!newName || newName === light.name) { nameEl.value = light.name; return; }
+    const res = await window.hue.renameLight(light.id, newName);
+    if (res.success) {
+      light.name = newName;
+      const rowName = patchRows.querySelector(`.prow[data-id="${light.id}"] .p-name`);
+      if (rowName) rowName.textContent = newName;
+      buildControlCards(state.lights);
+      toast(`Renamed to "${newName}"`, 'success');
+    } else {
+      nameEl.value = light.name;
+      toast(`Rename failed: ${res.error || ''}`, 'error');
+    }
+  };
+  nameEl.addEventListener('keydown', e => { if (e.key === 'Enter') nameEl.blur(); if (e.key === 'Escape') { nameEl.value = light.name; nameEl.blur(); } });
+  nameEl.addEventListener('blur', rename);
+
+  // Patch — a field only becomes an override when it differs from what the
+  // sequential patch / default universe would give it.
+  const savePatch = async () => {
+    const u  = parseInt($('insp-univ').value);
+    const ch = parseInt($('insp-addr').value);
+    const universe = isNaN(u)  ? customUniv : (customUniv == null && u === defaultUniverse() ? null : u);
+    const channel  = isNaN(ch) ? customCh   : (customCh == null && dmx && ch === dmx.start ? null : Math.max(1, Math.min(512, ch)));
+    await window.hue.setLightAddress(light.id, { channel, universe });
+    refreshLights();
+  };
+  $('insp-univ').addEventListener('change', savePatch);
+  $('insp-addr').addEventListener('change', savePatch);
+  const clear = $('insp-clear');
+  if (clear) clear.addEventListener('click', async () => { await window.hue.setLightAddress(light.id, null); refreshLights(); });
+
+  // Mode (DMX personality)
+  inspector.querySelectorAll('.seg button').forEach(b => b.addEventListener('click', async () => {
+    if (b.dataset.mode === mode) return;
+    const res = await window.hue.setLightMode(light.id, b.dataset.mode);
     if (res && res.success) {
-      const names = { rgb: 'Color (3ch)', ct: 'Tunable White (2ch)', dim: 'Dimmer (1ch)' };
-      toast(`"${light.name}" set to ${names[res.mode] || res.mode}`, 'success');
+      toast(`"${light.name}" set to ${MODE_INFO[res.mode]?.title || res.mode}`, 'success');
       refreshLights(); // footprint changed — every sequential address after it shifts
     } else {
       toast('Mode change failed', 'error');
     }
-  });
+  }));
 
-  // ── Rename ─────────────────────────────────────────────────────────────────
-  async function doRename() {
-    const newName = popup.querySelector('.light-opts-rename').value.trim();
-    if (!newName || newName === light.name) return;
-    const res = await window.hue.renameLight(light.id, newName);
-    if (res.success) {
-      light.name = newName;
-      popup.querySelector('.light-opts-title').textContent = newName;
-      const nameEl = lightsList.querySelector(`.light-row[data-id="${light.id}"] .light-name`);
-      if (nameEl) nameEl.textContent = newName;
-      toast(`Renamed to "${newName}"`, 'success');
-    } else {
-      toast(`Rename failed: ${res.error || ''}`, 'error');
-    }
-  }
-  popup.querySelector('.light-opts-rename-confirm').addEventListener('click', doRename);
-  popup.querySelector('.light-opts-rename').addEventListener('keydown', e => {
-    if (e.key === 'Enter') doRename();
-  });
-
-  // ── Delete ─────────────────────────────────────────────────────────────────
-  const deleteBtn = popup.querySelector('.light-opts-delete');
-  let deleteTimer = null;
-  deleteBtn.addEventListener('click', async () => {
-    if (deleteBtn.dataset.confirm === 'true') {
-      clearTimeout(deleteTimer);
+  // Remove (two clicks)
+  const del = $('insp-delete');
+  let delTimer = null;
+  del.addEventListener('click', async () => {
+    if (del.classList.contains('confirming')) {
+      clearTimeout(delTimer);
       const res = await window.hue.deleteLight(light.id);
       if (res.success) {
-        closeActivePopup();
-        const row = lightsList.querySelector(`.light-row[data-id="${light.id}"]`);
-        if (row) row.remove();
-        state.lights = state.lights.filter(l => String(l.id) !== String(light.id));
-        toast(`"${light.name}" removed from bridge`, 'info');
+        toast(`"${light.name}" removed from the bridge`, 'info');
+        state.selectedId = null;
+        refreshLights();
       } else {
-        toast(`Delete failed: ${res.error || ''}`, 'error');
-        deleteBtn.dataset.confirm = '';
-        deleteBtn.textContent = 'Delete from bridge';
+        toast(`Remove failed: ${res.error || ''}`, 'error');
       }
-    } else {
-      deleteBtn.dataset.confirm = 'true';
-      deleteBtn.textContent = 'Confirm delete?';
-      deleteTimer = setTimeout(() => {
-        if (deleteBtn.dataset.confirm === 'true') {
-          deleteBtn.dataset.confirm = '';
-          deleteBtn.textContent = 'Delete from bridge';
-        }
-      }, 3000);
+      return;
     }
+    del.classList.add('confirming');
+    del.textContent = 'Click again to remove';
+    delTimer = setTimeout(() => { del.classList.remove('confirming'); del.textContent = 'Remove from bridge'; }, 3000);
   });
-
-  // ── Position ───────────────────────────────────────────────────────────────
-  document.body.appendChild(popup);
-  const rect = trigger.getBoundingClientRect();
-  const pw   = popup.offsetWidth  || 240;
-  const ph   = popup.offsetHeight || 300;
-  let left   = rect.right - pw;
-  let top    = rect.bottom + 4;
-  if (left < 8)                           left = 8;
-  if (left + pw > window.innerWidth - 8)  left = window.innerWidth  - pw - 8;
-  if (top  + ph > window.innerHeight - 8) top  = rect.top - ph - 4;
-  popup.style.left = `${Math.round(left)}px`;
-  popup.style.top  = `${Math.round(top)}px`;
-
-  activePopup = popup;
 }
 
-function getLightColor(light) {
-  if (!light.state) return 'rgba(255,255,255,0.1)';
-  const s = light.state;
-  if (!s.on) return 'rgba(255,255,255,0.05)';
-  if (s.colormode === 'ct') {
-    const bri = (s.bri || 128) / 254;
-    const v   = Math.round(bri * 255);
-    return `rgb(${v}, ${Math.round(v * 0.9)}, ${Math.round(v * 0.7)})`;
-  }
-  if (s.hue !== undefined && s.sat !== undefined) {
-    const h   = (s.hue / 65535) * 360;
-    const sat = (s.sat / 254) * 100;
-    const bri = Math.round(((s.bri || 128) / 254) * 50);
-    return `hsl(${h}, ${sat}%, ${bri}%)`;
-  }
-  return 'rgba(255,255,255,0.2)';
-}
-
-// Live DMX swatch updates
-window.hue.on('artnet:dmx-update', (dmx, universe) => {
-  // Store frame in per-universe cache
-  const univ = universe ?? state.settings.universe ?? 0;
-  dmxByUniverse[univ] = dmx;
-
-  updateDmxBars();
-  onDmxPacket(univ);
-
-  // Use the protocol-aware default universe (same logic as updateDmxBars / updateMonitorCards)
-  const proto    = lbProtocol.value;
-  const mainUniv = proto === 'sacn'
-    ? (parseInt(lbSacnUniverse.value)   || (state.settings.sacnUniverse ?? 1))
-    : (parseInt(lbArtnetUniverse.value) || (state.settings.universe     ?? 0));
-
-  // light.dmx (from main) is the authoritative patch — start, channel count,
-  // and personality all come from the same map that drives the bridge.
+// Live meters, swatches and inspector bars — cheap per-frame updates
+function updatePatchLive() {
+  if (currentTab !== 'patch' || !state.lights.length) return;
+  const live = signalLive();
   for (const light of state.lights) {
-    if (!light.dmx) continue;
-    const patch = light.customAddress;
-    const lightUniv   = patch?.universe ?? mainUniv;
-    const lightBuffer = dmxByUniverse[lightUniv] || [];
-    const offset = light.dmx.start - 1;
-    const ch     = light.dmx.channels || 3;
+    const row = patchRows.querySelector(`.prow[data-id="${light.id}"]`);
+    if (!row) continue;
+    const vals = live && !light.disabled ? dmxValues(light) : dmxValues(light).map(() => 0);
+    row.querySelectorAll('.meter').forEach((m, j) => { m.style.height = `${Math.max(2, Math.round(((vals[j] || 0) / 255) * 16))}px`; });
+    const names = channelNames(light);
+    const iIdx = names.indexOf('Int');
+    const iv = iIdx >= 0 ? vals[iIdx] : Math.max(0, ...vals);
+    row.querySelector('.p-int').textContent = light.disabled ? '—' : (live ? `${Math.round((iv / 255) * 100)}%` : '—');
+    row.querySelector('.swatch').style.background = cssColor(liveColor(light)) || '#2A2D31';
 
-    if (offset < 0 || offset + ch - 1 >= lightBuffer.length) continue;
-    let r, g, b;
-    if (ch === 3) {
-      r = lightBuffer[offset]; g = lightBuffer[offset + 1]; b = lightBuffer[offset + 2];
-    } else {
-      // Intensity-based personalities (ct/dim) render as warm white at level
-      const v = lightBuffer[offset];
-      r = v; g = Math.round(v * 0.85); b = Math.round(v * 0.6);
-    }
-    const on = r > 0 || g > 0 || b > 0;
-
-    // Update lights-tab swatch
-    const row = lightsList.querySelector(`.light-row[data-id="${light.id}"]`);
-    if (row) {
-      const swatch = row.querySelector('.light-color-swatch');
-      if (swatch) swatch.style.background = on ? `rgb(${r},${g},${b})` : 'rgba(255,255,255,0.05)';
-    }
-
-    // Update control-tab tile swatch
-    const tile = controlGrid.querySelector(`[data-light-id="${light.id}"]`);
-    if (tile) {
-      const color = on ? `rgb(${r},${g},${b})` : 'rgba(255,255,255,0.05)';
-      const swatch = tile.querySelector('.ctrl-color-swatch');
-      if (swatch) swatch.style.background = color;
-      if (on) tile.style.setProperty('--tile-color', color);
+    if (String(light.id) === String(state.selectedId)) {
+      const sw = $('insp-swatch');
+      if (sw) sw.style.background = cssColor(liveColor(light)) || '#2A2D31';
+      inspector.querySelectorAll('.chan-fill').forEach(f => { f.style.width = `${((vals[f.dataset.ch] || 0) / 255) * 100}%`; });
+      inspector.querySelectorAll('.chan-val').forEach(v => { v.textContent = vals[v.dataset.ch] || 0; });
     }
   }
+}
+
+// ── Light discovery (Find lights) ────────────────────────────────────────────
+
+let discoveryTimer     = null;
+let discoveryPollCount = 0;
+
+$('btn-find-lights').addEventListener('click', startDiscovery);
+$('btn-discovery-done').addEventListener('click', async () => {
+  clearInterval(discoveryTimer);
+  discoveryTimer = null;
+  $('lights-discovery').hidden = true;
+  await refreshLights();
 });
 
-// ── DMX bar visualization ─────────────────────────────────────────────────────
+async function startDiscovery() {
+  if (!state.connected) { toast('Connect to a bridge first', 'error'); return; }
 
-function buildDmxBars() {
-  const wrap = document.getElementById('dmx-bar-wrap');
-  wrap.innerHTML = '';
-  if (state.lights && state.lights.length > 0) {
-    // One bar per fixture channel, tagged with the light id and channel offset
-    for (const light of state.lights) {
-      if (!light.dmx) continue;
-      for (let j = 0; j < light.dmx.channels; j++) {
-        const bar = document.createElement('div');
-        bar.className        = 'dmx-bar';
-        bar.dataset.lightId  = light.id;
-        bar.dataset.chOffset = j;
-        bar.style.height     = '0px';
-        wrap.appendChild(bar);
+  const discoveryEl = $('lights-discovery');
+  const resultsEl   = $('discovery-results');
+  const statusEl    = $('discovery-status-text');
+  const spinnerEl   = $('discovery-spinner');
+
+  clearInterval(discoveryTimer);
+  discoveryTimer     = null;
+  discoveryPollCount = 0;
+  resultsEl.innerHTML = '';
+  statusEl.textContent = 'Searching for new lights (about 40 s)…';
+  spinnerEl.hidden = false;
+  discoveryEl.hidden = false;
+
+  const res = await window.hue.searchNewLights();
+  if (!res.success) {
+    toast(`Search failed: ${res.error || ''}`, 'error');
+    discoveryEl.hidden = true;
+    return;
+  }
+
+  const seenIds = new Set();
+
+  function buildDiscoveryItem(found) {
+    const item = document.createElement('div');
+    item.className = 'discovery-row';
+    item.innerHTML = `
+      <input class="input" value="${esc(found.name)}" aria-label="Name for light ${esc(found.id)}">
+      <span class="hint mono">ID ${esc(found.id)}</span>
+      <button class="btn btn-sm btn-primary">Add</button>`;
+    const nameInput = item.querySelector('input');
+    const addBtn    = item.querySelector('button');
+
+    addBtn.addEventListener('click', async () => {
+      addBtn.disabled = true;
+      addBtn.textContent = 'Adding…';
+      const newName = nameInput.value.trim();
+      if (newName && newName !== found.name) {
+        const r = await window.hue.renameLight(found.id, newName);
+        if (r.success) found.name = newName;
       }
+      // A reused bridge id may carry an old fixture's tile state; drop it so
+      // the tile re-initialises from the real bulb.
+      delete controlState[found.id];
+      delete controlState[String(found.id)];
+      if (state.settings && state.settings.lightStates) {
+        delete state.settings.lightStates[found.id];
+        delete state.settings.lightStates[String(found.id)];
+      }
+      const r = await window.hue.addLight(found.id);
+      if (r && r.success) {
+        item.classList.add('added');
+        nameInput.disabled = true;
+        addBtn.replaceWith(Object.assign(document.createElement('span'), { className: 'added-tag', textContent: 'Added' }));
+        toast(`Added "${found.name}"`, 'success');
+        await refreshLights();
+      } else {
+        addBtn.disabled = false;
+        addBtn.textContent = 'Add';
+        toast(`Add failed: ${(r && r.error) || ''}`, 'error');
+      }
+    });
+    return item;
+  }
+
+  async function pollForNewLights() {
+    discoveryPollCount++;
+    const r = await window.hue.getNewLights();
+    if (!r.success) return;
+    for (const found of r.lights) {
+      if (seenIds.has(found.id)) continue;
+      seenIds.add(found.id);
+      resultsEl.appendChild(buildDiscoveryItem(found));
     }
-  } else {
-    // No lights loaded yet — show 64 generic placeholder bars
-    for (let i = 0; i < 64; i++) {
-      const bar = document.createElement('div');
-      bar.className    = 'dmx-bar';
-      bar.style.height = '0px';
-      wrap.appendChild(bar);
+    if (!r.scanning || discoveryPollCount >= 14) {
+      clearInterval(discoveryTimer);
+      discoveryTimer = null;
+      spinnerEl.hidden = true;
+      statusEl.textContent = seenIds.size > 0
+        ? `Found ${seenIds.size} new light${seenIds.size !== 1 ? 's' : ''}. Add the ones you want, then Done.`
+        : 'No new lights found. Make sure the bulb is powered on and near the bridge.';
     }
   }
+
+  discoveryTimer = setInterval(pollForNewLights, 3000);
+  setTimeout(pollForNewLights, 4000);
 }
 
-function updateDmxBars() {
-  const cfg = state.settings;
-  const proto    = lbProtocol.value;
-  const mainUniv = proto === 'sacn'
-    ? (parseInt(lbSacnUniverse.value)   || cfg.sacnUniverse || 1)
-    : (parseInt(lbArtnetUniverse.value) || cfg.universe     || 0);
+// ── DMX input ────────────────────────────────────────────────────────────────
 
-  document.querySelectorAll('.dmx-bar[data-light-id]').forEach(bar => {
-    const light     = state.lights.find(l => String(l.id) === String(bar.dataset.lightId));
-    if (!light || !light.dmx) return;
-    const patch     = light.customAddress;
-    const lightUniv = patch?.universe ?? mainUniv;
-    const buf       = dmxByUniverse[lightUniv] || [];
-    // light.dmx.start is 1-based; subtract 1 for 0-based array index
-    const val = buf[(light.dmx.start - 1) + parseInt(bar.dataset.chOffset)] || 0;
-    bar.style.height = `${Math.round((val / 255) * 24)}px`;
+let lastPacketMs = 0;
+let packetCount  = 0;
+let packetRate   = 0;
+let liveQueued   = false;
+
+function signalLive() { return state.artnetRunning && lastPacketMs && Date.now() - lastPacketMs < 2000; }
+
+window.hue.on('artnet:dmx-update', (dmx, universe) => {
+  const univ = universe ?? defaultUniverse();
+  dmxByUniverse[univ] = dmx;
+  const wasLive = signalLive();
+  lastPacketMs = Date.now();
+  packetCount++;
+  universeSeenAt[univ] = lastPacketMs;
+  if (!wasLive) { paintInputStatus(); paintSignalRow(); }
+
+  if (liveQueued) return;
+  liveQueued = true;
+  requestAnimationFrame(() => {
+    liveQueued = false;
+    updatePatchLive();
+    if (state.dmxActive) paintTilesFromDmx();
+    paintAmbient();
   });
+});
+
+const universeSeenAt = {}; // universe → last packet time, for the Log signal row
+
+function liveUniverses() {
+  const now = Date.now();
+  return Object.keys(universeSeenAt).filter(u => now - universeSeenAt[u] < 2000).map(Number).sort((a, b) => a - b);
 }
 
-// ── OTA Updates ───────────────────────────────────────────────────────────────
+// Once a second: packet rate, signal-lost detection, Log tab signal row
+setInterval(() => {
+  packetRate = packetCount;
+  packetCount = 0;
+  paintInputStatus();
+  paintSignalRow();
+  if (lastPacketMs && !signalLive()) { updatePatchLive(); scheduleAmbient(); }
+}, 1000);
 
-const updateBanner       = document.getElementById('update-banner');
-const updateBannerText   = document.getElementById('update-banner-text');
-const updateProgressWrap = document.getElementById('update-progress-wrap');
-const updateProgressBar  = document.getElementById('update-progress-bar');
-const btnUpdateDownload  = document.getElementById('btn-update-download');
-const btnUpdateInstall   = document.getElementById('btn-update-install');
+// ── Update banner ────────────────────────────────────────────────────────────
+
+const updateBanner       = $('update-banner');
+const updateBannerText   = $('update-banner-text');
+const updateProgressWrap = $('update-progress-wrap');
+const updateProgressBar  = $('update-progress-bar');
+const btnUpdateDownload  = $('btn-update-download');
+const btnUpdateInstall   = $('btn-update-install');
 
 window.hue.on('update:available', ({ version }) => {
-  updateBannerText.textContent = `Update available: v${version}`;
-  updateBanner.style.display = 'flex';
+  updateBannerText.textContent = `Update available · v${version}`;
+  updateBanner.hidden = false;
 });
-
 window.hue.on('update:progress', ({ percent }) => {
-  updateProgressWrap.style.display  = 'flex';
-  updateProgressBar.style.width     = `${percent}%`;
-  updateBannerText.textContent      = `Downloading update… ${percent}%`;
-  btnUpdateDownload.style.display   = 'none';
-  btnUpdateDownload.disabled        = false;
-  btnUpdateDownload.textContent     = 'Download';
+  updateProgressWrap.hidden = false;
+  updateProgressBar.style.width = `${percent}%`;
+  updateBannerText.textContent = `Downloading · ${percent}%`;
+  btnUpdateDownload.hidden = true;
 });
-
 window.hue.on('update:downloaded', () => {
-  updateBannerText.textContent    = '✓ Update downloaded — restart to install';
-  updateProgressWrap.style.display = 'none';
-  btnUpdateInstall.style.display  = '';
-  btnUpdateDownload.style.display = 'none';
+  updateBannerText.textContent = 'Update ready';
+  updateProgressWrap.hidden = true;
+  btnUpdateInstall.hidden = false;
+  btnUpdateDownload.hidden = true;
 });
-
 window.hue.on('update:error', ({ message }) => {
-  updateBannerText.textContent    = 'Update available';
-  updateProgressWrap.style.display = 'none';
-  btnUpdateDownload.style.display = '';
-  btnUpdateDownload.disabled      = false;
+  updateBannerText.textContent = 'Update available';
+  updateProgressWrap.hidden = true;
+  btnUpdateDownload.hidden = false;
+  btnUpdateDownload.disabled = false;
+  btnUpdateDownload.textContent = 'Download';
   toast(`Update failed: ${message}`, 'error');
 });
-
 btnUpdateDownload.addEventListener('click', () => {
   btnUpdateDownload.disabled = true;
   btnUpdateDownload.textContent = 'Downloading…';
   window.hue.downloadUpdate();
 });
-btnUpdateInstall.addEventListener('click',  () => window.hue.installUpdate());
-document.getElementById('btn-update-dismiss').addEventListener('click', () => {
-  updateBanner.style.display = 'none';
-});
+btnUpdateInstall.addEventListener('click', () => window.hue.installUpdate());
+$('btn-update-dismiss').addEventListener('click', () => { updateBanner.hidden = true; });
 
-// ── Color palette ─────────────────────────────────────────────────────────────
-// Preset swatches tuned for Hue bulbs — two whites first, then the hues —
-// plus a rainbow "custom" dot that opens the OS color picker.
+// ── Control ──────────────────────────────────────────────────────────────────
 
 const PALETTE = [
   { hex: '#ffb46b', name: 'Warm white' },
   { hex: '#ffe0b3', name: 'Soft white' },
+  { hex: '#f2f4ff', name: 'Cool white' },
   { hex: '#ff4d3e', name: 'Red' },
-  { hex: '#ff9500', name: 'Orange' },
+  { hex: '#ff9500', name: 'Amber' },
   { hex: '#ffd60a', name: 'Yellow' },
   { hex: '#30d158', name: 'Green' },
   { hex: '#0a84ff', name: 'Blue' },
-  { hex: '#bf5af2', name: 'Purple' },
+  { hex: '#bf5af2', name: 'Violet' },
 ];
 
-// Build a palette row: preset dots + custom picker.
-// onPick(hex) fires on any selection. el.setActive(hex) rings the matching
-// dot (or the custom dot when the color is off-palette).
-function buildPalette(onPick, opts = {}) {
-  const el = document.createElement('div');
-  el.className = 'palette';
-  const dots = [];
-  for (const { hex, name } of PALETTE) {
-    const d = document.createElement('button');
-    d.className = 'palette-dot';
-    d.title = name;
-    d.style.background = hex;
-    d.dataset.hex = hex;
-    d.addEventListener('click', (e) => {
-      e.stopPropagation();
-      el.setActive(hex);
-      onPick(hex);
-    });
-    dots.push(d);
-    el.appendChild(d);
-  }
+const controlGrid    = $('control-grid');
+const panelControl   = $('panel-control');
+const controlState   = {}; // { lightId: { on, rgb, bri } } — persisted to config
+const selectedLights = new Set();
+let lastClickedId    = null;
 
-  const custom = document.createElement('label');
-  custom.className = 'palette-dot palette-custom';
-  custom.title = 'Custom color…';
-  const input = document.createElement('input');
-  input.type = 'color';
-  input.value = opts.initial || '#ffcc66';
-  const pickCustom = () => { el.setActive(input.value); onPick(input.value); };
-  input.addEventListener('input',  pickCustom);
-  input.addEventListener('change', pickCustom);
-  input.addEventListener('click', e => e.stopPropagation());
-  custom.addEventListener('click', e => e.stopPropagation());
-  custom.appendChild(input);
-  el.appendChild(custom);
+const persistControlState = debounce(() => {
+  window.hue.saveSettings({ lightStates: { ...controlState } });
+}, 1500);
 
-  el.setActive = (hex) => {
-    let matched = false;
-    for (const d of dots) {
-      const on = !!hex && d.dataset.hex.toLowerCase() === String(hex).toLowerCase();
-      d.classList.toggle('active', on);
-      matched = matched || on;
-    }
-    custom.classList.toggle('active', !!hex && !matched);
-    if (hex && !matched) input.value = hex;   // keep the OS picker in sync
-  };
-  if (opts.initial) el.setActive(opts.initial);
-  return el;
+async function sendLightState(lightId, s) {
+  persistControlState();
+  updateMasterStatus();
+  scheduleAmbient();
+  if (!s.on) { await window.hue.setLightState(lightId, { on: false }); return; }
+  await window.hue.setLightState(lightId, { on: true, rgb: s.rgb, bri: s.bri });
 }
 
-// ── Control panel ─────────────────────────────────────────────────────────────
+function setFader(el, pct, fill) {
+  el.style.setProperty('--pct', `${pct}%`);
+  if (fill) el.style.setProperty('--fill', fill);
+}
 
-const controlGrid       = document.getElementById('control-grid');
-const dmxOverrideBanner = document.getElementById('dmx-override-banner');
-const dmxOverrideInfo   = document.getElementById('dmx-override-info');
-const panelControl      = document.getElementById('panel-control');
+// Paint a tile from its control state (or, while DMX owns the rig, from DMX)
+function paintTile(tile, light) {
+  const s = controlState[light.id];
+  if (!s) return;
+  const down = isUnreachable(light);
+  tile.classList.toggle('unreachable', down);
+  tile.classList.toggle('off', !s.on);
+  tile.querySelector('.tile-swatch').style.background = s.on && !down ? s.rgb : '#2A2D31';
+  tile.querySelector('.tile-level').textContent = down ? '—' : s.on ? `${s.bri}%` : 'Off';
+  tile.querySelector('.switch-btn').setAttribute('aria-pressed', String(!!s.on));
+  const fader = tile.querySelector('.fader');
+  fader.hidden = down;
+  tile.querySelector('.tile-down').hidden = !down;
+  if (document.activeElement !== fader) fader.value = s.bri;
+  setFader(fader, s.bri, s.on ? s.rgb : '#4A4E55');
+}
 
-// ── All Lights master row ─────────────────────────────────────────────────────
-
-const masterBri    = document.getElementById('master-bri');
-const masterBriVal = document.getElementById('master-bri-val');
-const masterStatus = document.getElementById('master-status');
-
-// Iterate every light that can accept a command (skips unreachable bulbs so
-// group/master actions never stall the bridge in Zigbee retries).
-function eachControllableLight(fn) {
+function paintTilesFromDmx() {
   for (const light of state.lights) {
-    if (light.state && light.state.reachable === false) continue;
-    const s = controlState[light.id];
-    if (s) fn(light, s);
+    const tile = controlGrid.querySelector(`[data-light-id="${light.id}"]`);
+    if (!tile || light.disabled) continue;
+    const col = colorFromDmx(light, dmxValues(light));
+    const css = cssColor(col);
+    const pct = Math.round(col.k * 100);
+    tile.classList.toggle('off', !css);
+    tile.querySelector('.tile-swatch').style.background = css || '#2A2D31';
+    tile.querySelector('.tile-level').textContent = css ? `${pct}%` : 'Off';
+    tile.querySelector('.switch-btn').setAttribute('aria-pressed', String(!!css));
+    const fader = tile.querySelector('.fader');
+    if (fader) { fader.value = Math.max(1, pct); setFader(fader, pct, css ? `rgb(${col.c.map(Math.round).join(',')})` : '#4A4E55'); }
   }
 }
 
 function repaintAllTiles() {
   for (const light of state.lights) {
     const tile = controlGrid.querySelector(`[data-light-id="${light.id}"]`);
-    const s    = controlState[light.id];
-    if (tile && s) paintTile(tile, s);
+    if (tile) paintTile(tile, light);
   }
   updateMasterStatus();
-}
-
-function updateMasterStatus() {
-  const total = state.lights.length;
-  if (total === 0) { masterStatus.textContent = ''; return; }
-  const on = state.lights.filter(l => controlState[l.id]?.on).length;
-  masterStatus.textContent = on === 0 ? 'All off' : on === total ? 'All on' : `${on} of ${total} on`;
-}
-
-document.getElementById('btn-all-on').addEventListener('click', () => {
-  eachControllableLight((light, s) => { s.on = true; sendLightState(light.id, s); });
-  repaintAllTiles();
-});
-document.getElementById('btn-all-off').addEventListener('click', async () => {
-  // One group-0 bridge command — instant rig-wide off. Per-bulb sends would be
-  // paced ~1/sec each; the group action lands everywhere at once.
-  for (const light of state.lights) { const s = controlState[light.id]; if (s) s.on = false; }
-  persistControlState();
-  repaintAllTiles();
-  await window.hue.allLightsOff().catch(() => {});
-});
-
-// All-off fired from elsewhere (Companion, panic endpoint) — mirror it in the UI
-window.hue.on('lights:all-off', ({ source } = {}) => {
-  for (const light of state.lights) { const s = controlState[light.id]; if (s) s.on = false; }
-  persistControlState();
-  repaintAllTiles();
-  if (source && source !== 'control tab') toast(`All lights off (${source})`, 'warn');
-});
-
-// Master dimmer + color apply to the lights that are ON — All On/Off are the
-// explicit way to change power, so dragging the room fader can't blind-fire
-// fixtures that were deliberately dark.
-const sendMasterBri = debounce(() => {
-  const bri = parseInt(masterBri.value);
-  eachControllableLight((light, s) => {
-    if (!s.on) return;
-    s.bri = bri;
-    sendLightState(light.id, s);
-  });
-  repaintAllTiles();
-}, 120);
-masterBri.addEventListener('input', () => {
-  masterBriVal.textContent = `${masterBri.value}%`;
-  sendMasterBri();
-});
-
-const masterPalette = buildPalette(hex => {
-  eachControllableLight((light, s) => {
-    if (!s.on) return;
-    s.rgb = hex;
-    sendLightState(light.id, s);
-  });
-  repaintAllTiles();
-});
-document.getElementById('master-palette').replaceWith(masterPalette);
-masterPalette.id = 'master-palette';
-
-// ── Select mode (group control) ───────────────────────────────────────────────
-// Toolbar "Select" toggles a mode where tapping cards selects them; the group
-// actions bar then drives every selected light at once.
-
-let selectMode = false;
-const selectedLights = new Set();
-const groupActions   = document.getElementById('group-actions');
-const btnSelectMode  = document.getElementById('btn-select-mode');
-const groupBriEl     = document.getElementById('group-bri');
-
-function toggleTileSelected(id, tile) {
-  const key = String(id);
-  if (selectedLights.has(key)) { selectedLights.delete(key); tile.classList.remove('selected'); }
-  else                         { selectedLights.add(key);    tile.classList.add('selected'); }
-  updateGroupCount();
-}
-
-function updateGroupCount() {
-  document.getElementById('group-count').textContent = `${selectedLights.size} selected`;
-  const none = selectedLights.size === 0;
-  document.getElementById('btn-group-on').disabled  = none;
-  document.getElementById('btn-group-off').disabled = none;
-}
-
-function enterSelectMode() {
-  selectMode = true;
-  controlGrid.classList.add('selecting');
-  groupActions.style.display = 'flex';
-  btnSelectMode.textContent = 'Done';
-  btnSelectMode.classList.replace('btn-secondary', 'btn-primary');
-  updateGroupCount();
-}
-
-function exitSelectMode() {
-  selectMode = false;
-  selectedLights.clear();
-  controlGrid.classList.remove('selecting');
-  controlGrid.querySelectorAll('.ctrl-tile.selected').forEach(t => t.classList.remove('selected'));
-  groupActions.style.display = 'none';
-  btnSelectMode.textContent = 'Select';
-  btnSelectMode.classList.replace('btn-primary', 'btn-secondary');
-}
-
-btnSelectMode.addEventListener('click', () => (selectMode ? exitSelectMode() : enterSelectMode()));
-
-document.getElementById('btn-group-all').addEventListener('click', () => {
-  controlGrid.querySelectorAll('.ctrl-tile').forEach(t => {
-    const id = String(t.dataset.lightId);
-    if (!selectedLights.has(id)) { selectedLights.add(id); t.classList.add('selected'); }
-  });
-  updateGroupCount();
-});
-
-function eachSelected(fn) {
-  for (const id of selectedLights) {
-    const light = state.lights.find(l => String(l.id) === id);
-    if (!light) continue;
-    if (light.state && light.state.reachable === false) continue;
-    const s = controlState[light.id];
-    if (s) fn(light, s);
-  }
-}
-
-document.getElementById('btn-group-on').addEventListener('click', () => {
-  eachSelected((l, s) => { s.on = true; sendLightState(l.id, s); });
-  repaintAllTiles();
-});
-document.getElementById('btn-group-off').addEventListener('click', () => {
-  eachSelected((l, s) => { s.on = false; sendLightState(l.id, s); });
-  repaintAllTiles();
-});
-
-// Group color/brightness turn the selection on — acting on a selection is an
-// explicit "light these up" intent, unlike the ambient master fader.
-const sendGroupBri = debounce(() => {
-  const bri = parseInt(groupBriEl.value);
-  eachSelected((l, s) => { s.bri = bri; s.on = true; sendLightState(l.id, s); });
-  repaintAllTiles();
-}, 120);
-groupBriEl.addEventListener('input', () => {
-  document.getElementById('group-bri-val').textContent = `${groupBriEl.value}%`;
-  sendGroupBri();
-});
-
-const groupPalette = buildPalette(hex => {
-  eachSelected((l, s) => { s.rgb = hex; s.on = true; sendLightState(l.id, s); });
-  repaintAllTiles();
-});
-document.getElementById('group-palette').replaceWith(groupPalette);
-groupPalette.id = 'group-palette';
-
-// Debounce helper
-function debounce(fn, ms) {
-  let t;
-  return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
-}
-
-// Per-light state stored in renderer (and persisted to config)
-const controlState = {}; // { lightId: { on, rgb, bri } }
-
-// Debounced persist — writes controlState to config ~1.5 s after last change
-const persistControlState = debounce(() => {
-  window.hue.saveSettings({ lightStates: { ...controlState } });
-}, 1500);
-
-// Paint every on/off + color visual on a tile from its control state.
-// Skips the brightness slider while the user is dragging it.
-function paintTile(tile, s) {
-  tile.style.setProperty('--tile-color', s.rgb);
-  tile.classList.toggle('active', !!s.on);
-  const swatch = tile.querySelector('.ctrl-color-swatch');
-  if (swatch) swatch.style.background = s.on ? s.rgb : 'rgba(255,255,255,0.08)';
-  const sub = tile.querySelector('.ctrl-tile-sub');
-  if (sub) sub.textContent = s.on ? `On · ${s.bri}%` : 'Off';
-  const tog = tile.querySelector('.ctrl-toggle input');
-  if (tog) tog.checked = !!s.on;
-  const bri = tile.querySelector('.ctrl-bri');
-  if (bri && document.activeElement !== bri) bri.value = s.bri;
-  const briVal = tile.querySelector('.bri-val');
-  if (briVal) briVal.textContent = `${s.bri}%`;
-  const pal = tile.querySelector('.palette');
-  if (pal && pal.setActive) pal.setActive(s.rgb);
+  updateSelectionBar();
+  scheduleAmbient();
 }
 
 function buildControlCards(lights) {
-  exitSelectMode(); // selections can't survive a rebuild
   if (!lights || lights.length === 0) {
-    controlGrid.innerHTML = '<div class="empty-state"><p>Connect to a bridge and load lights first</p></div>';
+    controlGrid.innerHTML = '<div class="empty">Connect to a bridge and load lights first.</div>';
+    clearSelection();
     updateMasterStatus();
     return;
   }
   controlGrid.innerHTML = '';
-
-  // Seed from persisted config if available
   const saved = (state.settings && state.settings.lightStates) || {};
+  for (const id of [...selectedLights]) if (!lights.some(l => String(l.id) === id)) selectedLights.delete(id);
 
   for (const light of lights) {
     if (!controlState[light.id]) {
@@ -1451,389 +1326,431 @@ function buildControlCards(lights) {
     const s = controlState[light.id];
 
     const tile = document.createElement('div');
-    tile.className = 'ctrl-tile'
-      + (light.state && light.state.reachable === false ? ' tile-unreachable' : '');
+    tile.className = 'tile' + (selectedLights.has(String(light.id)) ? ' selected' : '');
     tile.dataset.lightId = light.id;
     tile.innerHTML = `
-      <div class="ctrl-tile-glow"></div>
-      <div class="sel-check"></div>
-      <div class="ctrl-head">
-        <div class="ctrl-color-swatch"></div>
-        <div class="ctrl-name-wrap">
-          <span class="ctrl-tile-name" title="${light.name.replace(/"/g, '&quot;')}">${light.name}</span>
-          <span class="ctrl-tile-sub">Off</span>
-        </div>
-        <label class="toggle ctrl-toggle" title="On / Off">
-          <input type="checkbox">
-          <span class="toggle-slider"></span>
-        </label>
+      <button class="tile-hit" aria-label="Select ${esc(light.name)}" aria-pressed="${selectedLights.has(String(light.id))}"></button>
+      <div class="tile-head">
+        <span class="tile-swatch"></span>
+        <span class="tile-name" title="${esc(light.name)}">${esc(light.name)}</span>
+        <button class="switch-btn" aria-label="${esc(light.name)} power" aria-pressed="false"><span class="switch"><span class="switch-thumb"></span></span></button>
       </div>
-      <div class="ctrl-bri-row">
-        <input type="range" min="1" max="100" value="${s.bri}" class="bri-slider ctrl-bri">
-        <span class="bri-val">${s.bri}%</span>
+      <div class="tile-value"><span class="tile-level">—</span><span class="tile-kind">${isColorLight(light) ? 'Color' : 'White'}</span></div>
+      <div class="tile-foot">
+        <input type="range" min="1" max="100" value="${s.bri}" class="fader" aria-label="${esc(light.name)} level">
+        <span class="tile-down" hidden><span class="dot dot-bad"></span>No response · retrying</span>
       </div>`;
 
-    // Color palette — picking a color turns the light on (what you'd expect
-    // from tapping a color in any smart-home app)
-    const pal = buildPalette(hex => {
-      s.rgb = hex;
-      s.on  = true;
-      paintTile(tile, s);
-      sendLightState(light.id, s);
-    }, { initial: s.rgb });
-    pal.classList.add('ctrl-palette');
-    tile.appendChild(pal);
+    tile.querySelector('.tile-hit').addEventListener('click', (e) => onTileClick(light, e));
 
-    // On/off toggle
-    tile.querySelector('.ctrl-toggle input').addEventListener('change', (e) => {
-      s.on = e.target.checked;
-      paintTile(tile, s);
+    tile.querySelector('.switch-btn').addEventListener('click', () => {
+      if (isUnreachable(light)) return;
+      s.on = !s.on;
+      state.activeScene = null;
+      paintTile(tile, light);
+      paintSceneActive();
       sendLightState(light.id, s);
     });
-    tile.querySelector('.ctrl-toggle').addEventListener('click', e => e.stopPropagation());
 
-    // Brightness — dragging while off turns the light on
-    const sendBri = debounce((bri) => {
-      s.bri = bri;
-      if (!s.on) { s.on = true; paintTile(tile, s); }
-      sendLightState(light.id, s);
-    }, 80);
-    tile.querySelector('.ctrl-bri').addEventListener('input', (e) => {
-      const bri = parseInt(e.target.value);
-      tile.querySelector('.bri-val').textContent = `${bri}%`;
-      sendBri(bri);
-    });
-
-    // In select mode, tapping anywhere on the card toggles selection
-    tile.addEventListener('click', () => {
-      if (selectMode) toggleTileSelected(light.id, tile);
+    // Level — dragging while off turns the light on
+    const sendBri = debounce(() => sendLightState(light.id, s), 80);
+    tile.querySelector('.fader').addEventListener('input', (e) => {
+      s.bri = parseInt(e.target.value);
+      s.on = true;
+      state.activeScene = null;
+      paintTile(tile, light);
+      paintSceneActive();
+      sendBri();
     });
 
     controlGrid.appendChild(tile);
-    paintTile(tile, s);
+    paintTile(tile, light);
   }
   updateMasterStatus();
-
-  // Re-show the override banner if DMX was active when the tab was re-entered
-  if (state.dmxActive) dmxOverrideBanner.style.display = 'flex';
+  updateSelectionBar();
+  if (state.dmxActive) paintTilesFromDmx();
 }
 
-// Pull fresh bridge state and make the tiles reflect reality: on/off, level,
-// reachability, and the real bulb color on the swatch/glow. Skipped while DMX
-// is active — the dmx-update handler keeps tiles live instead.
+// Pull fresh bridge state so tiles reflect reality (skipped while DMX owns the rig)
 async function refreshControlSwatches() {
   if (!state.connected || state.dmxActive) return;
   const res = await window.hue.getLights();
   if (!res || !res.lights) return;
-  for (const light of res.lights) {
-    const tile = controlGrid.querySelector(`[data-light-id="${light.id}"]`);
-    if (!tile) continue;
+  for (const fresh of res.lights) {
+    const light = state.lights.find(l => String(l.id) === String(fresh.id));
+    const s = controlState[fresh.id];
+    if (!light || !s || !fresh.state) continue;
+    light.state = fresh.state;
+    s.on = !!fresh.state.on;
+    if (fresh.state.bri != null) s.bri = Math.max(1, Math.round((fresh.state.bri / 254) * 100));
+  }
+  repaintAllTiles();
+  paintFixtureHealth();
+}
+
+// ── Selection ────────────────────────────────────────────────────────────────
+
+function onTileClick(light, e) {
+  const id = String(light.id);
+  if (e.shiftKey && lastClickedId != null) {
+    const ids = state.lights.map(l => String(l.id));
+    const a = ids.indexOf(lastClickedId), b = ids.indexOf(id);
+    for (const x of ids.slice(Math.min(a, b), Math.max(a, b) + 1)) selectedLights.add(x);
+  } else if (selectedLights.has(id)) {
+    selectedLights.delete(id);
+  } else {
+    selectedLights.add(id);
+  }
+  lastClickedId = id;
+  paintSelection();
+}
+
+function paintSelection() {
+  controlGrid.querySelectorAll('.tile').forEach(t => {
+    const on = selectedLights.has(String(t.dataset.lightId));
+    t.classList.toggle('selected', on);
+    t.querySelector('.tile-hit').setAttribute('aria-pressed', String(on));
+  });
+  updateSelectionBar();
+}
+
+function selectAll() {
+  for (const l of state.lights) if (!isUnreachable(l)) selectedLights.add(String(l.id));
+  paintSelection();
+}
+
+function clearSelection() {
+  selectedLights.clear();
+  lastClickedId = null;
+  paintSelection();
+}
+
+$('btn-select-all').addEventListener('click', selectAll);
+$('btn-sel-clear').addEventListener('click', clearSelection);
+
+function eachSelected(fn) {
+  for (const id of selectedLights) {
+    const light = state.lights.find(l => String(l.id) === id);
+    if (!light || isUnreachable(light)) continue;
     const s = controlState[light.id];
-    if (s && light.state) {
-      s.on = !!light.state.on;
-      if (light.state.bri != null) s.bri = Math.max(1, Math.round((light.state.bri / 254) * 100));
-      paintTile(tile, s);
-      if (s.on) {
-        // Show the bulb's actual color (hue/sat from the bridge), which can
-        // differ from the stored hex if something else changed the light.
-        const color = getLightColor(light);
-        const swatch = tile.querySelector('.ctrl-color-swatch');
-        if (swatch) swatch.style.background = color;
-        tile.style.setProperty('--tile-color', color);
-      }
+    if (s) fn(light, s);
+  }
+}
+
+// Color / level on a selection turn it on — acting on a selection is an
+// explicit "light these up" intent.
+const selPalette = buildPalette((hex) => {
+  eachSelected((l, s) => { s.rgb = hex; s.on = true; sendLightState(l.id, s); });
+  state.activeScene = null;
+  paintSceneActive();
+  repaintAllTiles();
+});
+$('sel-palette').replaceWith(selPalette);
+selPalette.id = 'sel-palette';
+
+const selBri = $('sel-bri');
+const sendSelBri = debounce(() => {
+  eachSelected((l, s) => sendLightState(l.id, s));
+}, 120);
+selBri.addEventListener('input', () => {
+  const v = parseInt(selBri.value);
+  eachSelected((l, s) => { s.bri = v; s.on = true; });
+  state.activeScene = null;
+  paintSceneActive();
+  repaintAllTiles();
+  sendSelBri();
+});
+$('btn-sel-on').addEventListener('click', () => { eachSelected((l, s) => { s.on = true; sendLightState(l.id, s); }); repaintAllTiles(); });
+$('btn-sel-off').addEventListener('click', () => { eachSelected((l, s) => { s.on = false; sendLightState(l.id, s); }); repaintAllTiles(); });
+
+function updateSelectionBar() {
+  const live = [];
+  eachSelected((l, s) => live.push(s));
+  const n = live.length;
+  $('selection-bar').classList.toggle('disabled', n === 0);
+  $('sel-title').textContent = n ? `${n} selected` : 'Nothing selected';
+  $('btn-sel-clear').hidden = n === 0;
+  $('sel-hint').hidden = n > 0;
+  if (n) {
+    const avg = Math.round(live.reduce((t, s) => t + s.bri, 0) / n);
+    if (document.activeElement !== selBri) selBri.value = avg;
+    setFader(selBri, avg, 'var(--text)');
+    $('sel-bri-val').textContent = `${avg}%`;
+    const colors = new Set(live.map(s => String(s.rgb).toLowerCase()));
+    selPalette.setActive(colors.size === 1 ? [...colors][0] : null);
+  } else {
+    setFader(selBri, 0);
+    $('sel-bri-val').textContent = '—';
+    selPalette.setActive(null);
+  }
+}
+
+function buildPalette(onPick) {
+  const el = document.createElement('div');
+  el.className = 'palette';
+  el.setAttribute('role', 'group');
+  el.setAttribute('aria-label', 'Color');
+  const chips = [];
+  for (const { hex, name } of PALETTE) {
+    const b = document.createElement('button');
+    b.className = 'chip';
+    b.title = name;
+    b.setAttribute('aria-label', name);
+    b.style.background = hex;
+    b.dataset.hex = hex;
+    b.addEventListener('click', () => onPick(hex));
+    chips.push(b);
+    el.appendChild(b);
+  }
+  const custom = document.createElement('label');
+  custom.className = 'chip chip-custom';
+  custom.title = 'Custom color';
+  custom.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg><input type="color" aria-label="Custom color">';
+  const input = custom.querySelector('input');
+  input.addEventListener('input', () => onPick(input.value));
+  el.appendChild(custom);
+
+  el.setActive = (hex) => {
+    let matched = false;
+    for (const c of chips) {
+      const on = !!hex && c.dataset.hex === String(hex).toLowerCase();
+      c.classList.toggle('active', on);
+      matched = matched || on;
     }
-    tile.classList.toggle('tile-unreachable', !!(light.state && light.state.reachable === false));
-  }
-  updateMasterStatus();
+    custom.classList.toggle('active', !!hex && !matched);
+    if (hex && !matched) input.value = hex;
+  };
+  return el;
 }
 
-async function sendLightState(lightId, s) {
+// ── Master ───────────────────────────────────────────────────────────────────
+
+const masterBri = $('master-bri');
+
+function updateMasterStatus() {
+  const total = state.lights.length;
+  const on = state.lights.filter(l => controlState[l.id]?.on).length;
+  $('master-status').textContent = total === 0 ? '' : on === 0 ? 'All off' : on === total ? `All ${total} on` : `${on} of ${total} on`;
+}
+
+function eachControllableLight(fn) {
+  for (const light of state.lights) {
+    if (isUnreachable(light)) continue;
+    const s = controlState[light.id];
+    if (s) fn(light, s);
+  }
+}
+
+$('btn-all-on').addEventListener('click', () => {
+  eachControllableLight((light, s) => { s.on = true; sendLightState(light.id, s); });
+  state.activeScene = null;
+  paintSceneActive();
+  repaintAllTiles();
+});
+$('btn-all-off').addEventListener('click', blackout);
+
+// The master fader scales lights that are ON — All on/off change power, so the
+// room fader can't blind-fire fixtures that were deliberately dark.
+const sendMasterBri = debounce(() => {
+  eachControllableLight((light, s) => { if (s.on) sendLightState(light.id, s); });
+}, 120);
+masterBri.addEventListener('input', () => {
+  const v = parseInt(masterBri.value);
+  $('master-bri-val').textContent = `${v}%`;
+  setFader(masterBri, v);
+  eachControllableLight((light, s) => { if (s.on) s.bri = v; });
+  repaintAllTiles();
+  sendMasterBri();
+});
+setFader(masterBri, 100);
+
+// All-off fired from elsewhere (Companion, panic endpoint) — mirror it
+window.hue.on('lights:all-off', ({ source } = {}) => {
+  for (const light of state.lights) { const s = controlState[light.id]; if (s) s.on = false; }
   persistControlState();
-  updateMasterStatus();
-  if (!s.on) {
-    await window.hue.setLightState(lightId, { on: false });
-    return;
-  }
-  await window.hue.setLightState(lightId, { on: true, rgb: s.rgb, bri: s.bri });
-}
+  state.activeScene = null;
+  paintSceneActive();
+  repaintAllTiles();
+  if (source && source !== 'control tab') toast(`All lights off (${source})`, 'warn');
+});
 
-// DMX takeover — lock the whole control surface while DMX owns the rig
+// DMX takeover — lock manual control while DMX owns the rig
 window.hue.on('dmx:takeover-change', ({ active }) => {
   const wasActive = state.dmxActive;
   state.dmxActive = active;
-  dmxOverrideBanner.style.display = active ? 'flex' : 'none';
+  $('dmx-override-banner').hidden = !active;
+  $('dmx-override-info').textContent = `${protoLabel()} is driving the rig. Manual control returns 2 s after the last packet.`;
   panelControl.classList.toggle('dmx-live', active);
-  dmxOverrideInfo.textContent = '';
-  // When DMX stops, tiles show the last DMX values rather than the real bulb
-  // state — pull fresh state so the tab reflects reality again.
+  if (active) paintTilesFromDmx();
+  // Tiles showed DMX values — pull fresh state so they reflect reality again
   if (wasActive && !active) refreshControlSwatches();
 });
 
-// Companion applied a preset behind our back — re-sync tiles to the bridge
-window.hue.on('companion:preset-applied', () => { refreshControlSwatches(); });
+window.hue.on('companion:preset-applied', () => refreshControlSwatches());
 
-// ── Scenes (chips) ────────────────────────────────────────────────────────────
-// Every scene is a pill: click applies it, ✕ deletes (click twice to confirm),
-// and the dashed "+ Save Scene" chip snapshots the current look inline.
+// ── Scenes ───────────────────────────────────────────────────────────────────
 
-let scenesCache = {}; // { name: [ { id, on, rgb, bri } ] } — for tile sync on apply
+let scenesCache = {}; // { name: [ { id, on, rgb, bri } ] }
+const sceneList = $('scene-list');
 
-// Reflect an applied scene in the tiles immediately (the bridge fade takes a
-// moment; the UI shouldn't wait for it).
 function syncTilesFromScene(name) {
   for (const entry of scenesCache[name] || []) {
     const s = controlState[entry.id];
     if (!s) continue;
     s.on = !!entry.on;
-    if (entry.rgb)        s.rgb = entry.rgb;
+    if (entry.rgb)         s.rgb = entry.rgb;
     if (entry.bri != null) s.bri = entry.bri;
   }
   repaintAllTiles();
   persistControlState();
 }
 
-// Snapshot the current control-tab state as a scene payload.
 function snapshotCurrentLook() {
-  return state.lights
-    .filter(l => controlState[l.id])
-    .map(l => ({ id: l.id, ...controlState[l.id] }));
+  return state.lights.filter(l => controlState[l.id]).map(l => ({ id: l.id, ...controlState[l.id] }));
+}
+
+async function applyScene(name) {
+  const res = await window.hue.applyScene(name);
+  if (res.success) {
+    state.activeScene = name;
+    paintSceneActive();
+    syncTilesFromScene(name);
+  } else {
+    toast(`Scene failed: ${(res.errors || []).join(', ')}`, 'error');
+  }
+}
+
+function paintSceneActive() {
+  sceneList.querySelectorAll('.scene').forEach(b => {
+    const on = b.dataset.name === state.activeScene;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-pressed', String(on));
+  });
+}
+
+function armButton(btn, label, onConfirm) {
+  let t = null;
+  const original = btn.textContent;
+  btn.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    const tools = btn.closest('.scene-tools');
+    if (btn.classList.contains('confirming')) {
+      clearTimeout(t);
+      btn.classList.remove('confirming');
+      tools.classList.remove('armed');
+      await onConfirm();
+      return;
+    }
+    tools.querySelectorAll('.confirming').forEach(b => b.classList.remove('confirming'));
+    btn.classList.add('confirming');
+    btn.textContent = label;
+    tools.classList.add('armed');
+    t = setTimeout(() => { btn.classList.remove('confirming'); btn.textContent = original; tools.classList.remove('armed'); }, 2500);
+  });
 }
 
 async function loadScenes() {
   scenesCache = await window.hue.getScenes() || {};
-  const wrap = document.getElementById('scene-cards');
-  wrap.innerHTML = '';
-
-  for (const name of Object.keys(scenesCache)) {
-    const entries = scenesCache[name] || [];
-    // Color preview built from the scene's lit fixtures — the card *shows*
-    // the look instead of just naming it.
-    const colors  = entries.filter(e => e.on && e.rgb).map(e => e.rgb).slice(0, 6);
-    const tint = colors.length >= 2 ? `linear-gradient(135deg, ${colors.join(', ')})`
-               : colors.length === 1 ? colors[0]
-               : 'rgba(255,255,255,0.06)';
-    const onCount = entries.filter(e => e.on).length;
-
-    const card = document.createElement('div');
-    card.className = 'scene-card';
-    card.innerHTML = `
-      <div class="scene-card-tint"></div>
-      <button class="scene-card-update" title="Update scene to the current look">↻</button>
-      <button class="scene-card-x" title="Delete scene">✕</button>
-      <div class="scene-card-name"></div>
-      <div class="scene-card-meta"></div>`;
-    card.querySelector('.scene-card-tint').style.background = tint;
-    card.querySelector('.scene-card-name').textContent = name;
-    card.querySelector('.scene-card-name').title = name;
-    card.querySelector('.scene-card-meta').textContent = entries.length
-      ? (onCount > 0 ? `${onCount} of ${entries.length} on` : `all ${entries.length} off`)
-      : 'empty scene';
-
-    card.addEventListener('click', async (e) => {
-      if (e.target.closest('.scene-card-x')) return;
-      const res = await window.hue.applyScene(name);
-      if (res.success) {
-        wrap.querySelectorAll('.scene-card.applied').forEach(c => c.classList.remove('applied'));
-        card.classList.add('applied');
-        setTimeout(() => card.classList.remove('applied'), 1200);
-        syncTilesFromScene(name);
-      } else {
-        toast(`Scene failed: ${(res.errors || []).join(', ')}`, 'error');
-      }
-    });
-
-    // ── Update: overwrite this scene with the current look (two-click confirm) ──
-    const upd = card.querySelector('.scene-card-update');
-    let updTimer = null;
-    upd.addEventListener('click', async (e) => {
-      e.stopPropagation();
-      if (upd.classList.contains('confirming')) {
-        clearTimeout(updTimer);
-        upd.classList.remove('confirming');
-        await window.hue.saveScene(name, snapshotCurrentLook());
-        toast(`Scene "${name}" updated`, 'success');
-        await loadScenes();
-      } else {
-        // Cancel any pending delete-confirm so the two states can't overlap
-        card.classList.remove('confirm-delete');
-        upd.classList.add('confirming');
-        upd.title = 'Click again to overwrite this scene';
-        updTimer = setTimeout(() => { upd.classList.remove('confirming'); upd.title = 'Update scene to the current look'; }, 2500);
-      }
-    });
-
-    const x = card.querySelector('.scene-card-x');
-    let confirmTimer = null;
-    x.addEventListener('click', async (e) => {
-      e.stopPropagation();
-      upd.classList.remove('confirming'); // clear a pending update-confirm
-      if (card.classList.contains('confirm-delete')) {
-        clearTimeout(confirmTimer);
-        await window.hue.deleteScene(name);
-        card.remove();
-        toast(`Scene "${name}" deleted`, 'info');
-      } else {
-        card.classList.add('confirm-delete');
-        confirmTimer = setTimeout(() => card.classList.remove('confirm-delete'), 2500);
-      }
-    });
-
-    wrap.appendChild(card);
-  }
-
-  // "+ Save Scene" card — becomes an inline name input
-  const ADD_HTML = `<div class="scene-card-name">+ Save Scene</div><div class="scene-card-meta">snapshot the current look</div>`;
-  const add = document.createElement('div');
-  add.className = 'scene-card scene-card-add';
-  add.innerHTML = ADD_HTML;
-  add.title = 'Save the current look as a scene';
-  add.addEventListener('click', () => {
-    if (add.querySelector('input')) return;
-    add.innerHTML = '';
-    const inp = document.createElement('input');
-    inp.className   = 'scene-card-input';
-    inp.placeholder = 'Scene name…';
-    add.appendChild(inp);
-    inp.focus();
-    const restore = () => { if (add.isConnected) add.innerHTML = ADD_HTML; };
-    inp.addEventListener('keydown', async (e) => {
-      if (e.key === 'Escape') { restore(); return; }
-      if (e.key !== 'Enter') return;
-      const name = inp.value.trim();
-      if (!name) { restore(); return; }
-      const existed = Object.prototype.hasOwnProperty.call(scenesCache, name);
-      await window.hue.saveScene(name, snapshotCurrentLook());
-      toast(`Scene "${name}" ${existed ? 'updated' : 'saved'}`, 'success');
-      await loadScenes();
-    });
-    inp.addEventListener('blur', () => setTimeout(restore, 100));
-  });
-  wrap.appendChild(add);
-}
-
-// ── Monitor panel ─────────────────────────────────────────────────────────────
-
-const monitorSignalDot    = document.getElementById('monitor-signal-dot');
-const monitorSignalLabel  = document.getElementById('monitor-signal-label');
-const monitorSignalAge    = document.getElementById('monitor-signal-age');
-const monitorUniverseLabel = document.getElementById('monitor-universe-label');
-const monitorGrid         = document.getElementById('monitor-grid');
-
-let lastPacketMs    = 0;
-let signalAgeTimer  = null;
-
-function updateSignalAge() {
-  if (!lastPacketMs) return;
-  const age = Date.now() - lastPacketMs;
-  monitorSignalAge.textContent = age < 2000
-    ? `(${age < 100 ? '<100' : age}ms ago)`
-    : `(${(age / 1000).toFixed(1)}s ago)`;
-  if (age >= 2000) {
-    monitorSignalDot.classList.remove('active');
-    monitorSignalLabel.textContent = 'Signal lost';
-  }
-}
-
-function onDmxPacket(packetUniverse) {
-  lastPacketMs = Date.now();
-  monitorSignalDot.classList.add('active');
-  monitorSignalLabel.textContent = 'Receiving';
-
-  const cfg   = state.settings;
-  const proto = cfg.protocol || 'artnet';
-  const univ  = packetUniverse ?? (proto === 'sacn' ? (cfg.sacnUniverse ?? 1) : (cfg.universe ?? 0));
-  monitorUniverseLabel.textContent =
-    `${proto === 'sacn' ? 'sACN' : proto === 'both' ? 'Art-Net+sACN' : 'Art-Net'} · Universe ${univ}`;
-
-  if (!signalAgeTimer) signalAgeTimer = setInterval(updateSignalAge, 250);
-  updateMonitorCards();
-}
-
-function buildMonitorCards(lights) {
-  if (!lights || lights.length === 0) {
-    monitorGrid.innerHTML = '<div class="empty-state"><p>No lights loaded — go to Lights tab and refresh</p></div>';
+  sceneList.innerHTML = '';
+  const names = Object.keys(scenesCache);
+  if (!names.length) {
+    sceneList.innerHTML = '<div class="empty">No scenes yet. Set up a look, then Save look.</div>';
     return;
   }
-  monitorGrid.innerHTML = '';
-  for (const light of lights) {
-    if (!light.dmx) continue;
-    const card       = document.createElement('div');
-    card.className   = 'monitor-card';
-    card.dataset.lightId = light.id;
 
-    const channelRows = light.dmx.labels.map(lbl => {
-      const [chStr, name] = lbl.split(':');
-      const cls = { R: 'r', G: 'g', B: 'b', CT: 'ct', Bri: 'bri', Int: 'bri' }[name] || '';
-      return `<div class="monitor-channel" data-ch="${chStr}">
-        <span class="monitor-ch-label">${name}</span>
-        <div class="monitor-bar-bg"><div class="monitor-bar-fill ${cls}" style="width:0%"></div></div>
-        <span class="monitor-ch-val">0</span>
+  names.forEach((name, i) => {
+    const entries = scenesCache[name] || [];
+    const lit = entries.filter(e => e.on && e.rgb);
+    const colors = [...new Set(lit.map(e => String(e.rgb).toLowerCase()))].slice(0, 6);
+    const onCount = entries.filter(e => e.on).length;
+
+    const wrap = document.createElement('div');
+    wrap.className = 'scene-row';
+    wrap.innerHTML = `
+      <button class="scene" data-name="${esc(name)}" aria-pressed="false">
+        <span class="scene-key">${i < 9 ? i + 1 : ''}</span>
+        <span class="scene-body">
+          <span class="scene-top">
+            <span class="scene-name" title="${esc(name)}">${esc(name)}</span>
+            <span class="scene-meta">${entries.length ? (onCount ? `${onCount} of ${entries.length} on` : 'all off') : 'empty'}</span>
+          </span>
+          <span class="scene-chips">${(colors.length ? colors : ['#2A2D31']).map(c => `<span style="background:${esc(c)}"></span>`).join('')}</span>
+        </span>
+      </button>
+      <div class="scene-tools">
+        <button class="upd" title="Overwrite with the current look">Update</button>
+        <button class="danger del" title="Delete scene">Delete</button>
       </div>`;
-    }).join('');
-
-    card.innerHTML = `
-      <div class="monitor-card-header">
-        <div class="monitor-swatch"></div>
-        <span class="monitor-card-name">${light.name}</span>
-        <span class="monitor-card-ch">ch${light.dmx.start}–${light.dmx.start + light.dmx.channels - 1}</span>
-      </div>
-      ${channelRows}`;
-    monitorGrid.appendChild(card);
-  }
-}
-
-function updateMonitorCards() {
-  // Read from listener bar (same source of truth used everywhere else), fall back to saved config
-  const cfg      = state.settings;
-  const proto    = lbProtocol.value;
-  const mainUniv = proto === 'sacn'
-    ? (parseInt(lbSacnUniverse.value)   || cfg.sacnUniverse || 1)
-    : (parseInt(lbArtnetUniverse.value) || cfg.universe     || 0);
-
-  monitorGrid.querySelectorAll('.monitor-card').forEach(card => {
-    const lightId = card.dataset.lightId;
-    const light   = state.lights.find(l => String(l.id) === String(lightId));
-    if (!light || !light.dmx) return;
-
-    const patch      = light.customAddress;
-    const lightUniv  = patch?.universe ?? mainUniv;
-    const dmx        = dmxByUniverse[lightUniv] || [];
-    const offset     = light.dmx.start - 1;   // authoritative patch from main
-    const chCount    = light.dmx.channels || 3;
-
-    const channels = card.querySelectorAll('.monitor-channel');
-    let anyActive  = false;
-
-    channels.forEach((row, j) => {
-      const val = dmx[offset + j] || 0;
-      if (val > 0) anyActive = true;
-      row.querySelector('.monitor-bar-fill').style.width = `${(val / 255) * 100}%`;
-      row.querySelector('.monitor-ch-val').textContent   = val;
+    wrap.querySelector('.scene').addEventListener('click', () => applyScene(name));
+    armButton(wrap.querySelector('.upd'), 'Overwrite?', async () => {
+      await window.hue.saveScene(name, snapshotCurrentLook());
+      toast(`Scene "${name}" updated`, 'success');
+      await loadScenes();
     });
-
-    let r, g, b;
-    if (chCount === 3) {
-      r = dmx[offset] || 0; g = dmx[offset + 1] || 0; b = dmx[offset + 2] || 0;
-    } else {
-      const v = dmx[offset] || 0;
-      r = v; g = Math.round(v * 0.85); b = Math.round(v * 0.6);
-    }
-    card.querySelector('.monitor-swatch').style.background =
-      (r > 0 || g > 0 || b > 0) ? `rgb(${r},${g},${b})` : 'rgba(255,255,255,0.05)';
-    card.classList.toggle('active', anyActive);
+    armButton(wrap.querySelector('.del'), 'Delete?', async () => {
+      await window.hue.deleteScene(name);
+      if (state.activeScene === name) state.activeScene = null;
+      toast(`Scene "${name}" deleted`, 'info');
+      await loadScenes();
+    });
+    sceneList.appendChild(wrap);
   });
+  paintSceneActive();
 }
 
-// ── Event log (Monitor tab) ───────────────────────────────────────────────────
+$('btn-save-scene').addEventListener('click', () => {
+  if (sceneList.querySelector('.scene-new')) { sceneList.querySelector('.scene-new input').focus(); return; }
+  const box = document.createElement('div');
+  box.className = 'scene-new';
+  box.innerHTML = '<input class="input" placeholder="Scene name, then Enter" aria-label="New scene name">';
+  sceneList.prepend(box);
+  const inp = box.querySelector('input');
+  inp.focus();
+  inp.addEventListener('keydown', async (e) => {
+    if (e.key === 'Escape') { box.remove(); return; }
+    if (e.key !== 'Enter') return;
+    const name = inp.value.trim();
+    if (!name) { box.remove(); return; }
+    const existed = Object.prototype.hasOwnProperty.call(scenesCache, name);
+    await window.hue.saveScene(name, snapshotCurrentLook());
+    state.activeScene = name;
+    toast(`Scene "${name}" ${existed ? 'updated' : 'saved'}`, 'success');
+    await loadScenes();
+  });
+  inp.addEventListener('blur', () => setTimeout(() => box.remove(), 150));
+});
 
-const eventLogList = document.getElementById('event-log-list');
+// ── Log ──────────────────────────────────────────────────────────────────────
+
+const eventLogList = $('event-log-list');
+
+function paintSignalRow() {
+  const dot = $('monitor-signal-dot'), label = $('monitor-signal-label'), age = $('monitor-signal-age');
+  if (signalLive()) {
+    setDot(dot, 'ok');
+    label.textContent = `Receiving · ${packetRate} Hz`;
+    age.textContent = '';
+  } else if (lastPacketMs) {
+    setDot(dot, 'bad');
+    label.textContent = 'Signal lost';
+    age.textContent = `last packet ${((Date.now() - lastPacketMs) / 1000).toFixed(0)} s ago`;
+  } else {
+    setDot(dot, null);
+    label.textContent = state.artnetRunning ? 'Listening · no signal yet' : 'Input off';
+    age.textContent = '';
+  }
+  const us = liveUniverses();
+  $('monitor-universe-label').textContent = us.length
+    ? `${protoLabel()} · Universe${us.length > 1 ? 's' : ''} ${us.join(', ')}`
+    : `${protoLabel()} · Universe ${defaultUniverse()}`;
+}
 
 function fmtLogTime(t) { return new Date(t).toTimeString().slice(0, 8); }
 
 function appendLogEntry(e, newestFirst = true) {
   const div = document.createElement('div');
   div.className = `log-entry log-${e.type || 'info'}`;
-  div.innerHTML = `<span class="log-time"></span><span class="log-msg"></span>`;
+  div.innerHTML = '<span class="log-time"></span><span class="log-msg"></span>';
   div.querySelector('.log-time').textContent = fmtLogTime(e.t);
   div.querySelector('.log-msg').textContent  = e.message;
   if (newestFirst) eventLogList.prepend(div); else eventLogList.appendChild(div);
@@ -1844,152 +1761,134 @@ async function loadEventLog() {
   const entries = await window.hue.getEventLog().catch(() => []);
   eventLogList.innerHTML = '';
   if (!entries || entries.length === 0) {
-    eventLogList.innerHTML = '<div class="hint" style="padding:6px 0">No events yet</div>';
+    eventLogList.innerHTML = '<div class="empty">No events yet</div>';
     return;
   }
   for (const e of entries.slice().reverse()) appendLogEntry(e, false);
 }
 
 window.hue.on('log:event', (e) => {
-  const placeholder = eventLogList.querySelector('.hint');
+  const placeholder = eventLogList.querySelector('.empty');
   if (placeholder) placeholder.remove();
   appendLogEntry(e);
 });
 
-// ── sACN diagnostics ──────────────────────────────────────────────────────────
-
-const sacnDiagBar  = document.getElementById('sacn-diag-bar');
-const sacnDiagText = document.getElementById('sacn-diag-text');
-const sacnDiagIcon = document.getElementById('sacn-diag-icon');
-
-window.hue.on('sacn:diag', ({ rawCount, lastUniverse, wrongUniverse, configured, watched, lastSize }) => {
-  const proto = (state.settings && state.settings.protocol) || 'artnet';
-  if (proto === 'artnet') { sacnDiagBar.style.display = 'none'; return; }
-
-  sacnDiagBar.style.display = 'flex';
-
+window.hue.on('sacn:diag', ({ rawCount, lastUniverse, configured, watched, lastSize }) => {
+  const bar = $('sacn-diag-bar'), text = $('sacn-diag-text');
+  if (protocol() === 'artnet') { bar.hidden = true; return; }
+  bar.hidden = false;
+  bar.className = 'diag';
   if (rawCount === 0) {
-    sacnDiagBar.className = '';
-    sacnDiagIcon.textContent = '';
-    sacnDiagText.textContent = `sACN: No UDP packets received on port 5568 yet`;
-    return;
+    text.textContent = 'sACN: no UDP packets on port 5568 yet';
+  } else if (lastUniverse === null) {
+    text.textContent = `sACN: ${rawCount} packets received but none were valid E1.31 (last: ${lastSize} bytes)`;
+  } else if (!new Set(watched || [configured]).has(lastUniverse)) {
+    bar.className = 'diag mismatch';
+    text.textContent = `sACN: receiving universe ${lastUniverse}, but Prism listens on ${configured}. Set the sACN universe in Setup to ${lastUniverse}.`;
+  } else {
+    bar.className = 'diag ok';
+    text.textContent = `sACN: receiving · universe${watched && watched.length > 1 ? 's ' + watched.join(', ') : ' ' + configured} · ${rawCount} packets`;
   }
-  if (lastUniverse === null) {
-    sacnDiagBar.className = '';
-    sacnDiagIcon.textContent = '';
-    sacnDiagText.textContent = `sACN: ${rawCount} packets received but none matched E1.31 format (last: ${lastSize} bytes)`;
-    return;
-  }
-  // Only warn if the last universe is completely unknown — not just an override universe
-  const watchedSet = new Set(watched || [configured]);
-  if (!watchedSet.has(lastUniverse)) {
-    sacnDiagBar.className = 'mismatch';
-    sacnDiagIcon.textContent = '';
-    sacnDiagText.textContent =
-      `sACN: Receiving universe ${lastUniverse} — app is configured for universe ${configured}. ` +
-      `Change sACN Universe in Settings to ${lastUniverse}.`;
-    return;
-  }
-  const univList = watched && watched.length > 1 ? watched.join(', ') : `${configured}`;
-  sacnDiagBar.className = 'ok';
-  sacnDiagIcon.textContent = '✓';
-  sacnDiagText.textContent = `sACN: Receiving · Universes ${univList} · ${rawCount} packets`;
 });
 
-// ── NIC selectors ─────────────────────────────────────────────────────────────
+// ── Setup: interfaces + settings ─────────────────────────────────────────────
 
 async function loadNicSelectors(savedIp) {
-  const ifaces    = await window.hue.getNetworkInterfaces();
-  const selectors = ['discover-nic', 's-nic'];
-
-  for (const id of selectors) {
-    const sel  = document.getElementById(id);
+  const ifaces = await window.hue.getNetworkInterfaces();
+  for (const id of ['discover-nic', 's-nic']) {
+    const sel  = $(id);
     const prev = sel.value;
     sel.innerHTML = '';
     for (const iface of ifaces) {
-      const opt       = document.createElement('option');
-      opt.value       = iface.ip;
+      const opt = document.createElement('option');
+      opt.value = iface.ip;
       opt.textContent = iface.label;
-      if (iface.internal) opt.style.color = 'var(--text3)';
       sel.appendChild(opt);
     }
     const target = (id === 's-nic' && savedIp) ? savedIp : prev;
     if ([...sel.options].some(o => o.value === target)) sel.value = target;
   }
 }
-
-document.getElementById('btn-refresh-nics-discover').addEventListener('click', () => loadNicSelectors());
-document.getElementById('btn-refresh-nics-settings').addEventListener('click', () => loadNicSelectors());
-
-// ── Settings panel ────────────────────────────────────────────────────────────
-
-function updateProtocolVisibility(_protocol) {
-  // sACN fields are always visible in Settings so they can always be configured.
-  // Protocol-based field hiding only applies to the listener bar (handled separately).
-  document.getElementById('sacn-fields').style.display = '';
-}
+$('btn-refresh-nics-discover').addEventListener('click', () => loadNicSelectors());
+$('btn-refresh-nics-settings').addEventListener('click', () => loadNicSelectors(state.settings.host));
 
 function updateMulticastHint() {
-  const universe = parseInt(document.getElementById('s-sacn-universe').value) || 1;
-  document.getElementById('sacn-multicast-group').textContent =
-    `239.255.${(universe >> 8) & 0xff}.${universe & 0xff}`;
+  const u = parseInt($('s-sacn-universe').value) || 1;
+  $('sacn-multicast-group').textContent = `239.255.${(u >> 8) & 0xff}.${u & 0xff}`;
 }
 
 async function refreshSettings() {
-  const cfg    = await window.hue.getSettings();
+  const cfg = await window.hue.getSettings();
   state.settings = cfg;
 
   await loadNicSelectors(cfg.host);
+  $('s-protocol').value       = cfg.protocol ?? 'artnet';
+  $('s-address').value        = cfg.dmxAddress ?? 1;
+  $('s-universe').value       = cfg.universe ?? 0;
+  $('s-sacn-universe').value  = cfg.sacnUniverse ?? 1;
+  $('s-sacn-multicast').checked = cfg.sacnMulticast !== false;
+  $('s-transition').value     = cfg.transition === 'channel' ? 'channel' : (cfg.transition ?? 100);
+  const amb = cfg.ambient ?? 45;
+  $('s-ambient').value = amb;
+  $('s-ambient-val').textContent = `${amb}%`;
+  setFader($('s-ambient'), amb);
+  window.hue.getLoginItem().then(on => { $('s-login-item').checked = !!on; }).catch(() => {});
+  updateMulticastHint();
 
-  document.getElementById('s-address').value        = cfg.dmxAddress  ?? 1;
-  document.getElementById('s-universe').value       = cfg.universe    ?? 0;
-  document.getElementById('s-sacn-universe').value  = cfg.sacnUniverse ?? 1;
-  document.getElementById('s-sacn-multicast').checked = cfg.sacnMulticast !== false;
-  document.getElementById('s-transition').value     = cfg.transition === 'channel' ? 'channel' : (cfg.transition ?? 100);
+  const status = await window.hue.artnetStatus();
+  setListenerRunning(status.running);
+  scheduleAmbient();
+}
 
-  // Launch at Login (read from OS — not stored in config.json)
-  const loginItemEl = document.getElementById('s-login-item');
-  if (loginItemEl) {
-    window.hue.getLoginItem().then(enabled => { loginItemEl.checked = !!enabled; }).catch(() => {});
+// Input settings save as you change them; a running listener restarts to apply
+const saveInputSettings = debounce(async () => {
+  const transRaw = $('s-transition').value.trim();
+  const updates = {
+    protocol:      $('s-protocol').value,
+    dmxAddress:    parseInt($('s-address').value)      || 1,
+    universe:      parseInt($('s-universe').value)     || 0,
+    sacnUniverse:  parseInt($('s-sacn-universe').value) || 1,
+    sacnMulticast: $('s-sacn-multicast').checked,
+    host:          $('s-nic').value || '0.0.0.0',
+    transition:    transRaw === 'channel' ? 'channel' : (parseInt(transRaw) || 100),
+  };
+  await window.hue.saveSettings(updates);
+  state.settings = { ...state.settings, ...updates };
+  paintInputStatus();
+  if (state.artnetRunning) {
+    await window.hue.stopArtnet();
+    await window.hue.startArtnet();
+    toast('Input settings saved — listener restarted', 'success');
+  } else {
+    toast('Input settings saved', 'success');
   }
+  if (state.connected) refreshLights();
+}, 400);
 
-  updateProtocolVisibility(cfg.protocol ?? 'artnet');
-  updateMulticastHint();
+['s-protocol', 's-nic', 's-universe', 's-sacn-universe', 's-sacn-multicast', 's-address', 's-transition']
+  .forEach(id => $(id).addEventListener('change', saveInputSettings));
+$('s-sacn-universe').addEventListener('input', updateMulticastHint);
 
-  // Sync listener bar
-  lbProtocol.value         = cfg.protocol    ?? 'artnet';
-  lbArtnetUniverse.value   = cfg.universe    ?? 0;
-  lbSacnUniverse.value     = cfg.sacnUniverse ?? 1;
-  updateListenerBarVisibility(lbProtocol.value);
-
-  const artnetStatus = await window.hue.artnetStatus();
-  setListenerRunning(artnetStatus.running);
-}
-
-// Launch at Login — saves immediately (OS setting, not in config.json)
-const loginItemEl = document.getElementById('s-login-item');
-if (loginItemEl) {
-  loginItemEl.addEventListener('change', () => {
-    window.hue.setLoginItem(loginItemEl.checked).catch(() => {});
-  });
-}
-
-document.getElementById('s-sacn-universe').addEventListener('input', () => {
-  lbSacnUniverse.value = document.getElementById('s-sacn-universe').value;
-  updateMulticastHint();
+$('s-ambient').addEventListener('input', () => {
+  const v = parseInt($('s-ambient').value);
+  state.settings.ambient = v;
+  $('s-ambient-val').textContent = `${v}%`;
+  setFader($('s-ambient'), v);
+  scheduleAmbient();
 });
-document.getElementById('s-universe').addEventListener('input', () => {
-  lbArtnetUniverse.value = document.getElementById('s-universe').value;
+$('s-ambient').addEventListener('change', () => window.hue.saveSettings({ ambient: state.settings.ambient }));
+
+$('s-login-item').addEventListener('change', () => {
+  window.hue.setLoginItem($('s-login-item').checked).catch(() => {});
 });
 
-// ── Show profile export / import ─────────────────────────────────────────────
-document.getElementById('btn-export-show').addEventListener('click', async () => {
+$('btn-export-show').addEventListener('click', async () => {
   const res = await window.hue.exportShow().catch(() => null);
   if (res && res.success) toast('Show profile exported', 'success');
   else if (res && !res.canceled) toast(`Export failed: ${res.error || ''}`, 'error');
 });
 
-document.getElementById('btn-import-show').addEventListener('click', async () => {
+$('btn-import-show').addEventListener('click', async () => {
   const res = await window.hue.importShow().catch(() => null);
   if (res && res.success) {
     toast(res.connected ? 'Show imported — bridge connected' : 'Show imported', 'success');
@@ -2001,192 +1900,7 @@ document.getElementById('btn-import-show').addEventListener('click', async () =>
   }
 });
 
-document.getElementById('btn-save-settings').addEventListener('click', async () => {
-  const transRaw = document.getElementById('s-transition').value.trim();
-  const updates  = {
-    protocol:      lbProtocol.value,
-    dmxAddress:    parseInt(document.getElementById('s-address').value)       || 1,
-    universe:      parseInt(document.getElementById('s-universe').value)      || 0,
-    sacnUniverse:  parseInt(document.getElementById('s-sacn-universe').value) || 1,
-    sacnMulticast: document.getElementById('s-sacn-multicast').checked,
-    host:          document.getElementById('s-nic').value || '0.0.0.0',
-    transition:    transRaw === 'channel' ? 'channel' : (parseInt(transRaw) || 100),
-  };
+// ── Init ─────────────────────────────────────────────────────────────────────
 
-  await window.hue.saveSettings(updates);
-  state.settings = { ...state.settings, ...updates };
-  toast('Settings saved', 'success');
-
-  if (state.artnetRunning) {
-    await window.hue.stopArtnet();
-    await window.hue.startArtnet();
-  }
-});
-
-// ── Light discovery (Find New Lights) ─────────────────────────────────────────
-
-let discoveryTimer     = null;
-let discoveryPollCount = 0;
-
-document.getElementById('btn-find-lights').addEventListener('click', startDiscovery);
-
-document.getElementById('btn-discovery-done').addEventListener('click', async () => {
-  clearInterval(discoveryTimer);
-  discoveryTimer = null;
-  document.getElementById('lights-discovery').style.display = 'none';
-  await refreshLights();
-});
-
-async function startDiscovery() {
-  if (!state.connected) { toast('Connect to a bridge first', 'error'); return; }
-
-  const discoveryEl = document.getElementById('lights-discovery');
-  const resultsEl   = document.getElementById('discovery-results');
-  const statusEl    = document.getElementById('discovery-status-text');
-  const spinnerEl   = document.getElementById('discovery-spinner');
-
-  // Reset state
-  clearInterval(discoveryTimer);
-  discoveryTimer     = null;
-  discoveryPollCount = 0;
-  resultsEl.innerHTML = '<div class="hint" style="padding:8px 0">Starting scan…</div>';
-  statusEl.textContent = 'Scanning for new lights (40 s)…';
-  spinnerEl.style.display = '';
-  discoveryEl.style.display = '';
-
-  const res = await window.hue.searchNewLights();
-  if (!res.success) {
-    toast(`Discovery failed: ${res.error || ''}`, 'error');
-    discoveryEl.style.display = 'none';
-    return;
-  }
-
-  const seenIds = new Set();
-
-  function buildDiscoveryItem(found) {
-    const item = document.createElement('div');
-    item.className = 'discovery-found-row';
-    item.innerHTML = `
-      <div class="light-color-swatch" style="background:rgba(255,255,255,0.1);width:28px;height:28px;flex-shrink:0"></div>
-      <div class="discovery-found-info">
-        <span class="discovery-found-name">${found.name}</span>
-        <input class="input discovery-rename-input" type="text" value="${found.name.replace(/"/g,'&quot;')}" style="display:none">
-        <span class="hint">ID: ${found.id}</span>
-      </div>
-      <button class="btn btn-secondary btn-sm discovery-rename-btn"     title="Rename (optional)">✎</button>
-      <button class="btn btn-primary   btn-sm discovery-rename-confirm" style="display:none" title="Save name">✓</button>
-      <button class="btn btn-primary   btn-sm discovery-add-btn">+ Add</button>
-      <span class="discovery-added-tag" style="display:none">✓ Added</span>
-    `;
-
-    const nameSpan   = item.querySelector('.discovery-found-name');
-    const nameInput  = item.querySelector('.discovery-rename-input');
-    const renameBtn  = item.querySelector('.discovery-rename-btn');
-    const confirmBtn = item.querySelector('.discovery-rename-confirm');
-    const addBtn     = item.querySelector('.discovery-add-btn');
-    const addedTag   = item.querySelector('.discovery-added-tag');
-
-    // ── Rename — optional and fully independent of adding ─────────────────────
-    function enterEdit() {
-      nameSpan.style.display   = 'none';
-      nameInput.style.display  = '';
-      renameBtn.style.display  = 'none';
-      confirmBtn.style.display = '';
-      nameInput.focus(); nameInput.select();
-    }
-    function exitEdit() {
-      nameSpan.style.display   = '';
-      nameInput.style.display  = 'none';
-      renameBtn.style.display  = '';
-      confirmBtn.style.display = 'none';
-    }
-    async function doRename() {
-      const newName = nameInput.value.trim();
-      if (newName && newName !== found.name) {
-        const r = await window.hue.renameLight(found.id, newName);
-        if (r.success) {
-          found.name = newName;
-          nameSpan.textContent = newName;
-          toast(`Renamed to "${newName}"`, 'success');
-        } else {
-          toast(`Rename failed: ${r.error || ''}`, 'error');
-        }
-      }
-      exitEdit();
-    }
-    renameBtn.addEventListener('click',  enterEdit);
-    confirmBtn.addEventListener('click', doRename);
-    nameInput.addEventListener('keydown', e => {
-      if (e.key === 'Enter')  doRename();
-      if (e.key === 'Escape') exitEdit();
-    });
-
-    // ── Add — the explicit, primary action ────────────────────────────────────
-    addBtn.addEventListener('click', async () => {
-      addBtn.disabled = true;
-      addBtn.textContent = 'Adding…';
-      // A reused bridge id may carry a previous fixture's control-tile state in
-      // the renderer; drop it from both the live map and the cached settings
-      // copy that buildControlCards re-seeds from, so the tile re-initialises
-      // from the real bulb instead of inheriting the old colour.
-      delete controlState[found.id];
-      delete controlState[String(found.id)];
-      if (state.settings && state.settings.lightStates) {
-        delete state.settings.lightStates[found.id];
-        delete state.settings.lightStates[String(found.id)];
-      }
-      const r = await window.hue.addLight(found.id);
-      if (r && r.success) {
-        renameBtn.style.display  = 'none';
-        confirmBtn.style.display = 'none';
-        addBtn.style.display     = 'none';
-        addedTag.style.display   = '';
-        item.classList.add('discovery-added');
-        toast(`Added "${found.name}"`, 'success');
-        await refreshLights(); // register in lights / control / monitor right away
-      } else {
-        addBtn.disabled = false;
-        addBtn.textContent = '+ Add';
-        toast(`Add failed: ${(r && r.error) || ''}`, 'error');
-      }
-    });
-
-    return item;
-  }
-
-  async function pollForNewLights() {
-    discoveryPollCount++;
-    const r = await window.hue.getNewLights();
-    if (!r.success) return;
-
-    for (const found of r.lights) {
-      if (seenIds.has(found.id)) continue;
-      seenIds.add(found.id);
-      const placeholder = resultsEl.querySelector('.hint');
-      if (placeholder) placeholder.remove();
-      resultsEl.appendChild(buildDiscoveryItem(found));
-    }
-
-    // Stop polling when scan ends or after ~42 s (14 × 3 s)
-    if (!r.scanning || discoveryPollCount >= 14) {
-      clearInterval(discoveryTimer);
-      discoveryTimer = null;
-      spinnerEl.style.display = 'none';
-      statusEl.textContent = seenIds.size > 0
-        ? `Found ${seenIds.size} new light${seenIds.size !== 1 ? 's' : ''}. Click + Add on each one you want, then Done.`
-        : 'Scan complete — no new lights found. Make sure the bulb is powered on and close to the bridge.';
-    }
-  }
-
-  discoveryTimer = setInterval(pollForNewLights, 3000);
-  // First poll after a short delay so the bridge has time to start the scan
-  setTimeout(pollForNewLights, 4000);
-}
-
-// ── Init ──────────────────────────────────────────────────────────────────────
-
-buildDmxBars();
-showTab('bridge');
 setBridgeStatus(false, null, false);
-loadNicSelectors();
-document.getElementById('btn-disconnect').style.display = 'none';
+showTab('setup'); // bridge:auto-connect moves to the last tab once connected

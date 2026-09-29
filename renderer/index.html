@@ -8,441 +8,431 @@
 </head>
 <body>
 
-<!-- Title bar -->
-<div id="titlebar">
-  <h1>PRISM</h1>
-  <span class="subtitle">Philips Hue DMX Bridge</span>
-  <div id="artnet-badge" class="artnet-badge">
-    <div class="dot"></div>
-    <span id="artnet-label">Art-Net: Stopped</span>
+<div id="app">
+
+<!-- Status strip: the one place that answers "is everything OK?" -->
+<header id="statusbar">
+  <div class="wordmark">PRISM</div>
+  <div class="sb-divider"></div>
+
+  <button class="sb-item" id="sb-bridge" data-goto="setup" title="Bridge connection">
+    <span class="dot" id="sb-bridge-dot"></span>
+    <span class="sb-label">Bridge</span>
+    <span class="sb-value mono" id="sb-bridge-value">Not connected</span>
+  </button>
+
+  <button class="sb-item" id="sb-input" data-goto="log" title="DMX input">
+    <span class="dot" id="sb-input-dot"></span>
+    <span class="sb-label" id="sb-input-label">Art-Net U0</span>
+    <span class="sb-value mono" id="sb-input-value">Idle</span>
+  </button>
+
+  <button class="sb-item" id="sb-fixtures" data-goto="patch" title="Fixture health">
+    <span class="dot" id="sb-fixtures-dot"></span>
+    <span class="sb-label">Fixtures</span>
+    <span class="sb-value" id="sb-fixtures-value">—</span>
+  </button>
+
+  <div class="sb-spacer"></div>
+
+  <button id="btn-listen" class="switch-btn" role="switch" aria-checked="false" title="Start / stop the DMX listener (Space)">
+    <span class="sb-label">Input</span>
+    <span class="switch"><span class="switch-thumb"></span></span>
+  </button>
+  <button id="btn-blackout" class="btn-blackout" title="All lights off now (⌘B)">
+    <span>Blackout</span><kbd>⌘B</kbd>
+  </button>
+</header>
+
+<!-- App-wide banners -->
+<div id="update-banner" class="banner banner-info" hidden>
+  <span id="update-banner-text" class="banner-title">Update available</span>
+  <div id="update-progress-wrap" class="progress" hidden><div id="update-progress-bar" class="progress-fill"></div></div>
+  <span class="banner-spacer"></span>
+  <button id="btn-update-download" class="btn btn-sm">Download</button>
+  <button id="btn-update-install"  class="btn btn-sm" hidden>Restart &amp; install</button>
+  <button id="btn-update-dismiss"  class="btn btn-sm btn-ghost" aria-label="Dismiss">Dismiss</button>
+</div>
+
+<div id="offline-banner" class="banner banner-warn" hidden>
+  <span class="dot dot-warn pulse"></span>
+  <span class="banner-title">Bridge offline</span>
+  <span>Restarting — DMX control is interrupted until it reconnects.</span>
+</div>
+
+<div id="dmx-override-banner" class="banner banner-live" hidden>
+  <span class="dot dot-ok"></span>
+  <span class="banner-title">DMX in control</span>
+  <span id="dmx-override-info">Manual control returns 2 s after the last packet.</span>
+</div>
+
+<!-- Tabs + per-tab actions -->
+<div id="toolbar">
+  <nav id="tabs" aria-label="Views">
+    <button class="tab" data-tab="patch">Patch</button>
+    <button class="tab" data-tab="control">Control</button>
+    <button class="tab" data-tab="log">Log</button>
+    <button class="tab" data-tab="setup">Setup</button>
+  </nav>
+  <div class="toolbar-spacer"></div>
+
+  <div class="tab-actions" data-for="patch">
+    <label class="search">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <input id="patch-filter" placeholder="Filter fixtures" aria-label="Filter fixtures">
+      <kbd>⌘F</kbd>
+    </label>
+    <button id="btn-refresh-lights" class="btn btn-sm" title="Reload lights from the bridge">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></svg>
+      Refresh
+    </button>
+    <button id="btn-find-lights" class="btn btn-sm">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+      Find lights
+    </button>
+  </div>
+
+  <div class="tab-actions" data-for="control">
+    <span class="hint">Click to select · ⇧-click for a range · 1–9 recall scenes</span>
+    <button id="btn-select-all" class="btn btn-sm">Select all <kbd>⌘A</kbd></button>
   </div>
 </div>
 
-<!-- Listener control bar (always visible) -->
-<div id="listener-bar">
-  <div class="lb-field">
-    <label>Protocol</label>
-    <select id="lb-protocol" class="select select-sm">
-      <option value="artnet">Art-Net</option>
-      <option value="sacn">sACN (E1.31)</option>
-      <option value="both">Both</option>
-    </select>
-  </div>
-  <div class="lb-field" id="lb-artnet-field">
-    <label>Default Univ.</label>
-    <input id="lb-artnet-universe" class="input input-sm" type="number" min="0" max="32767" placeholder="0">
-  </div>
-  <div class="lb-field" id="lb-sacn-field" style="display:none">
-    <label>Default Univ.</label>
-    <input id="lb-sacn-universe" class="input input-sm" type="number" min="1" max="63999" placeholder="1">
-  </div>
-  <button id="lb-start" class="btn btn-primary btn-sm">▶ Start</button>
-  <button id="lb-stop"  class="btn btn-secondary btn-sm" disabled>■ Stop</button>
-  <div id="lb-status">
-    <div class="dot"></div>
-    <span id="lb-label">Stopped</span>
-  </div>
-</div>
+<main id="content">
 
-<!-- Update banner (shown app-wide) -->
-<div id="update-banner" style="display:none">
-  <span id="update-banner-text">Update available</span>
-  <div id="update-progress-wrap" style="display:none;flex:1;max-width:160px">
-    <div class="scan-progress-bar-bg">
-      <div id="update-progress-bar" class="scan-progress-bar-fill"></div>
-    </div>
-  </div>
-  <button id="btn-update-download" class="btn btn-primary btn-sm">Download</button>
-  <button id="btn-update-install"  class="btn btn-primary btn-sm" style="display:none">Restart &amp; Install</button>
-  <button id="btn-update-dismiss"  class="btn btn-secondary btn-sm">✕</button>
-</div>
+  <!-- ═══ Patch ═══════════════════════════════════════════════════════════ -->
+  <section id="panel-patch" class="panel">
+    <div class="patch-main">
 
-<!-- Bridge-offline banner (shown app-wide while a reboot is in progress) -->
-<div id="offline-banner" style="display:none">
-  <div class="dot"></div>
-  <span>Bridge offline — restarting. DMX control is interrupted until it reconnects.</span>
-</div>
-
-<!-- Tabs -->
-<div id="tabs">
-  <div class="tab active" data-tab="bridge">Bridge</div>
-  <div class="tab" data-tab="lights">Lights</div>
-  <div class="tab" data-tab="control">Control</div>
-  <div class="tab" data-tab="monitor">Monitor</div>
-  <div class="tab" data-tab="settings">Settings</div>
-</div>
-
-<!-- Content -->
-<div id="content">
-
-  <!-- Bridge panel -->
-  <div id="panel-bridge" class="panel active">
-    <div class="bridge-layout">
-
-      <!-- Connection status -->
-      <div class="card">
-        <h2>Connection</h2>
-        <div class="status-row">
-          <div id="bridge-status-dot" class="status-dot"></div>
-          <span id="bridge-status-text">Not connected</span>
+      <div id="lights-discovery" hidden>
+        <div class="discovery-header">
+          <div class="spinner" id="discovery-spinner"></div>
+          <span id="discovery-status-text">Scanning for new lights (40 s)…</span>
+          <button id="btn-discovery-done" class="btn btn-sm">Done</button>
         </div>
-        <button id="btn-disconnect" class="btn btn-danger btn-sm" style="display:none">Disconnect</button>
+        <div id="discovery-results"></div>
       </div>
 
-      <!-- Discovery -->
-      <div class="card">
-        <h2>Discover Bridges</h2>
+      <div class="patch-head">
+        <span class="c-id">#</span>
+        <span class="c-name">Name</span>
+        <span class="c-type">Type</span>
+        <span class="c-patch">Patch</span>
+        <span class="c-range">Channels</span>
+        <span class="c-out">Output</span>
+        <span class="c-status">Status</span>
+        <span class="c-park">Park</span>
+      </div>
+      <div id="patch-rows" class="patch-rows">
+        <div class="empty">Connect to a bridge in Setup to load your lights.</div>
+      </div>
+      <div class="patch-foot">
+        <span id="patch-summary"></span>
+        <span class="toolbar-spacer"></span>
+        <span class="hint">Drag rows to reorder the sequential patch</span>
+      </div>
+    </div>
 
-        <div class="field" style="margin-bottom:8px">
-          <label>Search via Interface</label>
-          <div class="nic-row">
-            <select id="discover-nic" class="select" style="flex:1">
-              <option value="0.0.0.0">All Interfaces (0.0.0.0)</option>
-            </select>
-            <button id="btn-refresh-nics-discover" class="btn btn-secondary btn-sm" title="Refresh interfaces">↻</button>
+    <aside id="inspector" aria-label="Fixture inspector">
+      <div class="empty">Select a fixture to inspect its patch and incoming values.</div>
+    </aside>
+  </section>
+
+  <!-- ═══ Control ════════════════════════════════════════════════════════ -->
+  <section id="panel-control" class="panel">
+    <aside id="scene-rail" aria-label="Scenes and master">
+      <div class="rail-head">
+        <span class="section-label">Scenes</span>
+        <button id="btn-save-scene" class="btn btn-sm btn-ghost" title="Save the current look as a scene">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+          Save look
+        </button>
+      </div>
+      <div id="scene-list" class="scene-list"></div>
+
+      <div class="master">
+        <div class="master-head">
+          <span class="section-label">Master</span>
+          <span class="mono master-val" id="master-bri-val">100%</span>
+        </div>
+        <input type="range" min="1" max="100" value="100" class="fader" id="master-bri" aria-label="Master level (lights that are on)">
+        <div class="master-meta" id="master-status"></div>
+        <div class="master-btns">
+          <button id="btn-all-on"  class="btn">All on</button>
+          <button id="btn-all-off" class="btn">All off</button>
+        </div>
+      </div>
+    </aside>
+
+    <div class="control-main">
+      <div id="control-grid" class="tile-grid">
+        <div class="empty">Connect to a bridge and load lights first.</div>
+      </div>
+
+      <div id="selection-bar">
+        <div class="sel-info">
+          <span id="sel-title" class="sel-title">Nothing selected</span>
+          <button id="btn-sel-clear" class="link" hidden>Clear</button>
+          <span id="sel-hint" class="hint">Pick fixtures first</span>
+        </div>
+        <div id="sel-palette" class="palette" role="group" aria-label="Color"></div>
+        <div class="sb-divider"></div>
+        <div class="sel-level">
+          <span class="section-label">Level</span>
+          <input type="range" min="1" max="100" value="100" class="fader" id="sel-bri" aria-label="Level for selected fixtures">
+          <span class="mono sel-level-val" id="sel-bri-val">—</span>
+        </div>
+        <div class="sel-btns">
+          <button id="btn-sel-on"  class="btn">On</button>
+          <button id="btn-sel-off" class="btn">Off</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══ Log ════════════════════════════════════════════════════════════ -->
+  <section id="panel-log" class="panel">
+    <div class="log-wrap">
+      <div class="signal-row">
+        <span class="dot" id="monitor-signal-dot"></span>
+        <span class="signal-title" id="monitor-signal-label">No signal</span>
+        <span class="mono hint" id="monitor-signal-age"></span>
+        <span class="toolbar-spacer"></span>
+        <span class="mono" id="monitor-universe-label"></span>
+      </div>
+      <div id="sacn-diag-bar" class="diag" hidden>
+        <span id="sacn-diag-text"></span>
+      </div>
+      <div class="log-head">
+        <span class="section-label">Event log</span>
+        <span class="log-legend">
+          <span class="lg lg-bulb">Bulbs</span>
+          <span class="lg lg-bridge">Bridge</span>
+          <span class="lg lg-listener">Listener</span>
+          <span class="lg lg-panic">Panic</span>
+        </span>
+      </div>
+      <div id="event-log-list" class="log-list">
+        <div class="empty">No events yet</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══ Setup (bridge + settings) ══════════════════════════════════════ -->
+  <section id="panel-setup" class="panel">
+    <div class="setup-grid">
+
+      <!-- Bridge -->
+      <div class="setup-col">
+        <div class="card" id="bridge-card">
+          <h2 class="section-label">Bridge</h2>
+          <div class="status-row">
+            <span id="bridge-status-dot" class="dot"></span>
+            <span id="bridge-status-text" class="status-text">Not connected</span>
+            <span class="toolbar-spacer"></span>
+            <button id="btn-disconnect" class="btn btn-sm btn-danger" hidden>Disconnect</button>
           </div>
-        </div>
 
-        <div class="tip-banner" style="margin-bottom:8px">
-          When connecting you'll need to <strong>press the round button on top of your Hue Bridge</strong> to authorize. Have it nearby before clicking Connect.
-        </div>
+          <div id="discover-block">
+            <p class="note">Pairing needs the <strong>round link button on top of the Hue Bridge</strong> — have it within reach before you connect.</p>
 
-        <div class="field" style="margin-bottom:8px">
-          <label>Additional Subnet <span style="color:var(--text3)">(optional, e.g. 10.0.5)</span></label>
-          <div class="nic-row">
-            <input id="extra-subnet" class="input" placeholder="e.g. 10.0.5  or  192.168.0" style="flex:1">
-            <button id="btn-show-subnets" class="btn btn-secondary btn-sm" title="Show subnets that will be scanned">?</button>
-          </div>
-          <div id="subnet-preview" class="hint" style="margin-top:4px;display:none"></div>
-        </div>
+            <label class="field">
+              <span class="field-label">Search on interface</span>
+              <span class="row">
+                <select id="discover-nic" class="select"><option value="0.0.0.0">All interfaces (0.0.0.0)</option></select>
+                <button id="btn-refresh-nics-discover" class="btn btn-icon" aria-label="Refresh interfaces" title="Refresh interfaces">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></svg>
+                </button>
+              </span>
+            </label>
 
-        <div style="display:flex;gap:8px;align-items:center">
-          <button id="btn-scan" class="btn btn-primary btn-sm">Scan Network</button>
-          <button id="btn-cancel-scan" class="btn btn-secondary btn-sm" style="display:none">Cancel</button>
-        </div>
+            <label class="field">
+              <span class="field-label">Extra subnet <span class="hint">optional, e.g. 10.0.5</span></span>
+              <span class="row">
+                <input id="extra-subnet" class="input mono" placeholder="10.0.5">
+                <button id="btn-show-subnets" class="btn btn-sm">Preview</button>
+              </span>
+              <span id="subnet-preview" class="hint" hidden></span>
+            </label>
 
-        <div id="scan-progress-wrap" style="display:none;margin-top:8px">
-          <div class="scan-progress-bar-bg">
-            <div id="scan-progress-bar" class="scan-progress-bar-fill"></div>
-          </div>
-          <div id="scan-progress-label" class="hint" style="margin-top:4px">Scanning…</div>
-        </div>
-
-        <div id="bridge-list" style="margin-top:16px">
-          <div class="empty-state"><small>Click "Scan Network" to find bridges on your LAN</small></div>
-        </div>
-
-        <div class="manual-ip-row">
-          <input id="manual-ip" class="input" placeholder="Manual IP e.g. 192.168.1.100" style="flex:1">
-          <button id="btn-manual-connect" class="btn btn-secondary btn-sm">Connect</button>
-        </div>
-      </div>
-
-      <!-- Maintenance / advanced -->
-      <div class="card maintenance-card">
-        <h2>Maintenance</h2>
-        <p class="hint" style="margin-bottom:10px">
-          Last-resort recovery. Restarting reboots the physical Hue Bridge and
-          interrupts all control for up to a minute.
-        </p>
-        <button id="btn-reboot-bridge" class="btn btn-ghost-warn btn-sm" disabled>Restart Bridge</button>
-      </div>
-
-    </div>
-
-    <!-- Reboot status panel (replaces the connection layout during a reboot) -->
-    <div id="reboot-status-panel" class="card" style="display:none">
-      <div class="reboot-status-head">
-        <div class="reboot-pulse-dot"></div>
-        <h2 id="reboot-status-title">Restarting bridge…</h2>
-      </div>
-      <div id="reboot-status-msg" class="hint" style="margin-top:8px">Sending restart command…</div>
-      <div class="reboot-status-actions" style="margin-top:16px">
-        <button id="btn-reboot-manual" class="btn btn-primary btn-sm" style="display:none">Reconnect now</button>
-        <a id="reboot-cancel-link" href="#" class="reboot-cancel-link">Cancel</a>
-      </div>
-    </div>
-
-  </div>
-
-  <!-- Lights panel -->
-  <div id="panel-lights" class="panel">
-    <div id="lights-toolbar">
-      <button id="btn-refresh-lights" class="btn btn-secondary btn-sm">↻ Refresh</button>
-      <button id="btn-find-lights"    class="btn btn-secondary btn-sm">+ Find New Lights</button>
-      <span class="hint">Drag to reorder · Address column sets a custom start channel · Toggle enables/disables</span>
-    </div>
-
-    <!-- Bulb discovery section (hidden until "Find New Lights" clicked) -->
-    <div id="lights-discovery" style="display:none">
-      <div class="discovery-header">
-        <div class="spinner" id="discovery-spinner"></div>
-        <span id="discovery-status-text">Scanning for new lights (40 s)…</span>
-        <button id="btn-discovery-done" class="btn btn-secondary btn-sm" style="margin-left:auto">Done</button>
-      </div>
-      <div id="discovery-results"></div>
-    </div>
-
-    <div id="lights-col-header">
-      <span class="lch-handle"></span>
-      <span class="lch-swatch"></span>
-      <span class="lch-fixture">Fixture</span>
-      <span class="lch-address">Address</span>
-      <span class="lch-patch">Patch</span>
-      <span class="lch-btn"></span>
-      <span class="lch-toggle"></span>
-    </div>
-
-    <div id="lights-list">
-      <div class="empty-state empty-state--left">
-        <p>Connect to a bridge first</p>
-      </div>
-    </div>
-  </div>
-
-  <!-- Control panel -->
-  <div id="panel-control" class="panel">
-
-    <!-- DMX override banner -->
-    <div id="dmx-override-banner" style="display:none">
-      <span>DMX Override Active</span>
-      <span id="dmx-override-info" class="hint"></span>
-      <span class="hint" style="margin-left:auto">Native control resumes 2 s after last DMX packet</span>
-    </div>
-
-    <!-- All Lights master row -->
-    <div id="master-row">
-      <div class="master-label-wrap">
-        <span class="master-label">All Lights</span>
-        <span id="master-status" class="master-status"></span>
-      </div>
-      <div id="master-palette"></div>
-      <div class="master-bri-wrap">
-        <input type="range" min="1" max="100" value="100" class="bri-slider" id="master-bri">
-        <span id="master-bri-val" class="bri-val">100%</span>
-      </div>
-      <div class="master-btns">
-        <button id="btn-all-on"  class="btn btn-secondary btn-sm">All On</button>
-        <button id="btn-all-off" class="btn btn-secondary btn-sm">All Off</button>
-      </div>
-    </div>
-
-    <!-- Scenes -->
-    <div class="control-section-head">
-      <span class="ct-label">Scenes</span>
-    </div>
-    <div id="scene-cards"></div>
-
-    <!-- Lights -->
-    <div class="control-section-head">
-      <span class="ct-label">Lights</span>
-      <button id="btn-select-mode" class="btn btn-secondary btn-sm" style="margin-left:auto">Select</button>
-    </div>
-
-    <!-- Group actions bar (visible in select mode) -->
-    <div id="group-actions" style="display:none">
-      <span id="group-count">0 selected</span>
-      <button id="btn-group-all" class="btn-link-sm">Select all</button>
-      <div id="group-palette"></div>
-      <div class="master-bri-wrap">
-        <input type="range" min="1" max="100" value="100" class="bri-slider" id="group-bri">
-        <span id="group-bri-val" class="bri-val">100%</span>
-      </div>
-      <div class="master-btns">
-        <button id="btn-group-on"  class="btn btn-secondary btn-sm" disabled>On</button>
-        <button id="btn-group-off" class="btn btn-secondary btn-sm" disabled>Off</button>
-      </div>
-    </div>
-
-    <!-- Per-light control grid -->
-    <div id="control-grid">
-      <div class="empty-state">
-        <p>Connect to a bridge and load lights first</p>
-      </div>
-    </div>
-
-  </div>
-
-  <!-- Monitor panel -->
-  <div id="panel-monitor" class="panel">
-    <div id="monitor-signal-bar">
-      <div id="monitor-signal-dot" class="signal-dot"></div>
-      <span id="monitor-signal-label">No signal</span>
-      <span id="monitor-signal-age" class="hint"></span>
-      <span id="monitor-universe-label" class="hint" style="margin-left:auto"></span>
-    </div>
-    <div id="sacn-diag-bar" style="display:none">
-      <span id="sacn-diag-icon"></span>
-      <span id="sacn-diag-text"></span>
-    </div>
-    <div id="monitor-grid">
-      <div class="empty-state">
-        <p>Connect to a bridge and start the listener to monitor channels</p>
-      </div>
-    </div>
-
-    <!-- Rolling event log: bulb drops/recoveries, reconnects, listener, panic -->
-    <div id="event-log-card">
-      <div id="event-log-head">
-        <span class="ct-label">Event Log</span>
-        <span class="hint" style="margin-left:auto">Bulb drops · recoveries · reconnects · listener · panic</span>
-      </div>
-      <div id="event-log-list">
-        <div class="hint" style="padding:6px 0">No events yet</div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Settings panel -->
-  <div id="panel-settings" class="panel">
-    <div class="settings-layout">
-
-      <!-- DMX / Art-Net settings -->
-      <div class="card">
-        <h2>Art-Net / DMX</h2>
-
-        <div class="field">
-          <label>Bind Interface</label>
-          <div class="nic-row">
-            <select id="s-nic" class="select" style="flex:1">
-              <option value="0.0.0.0">All Interfaces (0.0.0.0)</option>
-            </select>
-            <button id="btn-refresh-nics-settings" class="btn btn-secondary btn-sm" title="Refresh interfaces">↻</button>
-          </div>
-          <div class="hint">Interface the listener binds to. Restart after changing.</div>
-        </div>
-
-        <div class="field">
-          <label>Default Universe <span style="color:var(--text3)">(0 – 32767)</span> <span class="info-icon" data-tooltip="This universe applies to all fixtures. You can override it per fixture in the patch list below.">ⓘ</span></label>
-          <input id="s-universe" class="input" type="number" min="0" max="32767" placeholder="0">
-          <div class="hint">Applied to all lights unless overridden per fixture</div>
-        </div>
-
-        <div id="sacn-fields">
-          <div class="field">
-            <label>Default Universe (sACN) <span style="color:var(--text3)">(1 – 63999)</span> <span class="info-icon" data-tooltip="This universe applies to all fixtures using sACN. You can override it per fixture in the patch list below.">ⓘ</span></label>
-            <input id="s-sacn-universe" class="input" type="number" min="1" max="63999" placeholder="1">
-            <div class="hint">Applied to all lights unless overridden per fixture · Multicast group: <span id="sacn-multicast-group">239.255.0.1</span></div>
-          </div>
-          <div class="checkbox-row" style="border:none;padding:0;margin-bottom:16px">
-            <div>
-              <label for="s-sacn-multicast">sACN Multicast</label>
-              <div class="description">Join the universe multicast group. Disable for unicast.</div>
+            <div class="row">
+              <button id="btn-scan" class="btn btn-primary">Scan network</button>
+              <button id="btn-cancel-scan" class="btn" hidden>Cancel</button>
             </div>
-            <label class="toggle">
-              <input id="s-sacn-multicast" type="checkbox" checked>
-              <span class="toggle-slider"></span>
+
+            <div id="scan-progress-wrap" hidden>
+              <div class="progress"><div id="scan-progress-bar" class="progress-fill"></div></div>
+              <div id="scan-progress-label" class="hint">Scanning…</div>
+            </div>
+
+            <div id="bridge-list"></div>
+
+            <label class="field">
+              <span class="field-label">Or connect by IP</span>
+              <span class="row">
+                <input id="manual-ip" class="input mono" placeholder="192.168.1.100">
+                <button id="btn-manual-connect" class="btn">Connect</button>
+              </span>
             </label>
           </div>
         </div>
 
-        <div class="field">
-          <label>DMX Start Address <span style="color:var(--text3)">(1 – 511)</span></label>
-          <input id="s-address" class="input" type="number" min="1" max="511" placeholder="1">
+        <div class="card" id="reboot-status-panel" hidden>
+          <div class="status-row">
+            <span class="dot dot-warn pulse"></span>
+            <h2 id="reboot-status-title" class="status-text">Restarting bridge…</h2>
+          </div>
+          <div id="reboot-status-msg" class="hint">Sending restart command…</div>
+          <div class="row">
+            <button id="btn-reboot-manual" class="btn btn-primary" hidden>Reconnect now</button>
+            <button id="reboot-cancel-link" class="link">Cancel</button>
+          </div>
         </div>
 
-        <div class="field">
-          <label>Transition Time <span style="color:var(--text3)">(ms or "channel")</span></label>
-          <input id="s-transition" class="input" placeholder="100">
-          <div class="hint">Use "channel" to control transition via first DMX channel</div>
+        <div class="card">
+          <h2 class="section-label">Maintenance</h2>
+          <p class="note">Last-resort recovery. Restarting cycles the bridge's network service and interrupts all control for up to a minute.</p>
+          <div class="row"><button id="btn-reboot-bridge" class="btn btn-warn" disabled>Restart bridge</button></div>
         </div>
       </div>
 
-      <!-- Feature flags -->
-      <div class="card">
-        <h2>Features</h2>
+      <!-- Input + app settings -->
+      <div class="setup-col">
+        <div class="card">
+          <h2 class="section-label">DMX input</h2>
+          <p class="hint">Changes save as you make them. A running listener restarts to apply them.</p>
 
-        <div class="checkbox-row">
-          <div>
-            <label for="s-login-item">Launch at Login</label>
-            <div class="description">Start Prism automatically when you log in — runs silently in the menu bar</div>
-          </div>
-          <label class="toggle">
-            <input id="s-login-item" type="checkbox">
-            <span class="toggle-slider"></span>
+          <label class="field">
+            <span class="field-label">Protocol</span>
+            <select id="s-protocol" class="select">
+              <option value="artnet">Art-Net</option>
+              <option value="sacn">sACN (E1.31)</option>
+              <option value="both">Both</option>
+            </select>
           </label>
-        </div>
 
-        <div class="field" style="margin-top:16px">
-          <label>Show Profile</label>
-          <div style="display:flex;gap:8px">
-            <button id="btn-export-show" class="btn btn-secondary btn-sm">Export…</button>
-            <button id="btn-import-show" class="btn btn-secondary btn-sm">Import…</button>
+          <label class="field">
+            <span class="field-label">Listen on interface</span>
+            <span class="row">
+              <select id="s-nic" class="select"><option value="0.0.0.0">All interfaces (0.0.0.0)</option></select>
+              <button id="btn-refresh-nics-settings" class="btn btn-icon" aria-label="Refresh interfaces" title="Refresh interfaces">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></svg>
+              </button>
+            </span>
+          </label>
+
+          <div class="field-pair">
+            <label class="field">
+              <span class="field-label">Art-Net universe <span class="hint">0–32767</span></span>
+              <input id="s-universe" class="input mono" type="number" min="0" max="32767">
+            </label>
+            <label class="field">
+              <span class="field-label">sACN universe <span class="hint">1–63999</span></span>
+              <input id="s-sacn-universe" class="input mono" type="number" min="1" max="63999">
+            </label>
           </div>
-          <div class="hint">Patch, fixture modes, scenes and bridge pairing in one file — restore a rig on any machine. Contains the bridge API key; treat it like a password.</div>
+          <p class="hint">Fixtures use these unless patched to another universe in Patch. sACN multicast group <span id="sacn-multicast-group" class="mono">239.255.0.1</span></p>
+
+          <div class="toggle-row">
+            <div>
+              <div class="toggle-title">sACN multicast</div>
+              <div class="hint">Join the universe's multicast group. Turn off for unicast.</div>
+            </div>
+            <label class="toggle"><input id="s-sacn-multicast" type="checkbox" checked><span class="toggle-track"></span></label>
+          </div>
+
+          <div class="field-pair">
+            <label class="field">
+              <span class="field-label">Start address <span class="hint">1–511</span></span>
+              <input id="s-address" class="input mono" type="number" min="1" max="511">
+            </label>
+            <label class="field">
+              <span class="field-label">Transition <span class="hint">ms or "channel"</span></span>
+              <input id="s-transition" class="input mono" placeholder="100">
+            </label>
+          </div>
         </div>
 
+        <div class="card">
+          <h2 class="section-label">App</h2>
+
+          <label class="field">
+            <span class="field-label">Ambient background <span class="hint mono" id="s-ambient-val">45%</span></span>
+            <input id="s-ambient" type="range" min="0" max="100" step="5" value="45" class="fader">
+            <span class="hint">How strongly the lights' live colors tint the window. Keep it low in a dark room.</span>
+          </label>
+
+          <div class="toggle-row">
+            <div>
+              <div class="toggle-title">Launch at login</div>
+              <div class="hint">Start Prism when you log in — it runs quietly in the menu bar.</div>
+            </div>
+            <label class="toggle"><input id="s-login-item" type="checkbox"><span class="toggle-track"></span></label>
+          </div>
+
+          <div class="field">
+            <span class="field-label">Show profile</span>
+            <span class="row">
+              <button id="btn-export-show" class="btn">Export…</button>
+              <button id="btn-import-show" class="btn">Import…</button>
+            </span>
+            <span class="hint">Patch, modes, scenes and bridge pairing in one file. It contains the bridge API key — treat it like a password.</span>
+          </div>
+        </div>
       </div>
 
     </div>
+  </section>
 
-    <div class="settings-footer">
-      <button id="btn-save-settings" class="btn btn-primary">Save Settings</button>
-    </div>
-  </div>
-
+</main>
 </div>
 
-<!-- DMX channel bar (bottom) -->
-<div id="dmx-bar-wrap"></div>
+<!-- Bridge pairing modal -->
+<div id="pair-modal-overlay" class="modal-overlay" hidden>
+  <div id="pair-dialog" class="modal-box" role="dialog" aria-modal="true" aria-labelledby="pair-title">
+    <h2 id="pair-title">Pair bridge</h2>
 
-<!-- Bridge pairing modal — centered overlay so the 30 s link-button countdown
-     can never render below the fold -->
-<div id="pair-modal-overlay" class="modal-overlay" style="display:none">
-  <div id="pair-dialog" class="modal-box">
-    <h2>Bridge Pairing</h2>
-
-    <div id="pair-step-verify" class="pair-step">
-      <div style="display:flex;align-items:center;gap:10px">
+    <div id="pair-step-verify">
+      <div class="row">
         <div class="spinner"></div>
-        <span id="pair-verify-label">Checking bridge at <span id="pair-ip"></span>…</span>
+        <span id="pair-verify-label">Checking bridge at <span id="pair-ip" class="mono"></span>…</span>
       </div>
     </div>
 
-    <div id="pair-step-link" class="pair-step" style="display:none">
-      <div class="pair-found-banner">
-        ✓ Bridge found — <span id="pair-bridge-name"></span>
-      </div>
-      <div class="pair-link-instruction">
-        <div class="pair-link-icon">◉</div>
+    <div id="pair-step-link" hidden>
+      <div class="pair-found">Bridge found — <span id="pair-bridge-name"></span></div>
+      <div class="pair-instruction">
+        <div class="pair-count mono" id="pair-countdown">30</div>
         <div>
-          <strong>Press the round link button on top of your Hue Bridge</strong>
-          <p>The button is on the physical hardware. You have <span id="pair-countdown">30</span> seconds.</p>
+          <strong>Press the round link button on top of the Hue Bridge</strong>
+          <p class="hint">It's on the hardware itself. Pairing finishes on its own once you press it.</p>
         </div>
       </div>
-      <div class="scan-progress-bar-bg" style="margin-top:12px">
-        <div id="pair-timer-bar" class="scan-progress-bar-fill" style="background:var(--green);width:100%;transition:width 1s linear"></div>
-      </div>
-      <div id="pair-message" style="font-size:11px;color:var(--text3);margin-top:8px">Waiting…</div>
+      <div class="progress"><div id="pair-timer-bar" class="progress-fill progress-ok"></div></div>
+      <div id="pair-message" class="hint">Waiting…</div>
     </div>
 
-    <button id="btn-cancel-pair" class="btn btn-secondary btn-sm" style="margin-top:16px">Cancel</button>
+    <div class="modal-actions">
+      <button id="btn-cancel-pair" class="btn">Cancel</button>
+    </div>
   </div>
 </div>
 
 <!-- Restart-bridge confirmation modal -->
-<div id="reboot-modal-overlay" class="modal-overlay" style="display:none">
-  <div class="modal-box">
-    <h2>Restart Hue Bridge?</h2>
-    <p class="modal-body">
-      This will take the bridge offline for up to 60 seconds. All lights will
-      disconnect temporarily and DMX control will be interrupted. The bridge will
-      reconnect automatically.
-    </p>
-    <p class="modal-note">
-      This is a network/service restart — it cycles the bridge's connection and
-      Zigbee radio. The bridge's own status lights may not visibly change, and
-      your bulbs will hold their current state throughout.
-    </p>
-    <p id="reboot-modal-dmx-warn" class="modal-warn" style="display:none">
-      ⚠ DMX is currently active. Control will be interrupted.
-    </p>
+<div id="reboot-modal-overlay" class="modal-overlay" hidden>
+  <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="reboot-title">
+    <h2 id="reboot-title">Restart Hue Bridge?</h2>
+    <p class="modal-body">The bridge goes offline for up to 60 seconds. DMX control is interrupted and reconnects on its own.</p>
+    <p class="modal-note">This cycles the bridge's network service and Zigbee radio. Its status lights may not change, and bulbs hold their current state throughout.</p>
+    <p id="reboot-modal-dmx-warn" class="modal-warn" hidden>DMX is active right now — control will drop until the bridge is back.</p>
     <div class="modal-actions">
-      <button id="btn-reboot-cancel" class="btn btn-secondary btn-sm">Cancel</button>
-      <button id="btn-reboot-confirm" class="btn btn-warn-filled btn-sm">Restart Bridge</button>
+      <button id="btn-reboot-cancel" class="btn">Cancel</button>
+      <button id="btn-reboot-confirm" class="btn btn-warn-solid">Restart bridge</button>
     </div>
   </div>
 </div>
+
+<div id="toast-stack" aria-live="polite"></div>
 
 <script src="app.js"></script>
 </body>
